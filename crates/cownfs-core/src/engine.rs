@@ -935,6 +935,35 @@ impl Fs {
         Ok(())
     }
 
+    /// Create a hard link to `target` named `name` in `parent`.
+    pub fn link(&mut self, target: u64, parent: u64, name: &[u8]) -> Result<(), FsError> {
+        let inode = self.getattr(target)?;
+        if inode.ftype == FTYPE_DIR {
+            return Err(FsError::Invalid("cannot hard-link a directory".into()));
+        }
+        let key = DirKey::new(parent, name)?;
+        if self.dirs.get(&key)?.is_some() {
+            return Err(FsError::AlreadyExists);
+        }
+        self.dirs.insert(
+            key,
+            DirEnt {
+                ino: target,
+                typ: inode.ftype,
+            },
+        )?;
+        let mut inode = inode;
+        inode.nlink += 1;
+        inode.ctime = now_secs();
+        self.inodes.insert(target, inode)?;
+        let now = now_secs();
+        let mut p = self.getattr(parent)?;
+        p.mtime = now;
+        p.ctime = now;
+        self.inodes.insert(parent, p)?;
+        Ok(())
+    }
+
     pub fn rmdir(&mut self, parent: u64, name: &[u8]) -> Result<(), FsError> {
         let key = DirKey::new(parent, name)?;
         let ent = self.dirs.get(&key)?.ok_or(FsError::NotFound)?;

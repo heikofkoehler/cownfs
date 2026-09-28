@@ -17,17 +17,29 @@ pub const NFS4ERR_NOSPC: u32 = 28;
 pub const NFS4ERR_ROFS: u32 = 30;
 pub const NFS4ERR_NOTSUPP: u32 = 10004;
 pub const NFS4ERR_SERVERFAULT: u32 = 10006;
+pub const NFS4ERR_BAD_STATEID: u32 = 10025;
+pub const NFS4ERR_OPENMODE: u32 = 10026;
 
 // Operation numbers.
 pub const OP_ACCESS: u32 = 3;
+pub const OP_CREATE: u32 = 6;
 pub const OP_GETATTR: u32 = 9;
 pub const OP_GETFH: u32 = 10;
 pub const OP_LOOKUP: u32 = 15;
 pub const OP_LOOKUPP: u32 = 20;
+pub const OP_COMMIT: u32 = 21;
 pub const OP_PUTFH: u32 = 22;
 pub const OP_PUTROOTFH: u32 = 24;
 pub const OP_READ: u32 = 25;
 pub const OP_READDIR: u32 = 26;
+pub const OP_REMOVE: u32 = 28;
+pub const OP_RENAME: u32 = 29;
+pub const OP_LINK: u32 = 30;
+pub const OP_RESTOREFH: u32 = 31;
+pub const OP_SAVEFH: u32 = 32;
+pub const OP_SETATTR: u32 = 34;
+pub const OP_WRITE: u32 = 38;
+pub const OP_OPEN: u32 = 18;
 
 // Attribute numbers (RFC 7530 §5).
 pub const FATTR4_TYPE: u32 = 1;
@@ -48,6 +60,20 @@ pub const NF4REG: u32 = 1;
 pub const NF4DIR: u32 = 2;
 pub const NF4LNK: u32 = 5;
 
+// Create modes.
+pub const UNCHECKED4: u32 = 0;
+pub const GUARDED4: u32 = 1;
+pub const EXCLUSIVE4: u32 = 2;
+
+// Open flags.
+pub const OPEN4_NOCREATE: u32 = 0;
+pub const OPEN4_CREATE: u32 = 1;
+
+// Stable write modes.
+pub const UNSTABLE4: u32 = 0;
+pub const DATA_SYNC4: u32 = 1;
+pub const FILE_SYNC4: u32 = 2;
+
 // Access bits.
 pub const ACCESS4_READ: u32 = 0x0001;
 pub const ACCESS4_LOOKUP: u32 = 0x0002;
@@ -55,6 +81,28 @@ pub const ACCESS4_MODIFY: u32 = 0x0004;
 pub const ACCESS4_EXTEND: u32 = 0x0008;
 pub const ACCESS4_DELETE: u32 = 0x0010;
 pub const ACCESS4_EXECUTE: u32 = 0x0020;
+
+/// NFSv4 stateid (16 bytes: seqid + 12-byte other).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateId {
+    pub seqid: u32,
+    pub other: [u8; 12],
+}
+
+impl StateId {
+    pub fn decode(r: &mut Reader) -> Result<Self, NfsError> {
+        let seqid = r.u32()?;
+        let b = r.opaque_fixed(12)?;
+        let mut other = [0u8; 12];
+        other.copy_from_slice(b);
+        Ok(StateId { seqid, other })
+    }
+
+    pub fn encode(&self, w: &mut Writer) {
+        w.u32(self.seqid);
+        w.opaque_fixed(&self.other);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NfsError {
@@ -134,6 +182,40 @@ pub enum Op {
     Access {
         access: u32,
     },
+    Open {
+        flags: u32,
+        opentype: u32,
+        createmode: u32,
+        createattrs: Vec<(u32, Vec<u8>)>,
+        claim_type: u32,
+        filename: Vec<u8>,
+    },
+    Create {
+        ftype: u32,
+        linkdata: Vec<u8>,
+        name: Vec<u8>,
+        attrs: Vec<(u32, Vec<u8>)>,
+    },
+    Remove(Vec<u8>),
+    Rename {
+        old: Vec<u8>,
+        new: Vec<u8>,
+    },
+    Link(Vec<u8>),
+    SaveFh,
+    RestoreFh,
+    SetAttr {
+        attrs: Vec<(u32, Vec<u8>)>,
+    },
+    Write {
+        offset: u64,
+        stable: u32,
+        data: Vec<u8>,
+    },
+    Commit {
+        offset: u64,
+        count: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -199,6 +281,54 @@ impl<'a> Compound<'a> {
     }
 }
 
+/// Parse an fattr4 (bitmap + attr values) into (attrnum, raw XDR value) pairs.
+pub fn parse_fattr(r: &mut Reader) -> Result<Vec<(u32, Vec<u8>)>, NfsError> {
+    let mask = AttrMask::decode(r)?;
+    let blob = r.opaque()?;
+    let mut br = Reader::new(blob);
+    let mut out = Vec::new();
+    for (wi, word) in mask.words.iter().enumerate() {
+        for bit in 0..32 {
+            if word & (1 << bit) == 0 {
+                continue;
+            }
+            let attr = wi as u32 * 32 + bit;
+            // Capture the raw bytes for this attr by recording position.
+            let before = br.remaining();
+            skip_attr_value(&mut br, attr)?;
+            let after = br.remaining();
+            let len = before - after;
+            let start = blob.len() - before;
+            out.push((attr, blob[start..start + len].to_vec()));
+        }
+    }
+    Ok(out)
+}
+
+/// Skip one attribute value in an attrlist, based on its type.
+fn skip_attr_value(br: &mut Reader, attr: u32) -> Result<(), NfsError> {
+    match attr {
+        FATTR4_TYPE => {
+            br.u32()?;
+        }
+        FATTR4_SIZE | FATTR4_FILEID | FATTR4_SPACE_USED | FATTR4_MOUNTED_ON_FILEID => {
+            br.u64()?;
+        }
+        FATTR4_NUMLINKS | FATTR4_MODE => {
+            br.u32()?;
+        }
+        FATTR4_OWNER | FATTR4_OWNER_GROUP => {
+            br.opaque()?;
+        }
+        FATTR4_TIME_ACCESS | FATTR4_TIME_METADATA | FATTR4_TIME_MODIFY => {
+            br.i64()?;
+            br.u32()?;
+        }
+        _ => return Err(NfsError::Xdr(XdrError::Invalid("unsupported attr"))),
+    }
+    Ok(())
+}
+
 impl Op {
     fn decode(r: &mut Reader) -> Result<Self, NfsError> {
         let opnum = r.u32()?;
@@ -230,6 +360,91 @@ impl Op {
                 }
             }
             OP_ACCESS => Op::Access { access: r.u32()? },
+            OP_OPEN => {
+                let _clientid = r.u64()?;
+                let _owner = r.opaque()?; // open_owner4 (opaque)
+                let flags = r.u32()?;
+                let opentype = r.u32()?;
+                let (createmode, createattrs) = if opentype == OPEN4_CREATE {
+                    let mode = r.u32()?;
+                    let attrs = match mode {
+                        UNCHECKED4 | GUARDED4 => parse_fattr(r)?,
+                        EXCLUSIVE4 => {
+                            let _ = r.opaque_fixed(8)?; // verifier
+                            Vec::new()
+                        }
+                        _ => return Err(NfsError::Xdr(XdrError::Invalid("createmode"))),
+                    };
+                    (mode, attrs)
+                } else {
+                    (0, Vec::new())
+                };
+                let claim_type = r.u32()?;
+                let filename = match claim_type {
+                    0 => r.string()?.to_vec(), // CLAIM_NULL
+                    1 => Vec::new(),           // CLAIM_PREVIOUS
+                    _ => return Err(NfsError::Xdr(XdrError::Invalid("claim_type"))),
+                };
+                Op::Open {
+                    flags,
+                    opentype,
+                    createmode,
+                    createattrs,
+                    claim_type,
+                    filename,
+                }
+            }
+            OP_CREATE => {
+                let ftype = r.u32()?;
+                let linkdata = match ftype {
+                    NF4LNK => r.string()?.to_vec(),
+                    3 | 4 => {
+                        // NF4BLK/NF4CHR: specdata4
+                        let _ = r.u32()?;
+                        let _ = r.u32()?;
+                        Vec::new()
+                    }
+                    _ => Vec::new(),
+                };
+                let name = r.string()?.to_vec();
+                let attrs = parse_fattr(r)?;
+                Op::Create {
+                    ftype,
+                    linkdata,
+                    name,
+                    attrs,
+                }
+            }
+            OP_REMOVE => Op::Remove(r.string()?.to_vec()),
+            OP_RENAME => {
+                let old = r.string()?.to_vec();
+                let new = r.string()?.to_vec();
+                Op::Rename { old, new }
+            }
+            OP_LINK => Op::Link(r.string()?.to_vec()),
+            OP_SAVEFH => Op::SaveFh,
+            OP_RESTOREFH => Op::RestoreFh,
+            OP_SETATTR => {
+                let _stateid = StateId::decode(r)?;
+                let attrs = parse_fattr(r)?;
+                Op::SetAttr { attrs }
+            }
+            OP_WRITE => {
+                let _stateid = StateId::decode(r)?;
+                let offset = r.u64()?;
+                let stable = r.u32()?;
+                let data = r.opaque()?.to_vec();
+                Op::Write {
+                    offset,
+                    stable,
+                    data,
+                }
+            }
+            OP_COMMIT => {
+                let offset = r.u64()?;
+                let count = r.u32()?;
+                Op::Commit { offset, count }
+            }
             n => return Err(NfsError::BadOp(n)),
         };
         Ok(op)
@@ -246,6 +461,16 @@ impl Op {
             Op::ReadDir { .. } => OP_READDIR,
             Op::Read { .. } => OP_READ,
             Op::Access { .. } => OP_ACCESS,
+            Op::Open { .. } => OP_OPEN,
+            Op::Create { .. } => OP_CREATE,
+            Op::Remove(_) => OP_REMOVE,
+            Op::Rename { .. } => OP_RENAME,
+            Op::Link(_) => OP_LINK,
+            Op::SaveFh => OP_SAVEFH,
+            Op::RestoreFh => OP_RESTOREFH,
+            Op::SetAttr { .. } => OP_SETATTR,
+            Op::Write { .. } => OP_WRITE,
+            Op::Commit { .. } => OP_COMMIT,
         }
     }
 }

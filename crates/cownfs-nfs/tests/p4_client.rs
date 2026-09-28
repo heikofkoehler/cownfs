@@ -141,8 +141,19 @@ struct Client {
 
 impl Client {
     fn connect(addr: &str, uuid: [u8; 16]) -> Self {
+        // Retry: the server thread may not have bound yet.
+        let mut stream = None;
+        for _ in 0..50 {
+            match TcpStream::connect(addr) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            }
+        }
         Client {
-            stream: TcpStream::connect(addr).unwrap(),
+            stream: stream.expect("connect to test server"),
             rr: RecordReader::new(),
             xid: 0x1000,
             uuid,
