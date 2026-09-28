@@ -311,6 +311,45 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Shared read path for the live trees and snapshot views.
+fn read_from(
+    extents: &ExtentTree,
+    shared: &Rc<RefCell<Shared>>,
+    inode: &Inode,
+    ino: u64,
+    offset: u64,
+    len: usize,
+) -> Result<Vec<u8>, FsError> {
+    if inode.ftype != FTYPE_FILE && inode.ftype != FTYPE_SYMLINK {
+        return Err(FsError::NotFile);
+    }
+    let end = (offset + len as u64).min(inode.size);
+    if offset >= end {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::with_capacity((end - offset) as usize);
+    let mut buf = [0u8; BLOCK_SIZE];
+    let mut foff = offset;
+    while foff < end {
+        let blk_off = foff / BLOCK_SIZE as u64;
+        let in_blk = (foff % BLOCK_SIZE as u64) as usize;
+        let n = ((BLOCK_SIZE - in_blk) as u64).min(end - foff) as usize;
+        match extents.get(&ExtentKey { ino, off: blk_off })? {
+            Some(ext) => {
+                shared
+                    .borrow_mut()
+                    .dev
+                    .read_block(ext.blk, &mut buf)
+                    .map_err(StoreError::Io)?;
+                out.extend_from_slice(&buf[in_blk..in_blk + n]);
+            }
+            None => out.extend(std::iter::repeat(0).take(n)),
+        }
+        foff += n as u64;
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Fs
 // ---------------------------------------------------------------------------
@@ -336,6 +375,12 @@ pub struct Fs {
     snaps: SnapTree,
     next_inode: u64,
     next_snap: u64,
+    /// Data blocks referenced by at least one snapshot's extent tree.
+    /// Pinned blocks keep their bitmap bit set even when the live tree
+    /// frees them; they return to `pending_free` once no snapshot (and
+    /// not the live tree) references them. Rebuilt from the snapshot
+    /// records on open; purely in-memory.
+    snapshot_pinned: std::collections::HashSet<u64>,
 }
 
 /// Optional setattr fields.
@@ -386,6 +431,7 @@ impl Fs {
             snaps: SnapTree::open(sa, sroot, 0),
             next_inode: ROOT_INO + 1,
             next_snap: 1,
+            snapshot_pinned: std::collections::HashSet::new(),
         };
 
         let now = now_secs();
@@ -497,7 +543,7 @@ impl Fs {
         ea.borrow_mut().set_live(n_extents);
         sa.borrow_mut().set_live(n_snaps);
 
-        Ok(Fs {
+        let mut fs = Fs {
             shared,
             sb,
             active_slot,
@@ -507,7 +553,26 @@ impl Fs {
             snaps,
             next_inode,
             next_snap,
-        })
+            snapshot_pinned: std::collections::HashSet::new(),
+        };
+        fs.rebuild_pinned()?;
+        Ok(fs)
+    }
+
+    /// Rebuild the snapshot-pinned data-block set from the snapshot
+    /// records (used on open; the set is purely in-memory).
+    fn rebuild_pinned(&mut self) -> Result<(), FsError> {
+        let mut pinned = std::collections::HashSet::new();
+        for (snap_id, _) in self.snapshot_list()? {
+            let (_, _, extents) = self.snap_trees(snap_id)?;
+            for (_, ext) in extents.to_sorted_vec()? {
+                for b in ext.blk..ext.blk + ext.len as u64 {
+                    pinned.insert(b);
+                }
+            }
+        }
+        self.snapshot_pinned = pinned;
+        Ok(())
     }
 
     /// Filesystem UUID (for filehandles).
@@ -633,9 +698,25 @@ impl Fs {
         ] {
             reachable.extend(ids.iter().map(|id| id.idx));
         }
-        let meta_blocks = reachable.len() as u64;
+        let mut meta_blocks = reachable.len() as u64;
 
-        // Data blocks referenced by extents.
+        // Snapshot trees: each snapshot's roots must verify, and their
+        // blocks join the reachable set.
+        let mut snap_data: Vec<u64> = Vec::new();
+        for (snap_id, _) in self.snapshot_list()? {
+            let (inodes, dirs, extents) = self.snap_trees(snap_id)?;
+            for ids in [inodes.verify()?, dirs.verify()?, extents.verify()?] {
+                reachable.extend(ids.iter().map(|id| id.idx));
+            }
+            for (_, ext) in extents.to_sorted_vec()? {
+                // Shared with the live tree or other snapshots is normal.
+                for b in ext.blk..ext.blk + ext.len as u64 {
+                    snap_data.push(b);
+                }
+            }
+        }
+        meta_blocks = reachable.len() as u64;
+
         let mut data_blocks = 0u64;
         for (_, ext) in self.extents.to_sorted_vec()? {
             for b in ext.blk..ext.blk + ext.len as u64 {
@@ -644,6 +725,11 @@ impl Fs {
                 }
                 data_blocks += 1;
             }
+        }
+        // Snapshot data blocks join the reachable set after the live
+        // duplicate check (sharing with live is expected under CoW).
+        for b in snap_data {
+            reachable.insert(b);
         }
 
         // Reconcile against the active bitmap area.
@@ -688,9 +774,17 @@ impl Fs {
 
     /// Free a data block. Deferred like metadata frees: the bitmap bit is
     /// cleared at commit, so the block cannot be reallocated while the
-    /// committed generation still references it.
+    /// committed generation still references it. Blocks pinned by a
+    /// snapshot keep their bit set until the last pinning snapshot is
+    /// deleted (see `snapshot_delete`).
     fn free_block(&mut self, blk: u64) {
-        self.shared.borrow_mut().pending_free.push(blk);
+        if self.snapshot_pinned.contains(&blk) {
+            // Pinned by a snapshot: keep the bit set. The block is
+            // reclaimed in `snapshot_delete` when the last pinning
+            // snapshot goes away.
+        } else {
+            self.shared.borrow_mut().pending_free.push(blk);
+        }
     }
 
     fn read_block(&self, blk: u64, buf: &mut [u8; BLOCK_SIZE]) -> Result<(), FsError> {
@@ -1002,30 +1096,7 @@ impl Fs {
 
     pub fn read(&self, ino: u64, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
         let inode = self.getattr(ino)?;
-        if inode.ftype != FTYPE_FILE && inode.ftype != FTYPE_SYMLINK {
-            return Err(FsError::NotFile);
-        }
-        let end = (offset + len as u64).min(inode.size);
-        if offset >= end {
-            return Ok(Vec::new());
-        }
-        let mut out = Vec::with_capacity((end - offset) as usize);
-        let mut buf = [0u8; BLOCK_SIZE];
-        let mut foff = offset;
-        while foff < end {
-            let blk_off = foff / BLOCK_SIZE as u64;
-            let in_blk = (foff % BLOCK_SIZE as u64) as usize;
-            let n = ((BLOCK_SIZE - in_blk) as u64).min(end - foff) as usize;
-            match self.extents.get(&ExtentKey { ino, off: blk_off })? {
-                Some(ext) => {
-                    self.read_block(ext.blk, &mut buf)?;
-                    out.extend_from_slice(&buf[in_blk..in_blk + n]);
-                }
-                None => out.extend(std::iter::repeat(0).take(n)),
-            }
-            foff += n as u64;
-        }
-        Ok(out)
+        read_from(&self.extents, &self.shared, &inode, ino, offset, len)
     }
 
     /// Copy-on-write write: touched blocks are always freshly allocated;
@@ -1114,9 +1185,167 @@ impl Fs {
         Ok(())
     }
 
-    // -- P3: snapshots -----------------------------------------------------
-    // (Snapshot *management* lands in P3; the snap tree root is already
-    // carried in the superblock so images stay forward-compatible.)
+    // -- snapshots --------------------------------------------------------
+
+    /// Create a snapshot of the current tree roots. The three roots are
+    /// reference-counted; later CoW mutations copy instead of rewriting,
+    /// so the snapshot's blocks stay intact. Returns the snapshot id.
+    pub fn snapshot_create(&mut self, name: &[u8]) -> Result<u64, FsError> {
+        if name.is_empty() || name.len() > 64 {
+            return Err(FsError::BadName);
+        }
+        // Pin the roots before inserting: the insert may fail (NoSpace),
+        // in which case the pins are released again.
+        let roots = [
+            self.inodes.root_id(),
+            self.dirs.root_id(),
+            self.extents.root_id(),
+        ];
+        self.inodes.share(roots[0])?;
+        self.dirs.share(roots[1])?;
+        self.extents.share(roots[2])?;
+        let id = self.next_snap;
+        self.next_snap += 1;
+        let mut name_arr = [0u8; 64];
+        name_arr[..name.len()].copy_from_slice(name);
+        let rec = SnapRecord {
+            roots: [roots[0].idx, roots[1].idx, roots[2].idx],
+            root_gens: [roots[0].gen, roots[1].gen, roots[2].gen],
+            lens: [
+                self.inodes.len() as u64,
+                self.dirs.len() as u64,
+                self.extents.len() as u64,
+            ],
+            name: name_arr,
+        };
+        if let Err(e) = self.snaps.insert(id, rec) {
+            self.inodes.release(roots[0])?;
+            self.dirs.release(roots[1])?;
+            self.extents.release(roots[2])?;
+            return Err(FsError::Store(e));
+        }
+        // Pin the snapshot's data blocks: the live tree may overwrite
+        // them, but they must not be reallocated until this snapshot dies.
+        for (_, ext) in self.extents.to_sorted_vec()? {
+            for b in ext.blk..ext.blk + ext.len as u64 {
+                self.snapshot_pinned.insert(b);
+            }
+        }
+        Ok(id)
+    }
+
+    /// Delete a snapshot, releasing its roots. Blocks exclusive to the
+    /// snapshot are reclaimed (their bitmap bits clear at the next
+    /// commit); blocks still shared with the live trees just lose one
+    /// reference.
+    pub fn snapshot_delete(&mut self, snap_id: u64) -> Result<(), FsError> {
+        // Collect the snapshot's data blocks BEFORE removing the record:
+        // any of them not referenced by the live tree or a remaining
+        // snapshot become free (their bits were kept set while pinned).
+        let (_, _, snap_extents) = self.snap_trees(snap_id)?;
+        let mut deleted_blocks = Vec::new();
+        for (_, ext) in snap_extents.to_sorted_vec()? {
+            for b in ext.blk..ext.blk + ext.len as u64 {
+                deleted_blocks.push(b);
+            }
+        }
+        drop(snap_extents);
+
+        let rec = self.snaps.remove(&snap_id)?.ok_or(FsError::NotFound)?;
+        let ids = [
+            NodeId {
+                idx: rec.roots[0],
+                gen: rec.root_gens[0],
+            },
+            NodeId {
+                idx: rec.roots[1],
+                gen: rec.root_gens[1],
+            },
+            NodeId {
+                idx: rec.roots[2],
+                gen: rec.root_gens[2],
+            },
+        ];
+
+        self.inodes.release(ids[0])?;
+        self.dirs.release(ids[1])?;
+        self.extents.release(ids[2])?;
+        self.reclaim_pinned(deleted_blocks)?;
+        Ok(())
+    }
+
+    /// Rebuild the pinned set from the remaining snapshots, then move
+    /// `deleted_blocks` that are no longer referenced anywhere into
+    /// `pending_free` for reclamation at commit.
+    fn reclaim_pinned(&mut self, deleted_blocks: Vec<u64>) -> Result<(), FsError> {
+        self.rebuild_pinned()?;
+        let mut live: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for (_, ext) in self.extents.to_sorted_vec()? {
+            for b in ext.blk..ext.blk + ext.len as u64 {
+                live.insert(b);
+            }
+        }
+        for blk in deleted_blocks {
+            if !self.snapshot_pinned.contains(&blk) && !live.contains(&blk) {
+                self.shared.borrow_mut().pending_free.push(blk);
+            }
+        }
+        Ok(())
+    }
+
+    /// List snapshots as `(id, name)` in id order.
+    pub fn snapshot_list(&self) -> Result<Vec<(u64, Vec<u8>)>, FsError> {
+        Ok(self
+            .snaps
+            .to_sorted_vec()?
+            .into_iter()
+            .map(|(id, rec)| {
+                let name: Vec<u8> = rec.name.iter().take_while(|&&b| b != 0).copied().collect();
+                (id, name)
+            })
+            .collect())
+    }
+
+    /// Open read-only views of a snapshot's trees. The handles borrow the
+    /// shared arenas and never take ownership, so dropping them releases
+    /// nothing.
+    fn snap_trees(&self, snap_id: u64) -> Result<(InodeTree, DirTree, ExtentTree), FsError> {
+        let rec = self.snaps.get(&snap_id)?.ok_or(FsError::NotFound)?;
+        let id = |i: usize| NodeId {
+            idx: rec.roots[i],
+            gen: rec.root_gens[i],
+        };
+        Ok((
+            InodeTree::open(self.inodes.store_handle(), id(0), rec.lens[0] as usize),
+            DirTree::open(self.dirs.store_handle(), id(1), rec.lens[1] as usize),
+            ExtentTree::open(self.extents.store_handle(), id(2), rec.lens[2] as usize),
+        ))
+    }
+
+    /// Read file data as of a snapshot.
+    pub fn snapshot_read(
+        &self,
+        snap_id: u64,
+        ino: u64,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, FsError> {
+        let (inodes, _, extents) = self.snap_trees(snap_id)?;
+        let inode = inodes.get(&ino)?.ok_or(FsError::NotFound)?;
+        read_from(&extents, &self.shared, &inode, ino, offset, len)
+    }
+
+    /// Look up a name as of a snapshot.
+    pub fn snapshot_lookup(
+        &self,
+        snap_id: u64,
+        parent: u64,
+        name: &[u8],
+    ) -> Result<Option<(u64, u8)>, FsError> {
+        let (_, dirs, _) = self.snap_trees(snap_id)?;
+        let key = DirKey::new(parent, name)?;
+        Ok(dirs.get(&key)?.map(|e| (e.ino, e.typ)))
+    }
 }
 
 #[cfg(test)]
@@ -1633,6 +1862,92 @@ mod tests {
             format!("{err}").contains("unreachable"),
             "unexpected error: {err}"
         );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    // -- P3: snapshots -----------------------------------------------------
+
+    /// P3 gate: snapshot a populated image, overwrite all live data, verify
+    /// the snapshot still returns the old bytes; delete the snapshot and
+    /// prove its exclusive blocks are reclaimed.
+    #[test]
+    fn snapshot_isolation_and_reclaim() {
+        let (mut fs, path) = test_fs(1024);
+
+        // Populate: two files with distinct content, a subdir.
+        let a = fs.create(ROOT_INO, b"a", 0o644, 0, 0).unwrap();
+        let old_a: Vec<u8> = (0..6000u32).map(|i| (i % 251) as u8).collect();
+        fs.write(a, 0, &old_a).unwrap();
+        let b = fs.create(ROOT_INO, b"b", 0o644, 0, 0).unwrap();
+        let old_b = b"snapshot-me".repeat(500);
+        fs.write(b, 0, &old_b).unwrap();
+        let sub = fs.mkdir(ROOT_INO, b"sub", 0o755, 0, 0).unwrap();
+        let c = fs.create(sub, b"c", 0o644, 0, 0).unwrap();
+        fs.write(c, 0, b"nested").unwrap();
+        fs.commit().unwrap();
+
+        let snap = fs.snapshot_create(b"v1").unwrap();
+        assert_eq!(fs.snapshot_list().unwrap(), [(snap, b"v1".to_vec())]);
+        fs.commit().unwrap();
+
+        let before = fs.check().unwrap();
+        let snap_blocks_before = before.allocated_blocks;
+
+        // Overwrite ALL live data (and unlink one file, add another).
+        let new_a: Vec<u8> = (0..6000u32).map(|i| (255 - i % 251) as u8).collect();
+        fs.write(a, 0, &new_a).unwrap();
+        fs.write(b, 0, b"overwritten-live-data").unwrap();
+        fs.unlink(ROOT_INO, b"b").unwrap();
+        let d = fs.create(ROOT_INO, b"d", 0o644, 0, 0).unwrap();
+        fs.write(d, 0, b"new-file").unwrap();
+        fs.commit().unwrap();
+
+        // Live sees new data...
+        assert_eq!(fs.read(a, 0, 6000).unwrap(), new_a);
+        assert!(fs.lookup(ROOT_INO, b"b").unwrap().is_none());
+        // ...but the snapshot still returns the old bytes.
+        assert_eq!(fs.snapshot_read(snap, a, 0, 6000).unwrap(), old_a);
+        assert_eq!(fs.snapshot_read(snap, b, 0, old_b.len()).unwrap(), old_b);
+        assert_eq!(fs.snapshot_read(snap, c, 0, 6).unwrap(), b"nested");
+        assert_eq!(
+            fs.snapshot_lookup(snap, ROOT_INO, b"b").unwrap(),
+            Some((b, FTYPE_FILE))
+        );
+        // Snapshot is stable across a reopen.
+        drop(fs);
+        let mut fs = Fs::open(&path).unwrap();
+        assert_eq!(fs.snapshot_read(snap, a, 0, 6000).unwrap(), old_a);
+
+        // Delete the snapshot: its exclusive blocks must be reclaimed.
+        let during = fs.check().unwrap();
+        assert!(
+            during.allocated_blocks > snap_blocks_before,
+            "divergence should have allocated blocks"
+        );
+        fs.snapshot_delete(snap).unwrap();
+        assert!(fs.snapshot_list().unwrap().is_empty());
+        // Deleting twice is an error.
+        assert!(fs.snapshot_delete(snap).is_err());
+        fs.commit().unwrap();
+        let after = fs.check().unwrap();
+        assert!(
+            after.allocated_blocks < during.allocated_blocks,
+            "expected reclaim: during={} after={}",
+            during.allocated_blocks,
+            after.allocated_blocks
+        );
+        // And the image is still fully consistent.
+        fs.check().unwrap();
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn snapshot_bad_name_rejected() {
+        let (mut fs, path) = test_fs(256);
+        assert!(fs.snapshot_create(b"").is_err());
+        assert!(fs.snapshot_create(&[b'x'; 65]).is_err());
+        assert!(fs.snapshot_read(999, 1, 0, 1).is_err());
+        assert!(fs.snapshot_lookup(999, 1, b"nope").is_err());
         std::fs::remove_file(&path).unwrap();
     }
 }

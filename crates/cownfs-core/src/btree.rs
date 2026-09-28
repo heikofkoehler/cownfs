@@ -266,6 +266,22 @@ impl<K, V, S: NodeStore<K, V>, const T: usize> BTree<K, V, S, T> {
         self.root
     }
 
+    /// Share an arbitrary node (used to pin snapshot roots).
+    pub fn share(&self, id: NodeId) -> Result<(), StoreError> {
+        self.store.borrow_mut().inc_ref(id)
+    }
+
+    /// Release an arbitrary node, reclaiming unreachable blocks
+    /// (used to drop snapshot roots).
+    pub fn release(&self, id: NodeId) -> Result<(), StoreError> {
+        self.store.borrow_mut().dec_ref(id)
+    }
+
+    /// Share the store handle (used to open snapshot views).
+    pub fn store_handle(&self) -> Rc<RefCell<S>> {
+        Rc::clone(&self.store)
+    }
+
     /// Nodes reachable from the current root (for seeding a reopened
     /// store's live-node count, and for leak checks).
     pub fn count_reachable(&self) -> Result<usize, StoreError> {
