@@ -7,15 +7,14 @@ mountable from any OS with an NFS client.
 Status: design phase. See [docs/architecture-plan.md](docs/architecture-plan.md)
 for the full architecture, on-disk format, and phased implementation plan (P0–P7).
 
-## Layout
+## Layout (Rust workspace)
 
-- `src/block/`  — block device layer, allocator, superblock
-- `src/btree/`  — copy-on-write B-tree, refcounts
-- `src/engine/` — VFS-like API: inodes, directories, extents, snapshots, transactions
-- `src/nfs/`    — hand-rolled RPC/XDR + NFSv4.0 server
-- `tools/`      — `mkfs`, `fsck`
-- `tests/`      — model tests, crash-injection harness, pynfs runs
-- `docs/`       — design documents
+- `crates/cownfs-core/` — block device, superblock, bitmap, checksums (P0);
+  CoW B-tree and engine (P1–P3)
+- `crates/cownfs-mkfs/` — `mkfs` binary
+- `crates/cownfs-fsck/` — `fsck` binary
+- `crates/cownfs-nfs/` — hand-rolled RPC/XDR + NFSv4.0 server (P4+)
+- `docs/` — design documents
 
 ## Principles
 
