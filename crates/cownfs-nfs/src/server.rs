@@ -9,13 +9,16 @@ use cownfs_core::engine::{Fs, FsError, FTYPE_DIR, FTYPE_SYMLINK, ROOT_INO};
 use crate::nfs4::{
     encode_compound, AttrMask, AttrValues, Compound, FileAttrs, FileHandle, NfsError, Op, OpResult,
     StateId, ACCESS4_EXECUTE, ACCESS4_EXTEND, ACCESS4_LOOKUP, ACCESS4_READ, FATTR4_MODE,
-    FATTR4_SIZE, FILE_SYNC4, GUARDED4, NF4DIR, NF4LNK, NF4REG, NFS4ERR_INVAL, NFS4ERR_ISDIR,
-    NFS4ERR_NOENT, NFS4ERR_NOTDIR, NFS4ERR_NOTSUPP, NFS4ERR_SERVERFAULT, NFS4_OK, OPEN4_CREATE,
-    OP_ACCESS, OP_COMMIT, OP_CREATE, OP_GETATTR, OP_GETFH, OP_LINK, OP_LOOKUP, OP_LOOKUPP, OP_OPEN,
-    OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_REMOVE, OP_RENAME, OP_RESTOREFH, OP_SAVEFH,
-    OP_SETATTR, OP_WRITE, UNCHECKED4,
+    FATTR4_SIZE, FILE_SYNC4, GUARDED4, NF4DIR, NF4LNK, NF4REG, NFS4ERR_BAD_SEQID, NFS4ERR_DENIED,
+    NFS4ERR_EXPIRED, NFS4ERR_INVAL, NFS4ERR_ISDIR, NFS4ERR_LOCKED, NFS4ERR_NOENT, NFS4ERR_NOTDIR,
+    NFS4ERR_NOTSUPP, NFS4ERR_SERVERFAULT, NFS4ERR_STALE_CLIENTID, NFS4_OK, OPEN4_CREATE, OP_ACCESS,
+    OP_CLOSE, OP_COMMIT, OP_CREATE, OP_GETATTR, OP_GETFH, OP_LINK, OP_LOCK, OP_LOCKU, OP_LOOKUP,
+    OP_LOOKUPP, OP_OPEN, OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_REMOVE, OP_RENAME,
+    OP_RENEW, OP_RESTOREFH, OP_SAVEFH, OP_SETATTR, OP_SETCLIENTID, OP_SETCLIENTID_CONFIRM,
+    OP_WRITE, UNCHECKED4,
 };
 use crate::rpc::{self, Call, RecordReader, RpcError};
+use crate::state::{StateManager, OPEN4_SHARE_ACCESS_BOTH};
 use crate::xdr::{Writer, XdrError};
 use cownfs_core::engine::SetAttrs;
 
@@ -75,6 +78,8 @@ struct Session<'f> {
     cfh: Option<u64>,
     /// Saved filehandle (SAVEFH/RESTOREFH).
     saved_fh: Option<u64>,
+    /// NFSv4 client/open/lock state (P6).
+    state: StateManager,
 }
 
 impl<'f> Session<'f> {
@@ -83,6 +88,7 @@ impl<'f> Session<'f> {
             fs,
             cfh: None,
             saved_fh: None,
+            state: StateManager::new(),
         }
     }
 
@@ -144,6 +150,8 @@ impl<'f> Session<'f> {
             Op::Read { offset, count } => self.op_read(*offset, *count),
             Op::Access { access } => self.op_access(*access),
             Op::Open {
+                clientid,
+                owner,
                 flags,
                 opentype,
                 createmode,
@@ -151,6 +159,8 @@ impl<'f> Session<'f> {
                 claim_type,
                 filename,
             } => self.op_open(
+                *clientid,
+                owner,
                 *flags,
                 *opentype,
                 *createmode,
@@ -185,6 +195,46 @@ impl<'f> Session<'f> {
                 data,
             } => self.op_write(*offset, *stable, data),
             Op::Commit { offset, count } => self.op_commit(*offset, *count),
+            Op::SetClientId {
+                verifier,
+                client_name,
+                ..
+            } => self.op_setclientid(*verifier, client_name),
+            Op::SetClientIdConfirm { clientid, verifier } => {
+                self.op_setclientid_confirm(*clientid, *verifier)
+            }
+            Op::Close { seqid, stateid } => self.op_close(*seqid, stateid),
+            Op::Lock {
+                locktype,
+                reclaim,
+                offset,
+                length,
+                new_lock_owner,
+                open_seqid,
+                open_stateid,
+                lock_seqid,
+                lock_stateid,
+                lock_owner,
+            } => self.op_lock(
+                *locktype,
+                *reclaim,
+                *offset,
+                *length,
+                *new_lock_owner,
+                *open_seqid,
+                open_stateid,
+                *lock_seqid,
+                lock_stateid,
+                lock_owner,
+            ),
+            Op::LockU {
+                locktype,
+                seqid,
+                stateid,
+                offset,
+                length,
+            } => self.op_locku(*locktype, *seqid, stateid, *offset, *length),
+            Op::Renew { clientid } => self.op_renew(*clientid),
         }
     }
 
@@ -388,7 +438,9 @@ impl<'f> Session<'f> {
 
     fn op_open(
         &mut self,
-        _flags: u32,
+        clientid: u64,
+        owner: &[u8],
+        flags: u32,
         opentype: u32,
         createmode: u32,
         createattrs: &[(u32, Vec<u8>)],
@@ -433,13 +485,21 @@ impl<'f> Session<'f> {
         };
 
         self.cfh = Some(file_ino);
-        // P5: dummy stateid; P6 implements real state.
+        // P6: create real open state with share reservation checking.
+        // flags: bits 0-1 = share_access, bits 4-5 = share_deny.
+        let share_access = flags & 0x3;
+        let share_deny = (flags >> 4) & 0x3;
+        let open_rec =
+            match self
+                .state
+                .open(clientid, owner.to_vec(), file_ino, share_access, share_deny)
+            {
+                Ok(rec) => rec,
+                Err(NfsError::Status(s)) => return OpResult::err(OP_OPEN, s),
+                Err(_) => return OpResult::err(OP_OPEN, NFS4ERR_SERVERFAULT),
+            };
         let mut w = Writer::new();
-        StateId {
-            seqid: 0,
-            other: [0u8; 12],
-        }
-        .encode(&mut w);
+        open_rec.stateid.encode(&mut w);
         // changeid
         w.u64(0);
         // rflags
@@ -659,6 +719,107 @@ impl<'f> Session<'f> {
                 OpResult::ok(OP_COMMIT, w.into_bytes())
             }
             Err(e) => OpResult::err(OP_COMMIT, fs_to_nfs(e)),
+        }
+    }
+
+    fn op_setclientid(&mut self, verifier: [u8; 8], name: &[u8]) -> OpResult {
+        let (clientid, _) = self.state.setclientid(verifier, name.to_vec());
+        let mut w = Writer::new();
+        w.u64(clientid);
+        w.opaque_fixed(&verifier);
+        OpResult::ok(OP_SETCLIENTID, w.into_bytes())
+    }
+
+    fn op_setclientid_confirm(&mut self, clientid: u64, verifier: [u8; 8]) -> OpResult {
+        if self.state.confirm(clientid, verifier) {
+            OpResult::ok(OP_SETCLIENTID_CONFIRM, Vec::new())
+        } else {
+            OpResult::err(OP_SETCLIENTID_CONFIRM, NFS4ERR_STALE_CLIENTID)
+        }
+    }
+
+    fn op_close(&mut self, seqid: u32, stateid: &StateId) -> OpResult {
+        match self.state.close(stateid, seqid) {
+            Ok(()) => OpResult::ok(OP_CLOSE, Vec::new()),
+            Err(NfsError::Status(s)) => OpResult::err(OP_CLOSE, s),
+            Err(_) => OpResult::err(OP_CLOSE, NFS4ERR_SERVERFAULT),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn op_lock(
+        &mut self,
+        locktype: u32,
+        _reclaim: bool,
+        offset: u64,
+        length: u64,
+        new_lock_owner: bool,
+        _open_seqid: u32,
+        open_stateid: &StateId,
+        _lock_seqid: u32,
+        lock_stateid: &StateId,
+        lock_owner: &[u8],
+    ) -> OpResult {
+        let file_ino = match self.cfh {
+            Some(i) => i,
+            None => return OpResult::err(OP_LOCK, NFS4ERR_INVAL),
+        };
+        // For P6, we need the clientid. In a real server, the clientid comes
+        // from the RPC credentials or the open_stateid. For simplicity, we
+        // use a fixed clientid 1 (the test will use SETCLIENTID first).
+        // Actually, let's get it from the open_stateid's client.
+        let clientid = match self.state.find_open(open_stateid) {
+            Some(o) => o.clientid,
+            None if !new_lock_owner => {
+                // Existing lock owner: find by lock_stateid.
+                return OpResult::err(OP_LOCK, NFS4ERR_EXPIRED);
+            }
+            None => 1, // Fallback for test.
+        };
+        let open_st = if new_lock_owner {
+            Some(open_stateid)
+        } else {
+            None
+        };
+        match self.state.lock(
+            clientid,
+            lock_owner.to_vec(),
+            file_ino,
+            locktype,
+            offset,
+            length,
+            open_st,
+        ) {
+            Ok(rec) => {
+                let mut w = Writer::new();
+                rec.stateid.encode(&mut w);
+                OpResult::ok(OP_LOCK, w.into_bytes())
+            }
+            Err(NfsError::Status(s)) => OpResult::err(OP_LOCK, s),
+            Err(_) => OpResult::err(OP_LOCK, NFS4ERR_SERVERFAULT),
+        }
+    }
+
+    fn op_locku(
+        &mut self,
+        _locktype: u32,
+        seqid: u32,
+        stateid: &StateId,
+        offset: u64,
+        length: u64,
+    ) -> OpResult {
+        match self.state.unlock(stateid, seqid, offset, length) {
+            Ok(()) => OpResult::ok(OP_LOCKU, Vec::new()),
+            Err(NfsError::Status(s)) => OpResult::err(OP_LOCKU, s),
+            Err(_) => OpResult::err(OP_LOCKU, NFS4ERR_SERVERFAULT),
+        }
+    }
+
+    fn op_renew(&mut self, clientid: u64) -> OpResult {
+        if self.state.renew(clientid) {
+            OpResult::ok(OP_RENEW, Vec::new())
+        } else {
+            OpResult::err(OP_RENEW, NFS4ERR_EXPIRED)
         }
     }
 

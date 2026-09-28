@@ -19,6 +19,11 @@ pub const NFS4ERR_NOTSUPP: u32 = 10004;
 pub const NFS4ERR_SERVERFAULT: u32 = 10006;
 pub const NFS4ERR_BAD_STATEID: u32 = 10025;
 pub const NFS4ERR_OPENMODE: u32 = 10026;
+pub const NFS4ERR_EXPIRED: u32 = 10011;
+pub const NFS4ERR_LOCKED: u32 = 10012;
+pub const NFS4ERR_DENIED: u32 = 10010;
+pub const NFS4ERR_BAD_SEQID: u32 = 10027;
+pub const NFS4ERR_STALE_CLIENTID: u32 = 10022;
 
 // Operation numbers.
 pub const OP_ACCESS: u32 = 3;
@@ -40,6 +45,12 @@ pub const OP_SAVEFH: u32 = 32;
 pub const OP_SETATTR: u32 = 34;
 pub const OP_WRITE: u32 = 38;
 pub const OP_OPEN: u32 = 18;
+pub const OP_CLOSE: u32 = 4;
+pub const OP_LOCK: u32 = 12;
+pub const OP_LOCKU: u32 = 14;
+pub const OP_RENEW: u32 = 27;
+pub const OP_SETCLIENTID: u32 = 35;
+pub const OP_SETCLIENTID_CONFIRM: u32 = 36;
 
 // Attribute numbers (RFC 7530 §5).
 pub const FATTR4_TYPE: u32 = 1;
@@ -68,6 +79,12 @@ pub const EXCLUSIVE4: u32 = 2;
 // Open flags.
 pub const OPEN4_NOCREATE: u32 = 0;
 pub const OPEN4_CREATE: u32 = 1;
+
+// Lock types.
+pub const READ_LT: u32 = 1;
+pub const WRITE_LT: u32 = 2;
+pub const READW_LT: u32 = 3;
+pub const WRITEW_LT: u32 = 4;
 
 // Stable write modes.
 pub const UNSTABLE4: u32 = 0;
@@ -111,6 +128,8 @@ pub enum NfsError {
     BadOp(u32),
     /// Minor version != 0.
     BadMinor,
+    /// NFS status code (for state management errors).
+    Status(u32),
 }
 
 impl From<XdrError> for NfsError {
@@ -183,6 +202,8 @@ pub enum Op {
         access: u32,
     },
     Open {
+        clientid: u64,
+        owner: Vec<u8>,
         flags: u32,
         opentype: u32,
         createmode: u32,
@@ -215,6 +236,43 @@ pub enum Op {
     Commit {
         offset: u64,
         count: u32,
+    },
+    SetClientId {
+        verifier: [u8; 8],
+        client_name: Vec<u8>,
+        callback_prog: u32,
+        netid: String,
+        addr: String,
+    },
+    SetClientIdConfirm {
+        clientid: u64,
+        verifier: [u8; 8],
+    },
+    Close {
+        seqid: u32,
+        stateid: StateId,
+    },
+    Lock {
+        locktype: u32,
+        reclaim: bool,
+        offset: u64,
+        length: u64,
+        new_lock_owner: bool,
+        open_seqid: u32,
+        open_stateid: StateId,
+        lock_seqid: u32,
+        lock_stateid: StateId,
+        lock_owner: Vec<u8>,
+    },
+    LockU {
+        locktype: u32,
+        seqid: u32,
+        stateid: StateId,
+        offset: u64,
+        length: u64,
+    },
+    Renew {
+        clientid: u64,
     },
 }
 
@@ -361,8 +419,8 @@ impl Op {
             }
             OP_ACCESS => Op::Access { access: r.u32()? },
             OP_OPEN => {
-                let _clientid = r.u64()?;
-                let _owner = r.opaque()?; // open_owner4 (opaque)
+                let clientid = r.u64()?;
+                let owner = r.opaque()?.to_vec();
                 let flags = r.u32()?;
                 let opentype = r.u32()?;
                 let (createmode, createattrs) = if opentype == OPEN4_CREATE {
@@ -386,6 +444,8 @@ impl Op {
                     _ => return Err(NfsError::Xdr(XdrError::Invalid("claim_type"))),
                 };
                 Op::Open {
+                    clientid,
+                    owner,
                     flags,
                     opentype,
                     createmode,
@@ -445,6 +505,106 @@ impl Op {
                 let count = r.u32()?;
                 Op::Commit { offset, count }
             }
+            OP_SETCLIENTID => {
+                // nfs_client_id4: verifier + id
+                let v = r.opaque_fixed(8)?;
+                let mut verifier = [0u8; 8];
+                verifier.copy_from_slice(v);
+                let client_name = r.opaque()?.to_vec();
+                // cb_client4: program + location (netid, addr)
+                let callback_prog = r.u32()?;
+                let netid = String::from_utf8_lossy(r.string()?).to_string();
+                let addr = String::from_utf8_lossy(r.string()?).to_string();
+                // callback_ident
+                let _ = r.u32()?;
+                Op::SetClientId {
+                    verifier,
+                    client_name,
+                    callback_prog,
+                    netid,
+                    addr,
+                }
+            }
+            OP_SETCLIENTID_CONFIRM => {
+                let clientid = r.u64()?;
+                let v = r.opaque_fixed(8)?;
+                let mut verifier = [0u8; 8];
+                verifier.copy_from_slice(v);
+                Op::SetClientIdConfirm { clientid, verifier }
+            }
+            OP_CLOSE => {
+                let seqid = r.u32()?;
+                let stateid = StateId::decode(r)?;
+                Op::Close { seqid, stateid }
+            }
+            OP_LOCK => {
+                let locktype = r.u32()?;
+                let reclaim = r.bool()?;
+                let offset = r.u64()?;
+                let length = r.u64()?;
+                let new_lock_owner = r.bool()?;
+                let (open_seqid, open_stateid, lock_seqid, lock_stateid, lock_owner) =
+                    if new_lock_owner {
+                        let os = r.u32()?;
+                        let ost = StateId::decode(r)?;
+                        let ls = r.u32()?;
+                        let _lock_clientid = r.u64()?;
+                        let owner = r.opaque()?.to_vec();
+                        (
+                            os,
+                            ost,
+                            ls,
+                            StateId {
+                                seqid: 0,
+                                other: [0u8; 12],
+                            },
+                            owner,
+                        )
+                    } else {
+                        let ls = r.u32()?;
+                        let lst = StateId::decode(r)?;
+                        (
+                            0,
+                            StateId {
+                                seqid: 0,
+                                other: [0u8; 12],
+                            },
+                            ls,
+                            lst,
+                            Vec::new(),
+                        )
+                    };
+                Op::Lock {
+                    locktype,
+                    reclaim,
+                    offset,
+                    length,
+                    new_lock_owner,
+                    open_seqid,
+                    open_stateid,
+                    lock_seqid,
+                    lock_stateid,
+                    lock_owner,
+                }
+            }
+            OP_LOCKU => {
+                let locktype = r.u32()?;
+                let seqid = r.u32()?;
+                let stateid = StateId::decode(r)?;
+                let offset = r.u64()?;
+                let length = r.u64()?;
+                Op::LockU {
+                    locktype,
+                    seqid,
+                    stateid,
+                    offset,
+                    length,
+                }
+            }
+            OP_RENEW => {
+                let clientid = r.u64()?;
+                Op::Renew { clientid }
+            }
             n => return Err(NfsError::BadOp(n)),
         };
         Ok(op)
@@ -471,6 +631,12 @@ impl Op {
             Op::SetAttr { .. } => OP_SETATTR,
             Op::Write { .. } => OP_WRITE,
             Op::Commit { .. } => OP_COMMIT,
+            Op::SetClientId { .. } => OP_SETCLIENTID,
+            Op::SetClientIdConfirm { .. } => OP_SETCLIENTID_CONFIRM,
+            Op::Close { .. } => OP_CLOSE,
+            Op::Lock { .. } => OP_LOCK,
+            Op::LockU { .. } => OP_LOCKU,
+            Op::Renew { .. } => OP_RENEW,
         }
     }
 }
@@ -636,6 +802,39 @@ mod tests {
         let bytes = w.into_bytes();
         let mut r = Reader::new(&bytes);
         assert_eq!(FileHandle::decode(&mut r).unwrap(), fh);
+    }
+
+    #[test]
+    fn test_lock_decode() {
+        let mut w = Writer::new();
+        w.u32(OP_LOCK);
+        w.u32(2); // WRITE_LT
+        w.bool(false); // reclaim
+        w.u64(0); // offset
+        w.u64(1000); // length
+        w.bool(true); // new_lock_owner
+        w.u32(0); // open seqid
+        w.u32(0);
+        w.opaque_fixed(&[1u8; 12]);
+        w.u32(0); // lock seqid
+        w.u64(1); // lock_owner clientid
+        w.opaque(b"owner1");
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        let op = Op::decode(&mut r).unwrap();
+        match op {
+            Op::Lock {
+                locktype,
+                offset,
+                length,
+                ..
+            } => {
+                assert_eq!(locktype, 2);
+                assert_eq!(offset, 0);
+                assert_eq!(length, 1000);
+            }
+            _ => panic!("wrong op: {op:?}"),
+        }
     }
 
     #[test]

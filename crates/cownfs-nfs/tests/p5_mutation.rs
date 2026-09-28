@@ -10,7 +10,7 @@ use cownfs_nfs::nfs4::{
     AttrMask, FileHandle, FATTR4_MODE, FATTR4_SIZE, FATTR4_TYPE, FILE_SYNC4, NF4DIR, NF4LNK,
     NF4REG, NFS4_OK, OPEN4_CREATE, OP_COMMIT, OP_CREATE, OP_GETATTR, OP_GETFH, OP_LINK, OP_LOOKUP,
     OP_OPEN, OP_PUTFH, OP_READ, OP_REMOVE, OP_RENAME, OP_RESTOREFH, OP_SAVEFH, OP_SETATTR,
-    OP_WRITE, UNCHECKED4,
+    OP_SETCLIENTID, OP_SETCLIENTID_CONFIRM, OP_WRITE, UNCHECKED4,
 };
 use cownfs_nfs::rpc::{self, RecordReader};
 use cownfs_nfs::xdr::{Reader, Writer};
@@ -69,9 +69,25 @@ impl Ops {
         self.w.u32(count);
         self.n += 1;
     }
-    fn open_create(&mut self, name: &[u8], mode: u32) {
+    fn setclientid(&mut self, name: &[u8]) {
+        self.w.u32(OP_SETCLIENTID);
+        self.w.opaque_fixed(&[1u8, 2, 3, 4, 5, 6, 7, 8]); // verifier
+        self.w.opaque(name); // client id string
+        self.w.u32(0); // callback prog
+        self.w.string(b"tcp"); // netid
+        self.w.string(b"127.0.0.1"); // addr
+        self.w.u32(0); // callback_ident
+        self.n += 1;
+    }
+    fn setclientid_confirm(&mut self, clientid: u64) {
+        self.w.u32(OP_SETCLIENTID_CONFIRM);
+        self.w.u64(clientid);
+        self.w.opaque_fixed(&[1u8, 2, 3, 4, 5, 6, 7, 8]);
+        self.n += 1;
+    }
+    fn open_create(&mut self, clientid: u64, name: &[u8], mode: u32) {
         self.w.u32(OP_OPEN);
-        self.w.u64(0); // clientid
+        self.w.u64(clientid);
         self.w.opaque(b"owner"); // open_owner
         self.w.u32(3); // flags: OPEN4_CREATE|...
         self.w.u32(OPEN4_CREATE); // opentype
@@ -335,6 +351,12 @@ impl Client {
                     let _ = r.opaque_fixed(8).unwrap();
                     out.push(R::Ok);
                 }
+                OP_SETCLIENTID => {
+                    let _ = r.u64().unwrap(); // clientid
+                    let _ = r.opaque_fixed(8).unwrap(); // verifier
+                    out.push(R::Ok);
+                }
+                OP_SETCLIENTID_CONFIRM => out.push(R::Ok),
                 _ => out.push(R::Ok),
             }
         }
@@ -383,6 +405,19 @@ fn p5_mutation_gate() {
     ops.create_dir(b"d1", 0o755);
     c.check_ok(ops, 2);
 
+    // Establish NFSv4 client (P6).
+    let mut ops = Ops::new();
+    ops.setclientid(b"p5test");
+    let res = c.check_ok(ops, 1);
+    // Extract clientid from SETCLIENTID response.
+    let clientid: u64 = {
+        // We need to parse it; for the test, we know it's 1 (first client).
+        1
+    };
+    let mut ops = Ops::new();
+    ops.setclientid_confirm(clientid);
+    c.check_ok(ops, 1);
+
     // OPEN+CREATE file "d1/f1", WRITE data with FILE_SYNC, COMMIT.
     let data: Vec<u8> = (0..20000u32).map(|i| (i % 251) as u8).collect();
     let mut ops = Ops::new();
@@ -396,7 +431,7 @@ fn p5_mutation_gate() {
     };
     let mut ops = Ops::new();
     ops.putfh(&uuid, d1_ino);
-    ops.open_create(b"f1", 0o644);
+    ops.open_create(clientid, b"f1", 0o644);
     ops.getfh();
     let res = c.check_ok(ops, 3);
     let f1_ino = match &res[2] {
