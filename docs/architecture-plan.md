@@ -1,6 +1,6 @@
 # cownfs: architecture and implementation plan
 
-**Status:** initial design, language decision open  
+**Status:** initial design, Rust selected as the primary implementation language  
 **Scope:** single-node, single-device, userspace copy-on-write filesystem exported only through NFSv4.0
 
 ## 1. Design in one page
@@ -84,17 +84,16 @@ Responsibilities:
 
 Recommended interface:
 
-```cpp
-struct BlockNo { uint64_t value; };
-struct Block { std::array<std::byte, 4096> bytes; };
+```rust
+struct BlockNo(u64);
+struct Block([u8; 4096]);
 
-class BlockStore {
-public:
-  Result<Block> read(BlockNo);
-  Result<void> write(BlockNo, const Block&);
-  Result<void> sync_data();
-  uint64_t block_count() const;
-};
+trait BlockStore {
+    fn read(&self, block: BlockNo) -> Result<Block>;
+    fn write(&self, block: BlockNo, data: &Block) -> Result<()>;
+    fn sync_data(&self) -> Result<()>;
+    fn block_count(&self) -> u64;
+}
 ```
 
 The allocator must never hand out a block reachable from the active generation or any snapshot. A crash can leak newly allocated but unpublished blocks; it must not make a published block appear free. `fsck --reclaim` repairs leaks by walking every live root and rebuilding the bitmap.
@@ -135,29 +134,28 @@ For the initial implementation, `DATA_SYNC` may be treated as `FILE_SYNC`. Group
 
 The engine is independent of RPC and XDR. It accepts validated identities, opaque inode numbers, byte ranges, and names; it returns typed errors that the frontend maps to NFS status codes. Do not leak NFS stateids into the storage layer.
 
-```cpp
-class Engine {
-public:
-  Result<Inode> lookup(View, Ino parent, Bytes name);
-  Result<Attrs> getattr(View, Ino);
-  Result<void> setattr(Txn&, Ino, AttrPatch);
-  Result<ReadResult> read(View, Ino, uint64_t off, uint32_t len);
-  Result<WriteResult> write(Txn&, Ino, uint64_t off, Bytes data);
+```rust
+trait Engine {
+    fn lookup(&self, view: &View, parent: Ino, name: &[u8]) -> Result<Inode>;
+    fn getattr(&self, view: &View, ino: Ino) -> Result<Attrs>;
+    fn setattr(&self, txn: &mut Txn, ino: Ino, patch: AttrPatch) -> Result<()>;
+    fn read(&self, view: &View, ino: Ino, off: u64, len: u32) -> Result<ReadResult>;
+    fn write(&self, txn: &mut Txn, ino: Ino, off: u64, data: &[u8]) -> Result<WriteResult>;
 
-  Result<Inode> create(Txn&, Ino parent, Bytes name, CreateArgs);
-  Result<Inode> mkdir(Txn&, Ino parent, Bytes name, Mode);
-  Result<void> remove(Txn&, Ino parent, Bytes name);
-  Result<void> rename(Txn&, Ino old_parent, Bytes old_name,
-                      Ino new_parent, Bytes new_name);
-  Result<void> link(Txn&, Ino target, Ino parent, Bytes name);
-  Result<Inode> symlink(Txn&, Ino parent, Bytes name, Bytes target);
-  Result<Bytes> readlink(View, Ino);
-  Result<DirPage> readdir(View, Ino, Cookie, uint32_t max_bytes);
+    fn create(&self, txn: &mut Txn, parent: Ino, name: &[u8], args: CreateArgs) -> Result<Inode>;
+    fn mkdir(&self, txn: &mut Txn, parent: Ino, name: &[u8], mode: Mode) -> Result<Inode>;
+    fn remove(&self, txn: &mut Txn, parent: Ino, name: &[u8]) -> Result<()>;
+    fn rename(&self, txn: &mut Txn, old_parent: Ino, old_name: &[u8],
+              new_parent: Ino, new_name: &[u8]) -> Result<()>;
+    fn link(&self, txn: &mut Txn, target: Ino, parent: Ino, name: &[u8]) -> Result<()>;
+    fn symlink(&self, txn: &mut Txn, parent: Ino, name: &[u8], target: &[u8]) -> Result<Inode>;
+    fn readlink(&self, view: &View, ino: Ino) -> Result<Vec<u8>>;
+    fn readdir(&self, view: &View, ino: Ino, cookie: Cookie, max_bytes: u32) -> Result<DirPage>;
 
-  Result<SnapshotId> snapshot_create(Txn&, String name);
-  Result<void> snapshot_delete(Txn&, SnapshotId);
-  Result<std::vector<Snapshot>> snapshot_list(View);
-};
+    fn snapshot_create(&self, txn: &mut Txn, name: String) -> Result<SnapshotId>;
+    fn snapshot_delete(&self, txn: &mut Txn, id: SnapshotId) -> Result<()>;
+    fn snapshot_list(&self, view: &View) -> Result<Vec<Snapshot>>;
+}
 ```
 
 `View` pins either the current committed roots or a snapshot. `Txn` is the only mutation capability. Each mutating operation updates all related trees in one transaction: for example, create inserts the inode and directory entry together; rename updates both directories and link counts atomically.
@@ -346,7 +344,7 @@ Implement the block store, checksum abstraction, dual superblocks, format codecs
 
 Implement lookup, ordered iteration, insert, replace, delete, split/merge, checked child dereference, refcounts, and recursive free.
 
-**Gate:** run one million randomized operations against a `std::map` model; repeatedly create/delete root snapshots; after every cycle assert `allocated blocks == blocks reachable from all roots`.
+**Gate:** run one million randomized operations against a Rust `BTreeMap` model; repeatedly create/delete root snapshots; after every cycle assert `allocated blocks == blocks reachable from all roots`.
 
 ### P2 — Files, directories, extents, and recovery
 
@@ -394,7 +392,7 @@ No phase is complete merely because its happy path works. Its gate becomes a reg
 
 The remaining test pillars are:
 
-- **B-tree model testing:** from P1 onward, generate insert/update/delete/scan/snapshot operations and compare every observable result with a `std::map`-based persistent model. Shrink failing seeds and preserve them as fixtures.
+- **B-tree model testing:** from P1 onward, generate insert/update/delete/scan/snapshot operations and compare every observable result with a Rust `BTreeMap`-based persistent model. Shrink failing seeds and preserve them as fixtures.
 - **Crash injection:** annotate commit stages and randomly terminate with `SIGKILL`; remount, identify the selected generation, and compare against the last acknowledged stable state. Include torn and reordered writes in a fake block backend, not only process kills against a real file.
 - **Format tests:** golden encoded blocks, endian round-trips, checksum failures, invalid offsets, overlapping items, cycles, out-of-range pointers, and excessive tree depth.
 - **Engine semantics:** link counts, rename replacement rules, directory cycles, sparse reads, truncate extension/shortening, timestamps, stale inode generations, and snapshot isolation.
@@ -407,25 +405,37 @@ Track three different acknowledgements in the test oracle: an unstable NFS reply
 
 ## 8. Programming language decision
 
-The language is intentionally not locked yet. The storage format and module boundaries should be specified independently first.
+**Rust is the primary implementation language.** The storage format and module boundaries remain language-independent, but safety takes priority over initial implementation speed.
 
 | Language | Main advantage | Main concern |
 |---|---|---|
-| C++20 | Immediate velocity | Manual lifetime safety |
-| Rust | Strong safety model | Learning/borrow friction |
+| Rust | Compile-time safety | Initial borrow friction |
+| C++20 | Immediate velocity | Manual memory safety |
 | C | Minimal runtime | Highest bug exposure |
 | Go | Fast server work | GC in storage path |
-| Zig | Explicit, modern low-level | Young ecosystem/tooling |
-
-### C++17/20
-
-Best fit for delivery speed. The author just completed a roughly 31 KLOC C++17 VM with a GC and JIT, so B-tree ownership, byte codecs, custom allocators, and performance work are familiar. C++20 adds `std::span`, concepts, stronger constexpr facilities, and better type constraints without changing the basic development model. It provides deterministic execution, no garbage-collector pauses, and full control over allocation and layout.
-
-Do not depend on compiler-packed structs as the serialization contract. Packed layouts are useful for assertions and inspection, but explicit endian-safe codecs are safer and portable. The hand-written XDR layer is approximately equal work in any candidate language.
+| Zig | Explicit low-level model | Young ecosystem/tooling |
 
 ### Rust
 
-Rust's strongest argument is not fashion: the borrow checker earns its keep precisely in B-tree mutation, transaction ownership, buffer slicing, and state-table code where use-after-free and aliasing bugs can destroy data. Enums also model XDR unions and protocol states well. The costs are lower initial velocity, friction around graph-like CoW structures, and thin server-side NFSv4 crates. RPC/XDR would still be hand-rolled for this scope.
+Rust is the best fit for a filesystem whose mistakes can corrupt user data:
+
+- **Untrusted network bytes:** the NFSv4 server hand-parses ONC RPC and XDR received from the network. Rust makes bounds-checked parsing and memory safety the default, so malformed lengths, unions, and compound operations cannot become buffer over-reads or use-after-free bugs in safe code.
+
+- **Shared CoW ownership:** refcounted B-tree nodes, snapshot roots, path copying, deferred decrements, and recursive free are exactly the manual-ownership code where a use-after-free or double-free can silently destroy data. Rust's ownership model turns broad classes of these failures into compile-time errors.
+
+- **Concurrent clients:** workers share committed views, NFS state tables, caches, and the serialized commit path. Rust's `Send` and `Sync` rules prevent non-thread-safe state from crossing worker boundaries and rule out data races in safe code.
+
+Use arena allocation with generational indices—a `slotmap`-style design—for in-memory B-tree nodes rather than pointer-linked parent/child objects. A node reference is a typed index plus generation, so deleting and reusing a slot invalidates stale references. On-disk links remain checked block numbers with generation and checksum fields. This pattern keeps graph-like mutation explicit without fighting self-referential borrows.
+
+Enums model XDR discriminated unions and NFS state transitions well. Slices and newtypes make bounded byte parsing explicit. Unsafe code should be unnecessary in the initial implementation; if later profiling justifies any, isolate it behind a small audited abstraction with safe property tests.
+
+The honest cost is lower initial velocity while the author gains fluency, especially around B-tree mutation and transaction lifetimes. The server-side NFSv4 crate ecosystem is thin, so RPC/XDR remains custom. Those costs are accepted because safety is the governing requirement.
+
+### C++20 alternative
+
+C++20 remains the documented fallback. The author already has deep C++ experience from a roughly 31 KLOC VM with a GC and JIT, so it offers essentially zero learning curve and higher initial velocity. It also provides deterministic execution, no garbage-collector pauses, direct layout control, and mature sanitizers and fuzzers.
+
+The trade is decisive: all memory safety, node lifetime, recursive release, buffer slicing, and cross-thread synchronization remain manual. RAII, smart pointers, sanitizers, fuzzing, and narrow mutation capabilities reduce risk but do not provide Rust's compile-time guarantees. Choose C++20 only if delivery speed is explicitly reprioritized above the safety-first decision.
 
 ### C
 
@@ -441,11 +451,9 @@ Zig offers explicit allocation, deterministic destruction, simple C interop, and
 
 ### Recommendation
 
-Start in **C++20**, while keeping the decision open until a short spike is complete. It has near-zero learning cost for this author, deterministic performance, direct control over memory and encoded bytes, and no meaningful XDR disadvantage because that layer is custom in every option. Use sanitizers, fuzzing, value-oriented RAII types, and narrow mutation capabilities to compensate for weaker memory safety.
+Proceed with **stable Rust** for production code. Favor safe Rust throughout the block, tree, transaction, RPC/XDR, and NFS state layers. Use generational arena indices for mutable graph structures, explicit endian codecs for disk bytes, bounded parsers for wire bytes, and compile-time `Send`/`Sync` checks at concurrency boundaries.
 
-The honest counterargument is Rust: storage corruption is exactly where compile-time ownership checks pay for themselves. If the project is intended more as a long-lived trustworthy filesystem than as a fast build, accepting lower early velocity for Rust may be the better trade.
-
-A decision spike should implement the same small vertical slice in C++20 and Rust: decode one bounded RPC record, perform a B-tree lookup from a 4 KiB block, verify a checksum, and encode a reply. Compare clarity, unsafe-code surface, binary size, sanitizer/fuzzer ergonomics, and author velocity. Do not use microbenchmark speed alone to decide.
+C++20 remains the speed-first alternative, not a parallel prototype requirement. Revisit it only if Rust creates a measured blocker that cannot be solved without an unsafe surface larger than the equivalent audited C++ implementation.
 
 ---
 
@@ -482,7 +490,7 @@ These invariants should appear as assertions in debug builds and checks in `fsck
 
 1. Freeze an on-disk format v0 header with explicit endian codecs and feature flags.
 2. Resolve and model-test the crash-consistent refcount representation before P1.
-3. Build the C++20/Rust decision spike; choose the language before production tree code.
+3. Create the Rust workspace, define checked block/index newtypes, and establish a no-`unsafe` baseline for P0.
 4. Implement P0 with a fake block backend capable of torn, lost, and reordered writes.
 5. Pin pynfs early and make one empty/read-only RPC response work before P4, so protocol risk is exposed while the storage engine is still small.
 
