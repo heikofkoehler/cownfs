@@ -1,13 +1,19 @@
-//! P1 gate: randomized model test of the CoW B-tree against `BTreeMap`.
+//! P1 gate (kept green through P2): randomized model test of the CoW
+//! B-tree against `BTreeMap`, on the shared [`MemArena`] store.
 //!
 //! Exercises insert/remove/get plus snapshot creation and drops under a
 //! deterministic PRNG, then checks every live tree for exact equality with
-//! its model and for node leaks (allocated == reachable once snapshots are
-//! gone).
+//! its model and for node leaks (store allocation == total reachable once
+//! only one tree remains).
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
-use cownfs_core::btree::BTree;
+use cownfs_core::btree::{MemArena, NodeStore};
+
+type Store = Rc<RefCell<MemArena<u64, u64>>>;
+type Tree<const T: usize> = cownfs_core::btree::BTree<u64, u64, MemArena<u64, u64>, T>;
 
 /// xorshift64* — deterministic, no dependency.
 struct Rng(u64);
@@ -27,8 +33,8 @@ impl Rng {
     }
 }
 
-fn check_tree<const T: usize>(t: &BTree<u64, u64, T>, m: &BTreeMap<u64, u64>) {
-    let got: Vec<(u64, u64)> = t.to_sorted_vec();
+fn check_tree<const T: usize>(t: &Tree<T>, m: &BTreeMap<u64, u64>) {
+    let got: Vec<(u64, u64)> = t.to_sorted_vec().unwrap();
     let want: Vec<(u64, u64)> = m.iter().map(|(&k, &v)| (k, v)).collect();
     assert_eq!(got, want, "tree contents diverged from model");
     assert_eq!(t.len(), m.len(), "len diverged from model");
@@ -36,8 +42,9 @@ fn check_tree<const T: usize>(t: &BTree<u64, u64, T>, m: &BTreeMap<u64, u64>) {
 
 fn run_model<const T: usize>(seed: u64, ops: usize) {
     let mut rng = Rng(seed);
-    let mut trees: Vec<(BTree<u64, u64, T>, BTreeMap<u64, u64>)> =
-        vec![(BTree::new(), BTreeMap::new())];
+    let store: Store = Rc::new(RefCell::new(MemArena::new()));
+    let mut trees: Vec<(Tree<T>, BTreeMap<u64, u64>)> =
+        vec![(Tree::new_on(Rc::clone(&store)).unwrap(), BTreeMap::new())];
 
     for step in 0..ops {
         let ti = rng.below(trees.len() as u64) as usize;
@@ -45,20 +52,20 @@ fn run_model<const T: usize>(seed: u64, ops: usize) {
             0..=44 => {
                 let k = rng.below(2000);
                 let v = rng.next();
-                let old_t = trees[ti].0.insert(k, v);
+                let old_t = trees[ti].0.insert(k, v).unwrap();
                 let old_m = trees[ti].1.insert(k, v);
                 assert_eq!(old_t, old_m, "insert old-value mismatch at step {step}");
             }
             45..=69 => {
                 let k = rng.below(2000);
-                let old_t = trees[ti].0.remove(&k);
+                let old_t = trees[ti].0.remove(&k).unwrap();
                 let old_m = trees[ti].1.remove(&k);
                 assert_eq!(old_t, old_m, "remove old-value mismatch at step {step}");
             }
             70..=79 => {
                 let k = rng.below(2000);
                 assert_eq!(
-                    trees[ti].0.get(&k),
+                    trees[ti].0.get(&k).unwrap(),
                     trees[ti].1.get(&k).copied(),
                     "get mismatch at step {step}"
                 );
@@ -87,15 +94,18 @@ fn run_model<const T: usize>(seed: u64, ops: usize) {
         check_tree(t, m);
     }
 
-    // Leak check: drop every snapshot; every allocated node must be
-    // reachable from the one surviving root.
-    let (mut survivor, _) = trees.pop().unwrap();
+    // Leak check: drop everything but one tree; every node allocated in the
+    // shared store must be reachable from the survivor's root.
+    let (survivor, _) = trees.pop().unwrap();
     drop(trees);
-    // Touch the survivor so the compiler can't drop it early.
-    survivor.insert(u64::MAX, 1);
-    survivor.remove(&u64::MAX);
-    let (live, reachable) = survivor.debug_stats();
-    assert_eq!(live, reachable, "leaked nodes: {live} allocated, {reachable} reachable");
+    let live = store.borrow_mut().live();
+    let reachable = survivor.reachable_node_count();
+    assert_eq!(
+        live, reachable,
+        "leaked nodes: {live} allocated, {reachable} reachable"
+    );
+    drop(survivor);
+    assert_eq!(store.borrow_mut().live(), 0, "drop of last tree leaked");
 }
 
 #[test]
@@ -113,50 +123,56 @@ fn model_t2_stress_splits() {
 
 #[test]
 fn ascending_inserts_descending_removes() {
-    let mut t = BTree::<u64, u64, 4>::new();
+    let store: Store = Rc::new(RefCell::new(MemArena::new()));
+    let mut t = Tree::<4>::new_on(Rc::clone(&store)).unwrap();
     for k in 0..5000 {
-        t.insert(k, k * 3);
+        t.insert(k, k * 3).unwrap();
     }
     assert_eq!(t.len(), 5000);
     for k in 0..5000 {
-        assert_eq!(t.get(&k), Some(k * 3));
+        assert_eq!(t.get(&k).unwrap(), Some(k * 3));
     }
     for k in (0..5000).rev() {
-        assert_eq!(t.remove(&k), Some(k * 3));
+        assert_eq!(t.remove(&k).unwrap(), Some(k * 3));
     }
     assert!(t.is_empty());
-    assert_eq!(t.to_sorted_vec(), vec![]);
-    let (live, reachable) = t.debug_stats();
-    assert_eq!((live, reachable), (1, 1), "only the empty root should remain");
+    assert_eq!(t.to_sorted_vec().unwrap(), vec![]);
+    let (live, reachable) = t.store_stats().unwrap();
+    assert_eq!(
+        (live, reachable),
+        (1, 1),
+        "only the empty root should remain"
+    );
 }
 
 #[test]
 fn cow_snapshot_isolation() {
-    let mut base = BTree::<u64, u64, 4>::new();
+    let store: Store = Rc::new(RefCell::new(MemArena::new()));
+    let mut base = Tree::<4>::new_on(Rc::clone(&store)).unwrap();
     for k in 0..100 {
-        base.insert(k, k);
+        base.insert(k, k).unwrap();
     }
     let mut snap = base.snapshot();
     // Mutate only the snapshot: inserts, overwrites, deletes.
     for k in 100..200 {
-        snap.insert(k, k * 2);
+        snap.insert(k, k * 2).unwrap();
     }
     for k in (0..50).step_by(2) {
-        snap.remove(&k);
+        snap.remove(&k).unwrap();
     }
-    snap.insert(7, 777);
+    snap.insert(7, 777).unwrap();
     // Base is untouched.
     assert_eq!(base.len(), 100);
     for k in 0..100 {
-        assert_eq!(base.get(&k), Some(k));
+        assert_eq!(base.get(&k).unwrap(), Some(k));
     }
-    assert_eq!(base.get(&150), None);
+    assert_eq!(base.get(&150).unwrap(), None);
     // Snapshot has its own contents.
     assert_eq!(snap.len(), 100 + 100 - 25);
-    assert_eq!(snap.get(&7), Some(777));
-    assert_eq!(snap.get(&8), None); // removed
-    assert_eq!(snap.get(&150), Some(300));
+    assert_eq!(snap.get(&7).unwrap(), Some(777));
+    assert_eq!(snap.get(&8).unwrap(), None); // removed
+    assert_eq!(snap.get(&150).unwrap(), Some(300));
     drop(snap);
-    let (live, reachable) = base.debug_stats();
+    let (live, reachable) = base.store_stats().unwrap();
     assert_eq!(live, reachable, "snapshot drop leaked nodes");
 }

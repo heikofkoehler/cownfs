@@ -1,42 +1,77 @@
-//! Copy-on-write B-tree with refcounted nodes.
+//! Copy-on-write B-tree generic over its node storage.
 //!
-//! P1 is in-memory. The design maps 1:1 onto the block-backed tree of P2:
-//! replace [`NodeId`] with a block number and [`Arena`] with the block
-//! cache, and the CoW/refcount logic below is unchanged.
-//!
-//! Design notes:
-//! - Nodes live in an [`Arena`] and are referenced by generational [`NodeId`]s.
-//!   A stale id (wrong generation) panics in debug builds instead of silently
-//!   corrupting — the in-memory equivalent of a checksum failure.
-//! - Every node carries a refcount. `insert`/`remove` clone nodes on the
-//!   mutation path whose refcount > 1 ([`ensure_unique`]), decrementing the
-//!   old node. This is the exact discipline P2 will apply to blocks.
-//! - [`BTree::snapshot`] shares the root (refcount + 1). Dropping a tree
-//!   decrements its root; nodes reaching zero are recursively freed.
-//! - `T` is the B-tree minimum degree: nodes hold up to `2T-1` keys.
-//!   Small `T` (2) is used in tests to stress splits and merges.
+//! The tree algorithm is storage-agnostic: [`NodeStore`] abstracts how nodes
+//! are addressed and persisted. [`MemArena`] is the pure in-memory store used
+//! for algorithm validation; the block-backed store (`store::BlockArena`)
+//! lets the *same* tested algorithm run directly on 4 KiB disk blocks, with
+//! child links as `(block, generation)` [`NodeId`]s.
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::rc::Rc;
 
-/// Generational node reference. `gen` must match the slot's generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct NodeId {
-    idx: u32,
-    gen: u32,
+use crate::store::StoreError;
+
+/// Generational node reference.
+///
+/// For [`MemArena`], `idx` is a slot index; for `BlockArena`, `idx` is a
+/// block number. `gen` must match the slot/block generation: a stale id
+/// panics (debug) instead of silently corrupting — the in-memory equivalent
+/// of a checksum failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NodeId {
+    pub idx: u64,
+    pub gen: u32,
 }
 
-struct Node<K, V> {
-    keys: Vec<K>,
-    vals: Vec<V>,
-    /// Empty for leaves; `keys.len() + 1` entries for internal nodes.
-    children: Vec<NodeId>,
-    refcount: u32,
+/// Storage backend for B-tree nodes.
+///
+/// Reads take `&mut self`: a block-backed store may need to fill its cache
+/// (i.e. do I/O) on a miss, so reads are honestly mutable. Fallible because
+/// block I/O, checksums, and space exhaustion are real errors.
+pub trait NodeStore<K, V> {
+    /// Fetch a node. Panics on a stale id (programmer error).
+    fn get(&mut self, id: NodeId) -> Result<&Node<K, V>, StoreError>;
+    /// Fetch a node for mutation. Marks it dirty in block-backed stores.
+    fn get_mut(&mut self, id: NodeId) -> Result<&mut Node<K, V>, StoreError>;
+    /// Whether the node's block belongs to the last committed generation.
+    /// Committed nodes must never be rewritten in place: mutating them
+    /// requires a copy-on-write. Always false for in-memory stores.
+    fn is_committed(&mut self, id: NodeId) -> Result<bool, StoreError>;
+    /// Store a fresh node with refcount 1 and return its id.
+    /// Fails with [`StoreError::NoSpace`] when the device is full.
+    fn alloc(&mut self, node: Node<K, V>) -> Result<NodeId, StoreError>;
+    /// Remove a node and hand back ownership. The caller must own the only
+    /// reference; child references transfer to the caller (used by merge).
+    fn take(&mut self, id: NodeId) -> Result<Node<K, V>, StoreError>;
+    /// Increment a node's reference count.
+    fn inc_ref(&mut self, id: NodeId) -> Result<(), StoreError>;
+    /// Decrement a node's reference count, freeing it (and, recursively,
+    /// unreachable children) when it reaches zero.
+    fn dec_ref(&mut self, id: NodeId) -> Result<(), StoreError>;
+    /// Persist dirty state. No-op for in-memory stores.
+    fn flush(&mut self) -> Result<(), StoreError> {
+        Ok(())
+    }
+    /// Nodes currently allocated (for leak checks).
+    fn live(&mut self) -> usize;
+    /// Nodes reachable from `root` (for leak checks).
+    fn reachable(&mut self, root: NodeId) -> Result<usize, StoreError>;
+}
+
+/// A B-tree node. Internal nodes interleave `children` around `keys`
+/// (`children.len() == keys.len() + 1`); leaf nodes have no children.
+/// Child links are [`NodeId`]s resolved by the store.
+#[derive(Debug, Clone)]
+pub struct Node<K, V> {
+    pub keys: Vec<K>,
+    pub vals: Vec<V>,
+    pub children: Vec<NodeId>,
+    pub refcount: u32,
 }
 
 impl<K, V> Node<K, V> {
-    fn leaf() -> Self {
+    pub fn leaf() -> Self {
         Self {
             keys: Vec::new(),
             vals: Vec::new(),
@@ -45,9 +80,15 @@ impl<K, V> Node<K, V> {
         }
     }
 
-    fn is_leaf(&self) -> bool {
+    pub fn is_leaf(&self) -> bool {
         self.children.is_empty()
     }
+}
+
+/// In-memory node store with generational ids and refcounted nodes.
+pub struct MemArena<K, V> {
+    slots: Vec<Slot<K, V>>,
+    free: Vec<u64>,
 }
 
 struct Slot<K, V> {
@@ -55,64 +96,76 @@ struct Slot<K, V> {
     node: Option<Node<K, V>>,
 }
 
-struct Arena<K, V> {
-    slots: Vec<Slot<K, V>>,
-    free: Vec<u32>,
-}
-
-impl<K, V> Arena<K, V> {
-    fn new() -> Self {
+impl<K, V> MemArena<K, V> {
+    pub fn new() -> Self {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
         }
     }
 
-    fn get(&self, id: NodeId) -> &Node<K, V> {
+    fn check(&self, id: NodeId) -> &Slot<K, V> {
         let slot = &self.slots[id.idx as usize];
         debug_assert_eq!(slot.gen, id.gen, "stale NodeId");
-        slot.node.as_ref().expect("dangling NodeId")
+        slot
+    }
+}
+
+impl<K, V> Default for MemArena<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K, V> NodeStore<K, V> for MemArena<K, V> {
+    fn get(&mut self, id: NodeId) -> Result<&Node<K, V>, StoreError> {
+        Ok(self.check(id).node.as_ref().expect("dangling NodeId"))
     }
 
-    fn get_mut(&mut self, id: NodeId) -> &mut Node<K, V> {
+    fn get_mut(&mut self, id: NodeId) -> Result<&mut Node<K, V>, StoreError> {
         let slot = &mut self.slots[id.idx as usize];
         debug_assert_eq!(slot.gen, id.gen, "stale NodeId");
-        slot.node.as_mut().expect("dangling NodeId")
+        Ok(slot.node.as_mut().expect("dangling NodeId"))
     }
 
-    fn alloc(&mut self, node: Node<K, V>) -> NodeId {
+    fn is_committed(&mut self, _id: NodeId) -> Result<bool, StoreError> {
+        // In-memory trees have no generations; everything is mutable.
+        Ok(false)
+    }
+
+    fn alloc(&mut self, node: Node<K, V>) -> Result<NodeId, StoreError> {
         debug_assert_eq!(node.refcount, 1);
         if let Some(idx) = self.free.pop() {
             let slot = &mut self.slots[idx as usize];
             debug_assert!(slot.node.is_none());
             slot.node = Some(node);
-            NodeId { idx, gen: slot.gen }
+            Ok(NodeId { idx, gen: slot.gen })
         } else {
-            let idx = self.slots.len() as u32;
-            self.slots.push(Slot { gen: 0, node: Some(node) });
-            NodeId { idx, gen: 0 }
+            let idx = self.slots.len() as u64;
+            self.slots.push(Slot {
+                gen: 0,
+                node: Some(node),
+            });
+            Ok(NodeId { idx, gen: 0 })
         }
     }
 
-    /// Removes the node from its slot *without* touching child refcounts.
-    /// The caller must own the only reference; child references are
-    /// transferred to the caller. Used by merge.
-    fn take(&mut self, id: NodeId) -> Node<K, V> {
-        debug_assert_eq!(self.get(id).refcount, 1, "take of shared node");
+    fn take(&mut self, id: NodeId) -> Result<Node<K, V>, StoreError> {
+        debug_assert_eq!(self.get(id)?.refcount, 1, "take of shared node");
         let slot = &mut self.slots[id.idx as usize];
         slot.gen += 1;
         self.free.push(id.idx);
-        slot.node.take().expect("dangling NodeId")
+        Ok(slot.node.take().expect("dangling NodeId"))
     }
 
-    fn inc_ref(&mut self, id: NodeId) {
-        self.get_mut(id).refcount += 1;
+    fn inc_ref(&mut self, id: NodeId) -> Result<(), StoreError> {
+        self.get_mut(id)?.refcount += 1;
+        Ok(())
     }
 
-    /// Drops one reference; recursively frees the subtree at zero.
-    fn dec_ref(&mut self, id: NodeId) {
+    fn dec_ref(&mut self, id: NodeId) -> Result<(), StoreError> {
         let do_free = {
-            let n = self.get_mut(id);
+            let n = self.get_mut(id)?;
             n.refcount -= 1;
             n.refcount == 0
         };
@@ -122,69 +175,101 @@ impl<K, V> Arena<K, V> {
             self.free.push(id.idx);
             let node = slot.node.take().expect("dangling NodeId");
             for c in node.children {
-                self.dec_ref(c);
+                self.dec_ref(c)?;
             }
         }
+        Ok(())
     }
 
-    /// Allocated slots (for leak checks).
-    fn live(&self) -> usize {
+    fn live(&mut self) -> usize {
         self.slots.iter().filter(|s| s.node.is_some()).count()
     }
 
-    /// Nodes reachable from `root` (for leak checks).
-    fn reachable(&self, root: NodeId) -> usize {
+    fn reachable(&mut self, root: NodeId) -> Result<usize, StoreError> {
         let mut count = 0;
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {
-            let n = self.get(id);
+            let n = self.get(id)?;
             count += 1;
             stack.extend(n.children.iter().copied());
         }
-        count
+        Ok(count)
     }
 }
 
 /// Returns an id for a node the caller may mutate: the node itself if its
 /// refcount is 1, otherwise a fresh copy sharing children (their refcounts
 /// bumped) with the old node dereferenced.
-fn ensure_unique<K: Clone, V: Clone>(a: &mut Arena<K, V>, id: NodeId) -> NodeId {
-    if a.get(id).refcount == 1 {
-        return id;
+fn ensure_unique<K: Clone, V: Clone, S: NodeStore<K, V>>(
+    a: &mut S,
+    id: NodeId,
+) -> Result<NodeId, StoreError> {
+    // A node is mutated in place only when it is uniquely owned *and* was
+    // allocated in the current (uncommitted) transaction. Committed nodes
+    // are immutable: rewriting one would corrupt the fallback generation.
+    if !a.is_committed(id)? && a.get(id)?.refcount == 1 {
+        return Ok(id);
     }
-    let src = a.get(id);
-    let node = Node {
-        keys: src.keys.clone(),
-        vals: src.vals.clone(),
-        children: src.children.clone(),
-        refcount: 1,
+    let node = {
+        let src = a.get(id)?;
+        Node {
+            keys: src.keys.clone(),
+            vals: src.vals.clone(),
+            children: src.children.clone(),
+            refcount: 1,
+        }
     };
-    let new_id = a.alloc(node);
-    for c in a.get(new_id).children.clone() {
-        a.inc_ref(c);
+    let new_id = a.alloc(node)?;
+    let children = a.get(new_id)?.children.clone();
+    for c in children {
+        a.inc_ref(c)?;
     }
-    a.dec_ref(id);
-    new_id
+    a.dec_ref(id)?;
+    Ok(new_id)
 }
 
 /// A copy-on-write B-tree. Clone-on-write snapshots share structure with the
 /// original; dropping a tree releases its references.
-pub struct BTree<K, V, const T: usize = 4> {
-    store: Rc<RefCell<Arena<K, V>>>,
+///
+/// `T` is the minimum degree (nodes hold up to `2T-1` keys); `S` is the node
+/// storage backend.
+pub struct BTree<K, V, S: NodeStore<K, V>, const T: usize> {
+    store: Rc<RefCell<S>>,
     root: NodeId,
     len: usize,
+    /// Whether this handle owns a reference on `root` (i.e. it allocated
+    /// the root or incremented its refcount). `open` handles borrow the
+    /// root from elsewhere (e.g. the superblock) and must not release it.
+    owned: bool,
+    _types: std::marker::PhantomData<(K, V)>,
 }
 
-impl<K: Ord + Clone, V: Clone, const T: usize> BTree<K, V, T> {
-    pub fn new() -> Self {
-        debug_assert!(T >= 2, "minimum degree must be >= 2");
-        let mut arena = Arena::new();
-        let root = arena.alloc(Node::leaf());
-        Self {
-            store: Rc::new(RefCell::new(arena)),
+/// In-memory B-tree (the P1-tested configuration).
+pub type MemBTree<K, V, const T: usize = 4> = BTree<K, V, MemArena<K, V>, T>;
+
+impl<K, V, S: NodeStore<K, V>, const T: usize> BTree<K, V, S, T> {
+    /// Create a tree from an existing store handle, root id and length
+    /// (used when opening block-backed trees from disk).
+    pub fn open(store: Rc<RefCell<S>>, root: NodeId, len: usize) -> Self {
+        assert!(T >= 2, "minimum degree T must be >= 2");
+        BTree {
+            store,
             root,
-            len: 0,
+            len,
+            owned: false,
+            _types: std::marker::PhantomData,
         }
+    }
+
+    /// Current root id (changes across CoW mutations; recorded at commit).
+    pub fn root_id(&self) -> NodeId {
+        self.root
+    }
+
+    /// Nodes reachable from the current root (for seeding a reopened
+    /// store's live-node count, and for leak checks).
+    pub fn count_reachable(&self) -> Result<usize, StoreError> {
+        self.store.borrow_mut().reachable(self.root)
     }
 
     pub fn len(&self) -> usize {
@@ -195,27 +280,139 @@ impl<K: Ord + Clone, V: Clone, const T: usize> BTree<K, V, T> {
         self.len == 0
     }
 
+    /// `(allocated nodes, nodes reachable from root)` — leak-check aid.
+    pub fn store_stats(&self) -> Result<(usize, usize), StoreError> {
+        let live = self.store.borrow_mut().live();
+        Ok((live, self.reachable_node_count()))
+    }
+
+    /// Nodes reachable from this tree's root — for per-store leak checks
+    /// when several trees share one store (tests).
+    pub fn reachable_node_count(&self) -> usize {
+        let mut s = self.store.borrow_mut();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![self.root];
+        while let Some(id) = stack.pop() {
+            if !seen.insert((id.idx, id.gen)) {
+                continue;
+            }
+            let n = s.get(id).expect("reachable walk on a consistent tree");
+            let kids = n.children.clone();
+            stack.extend(kids);
+        }
+        seen.len()
+    }
+
+    /// Verify the tree: every node must load (the store checks checksums
+    /// and generations on load), keys must be strictly increasing in
+    /// traversal order, and every child link must resolve. Shared
+    /// subtrees (snapshots) are verified once. Returns all reachable
+    /// node ids; for block-backed stores `id.idx` is the block number.
+    pub fn verify(&self) -> Result<Vec<NodeId>, StoreError>
+    where
+        K: Ord + Clone,
+    {
+        fn walk<K: Ord + Clone, V, S: NodeStore<K, V>>(
+            st: &mut S,
+            id: NodeId,
+            ids: &mut Vec<NodeId>,
+            seen: &mut std::collections::HashSet<(u64, u32)>,
+            last: &mut Option<K>,
+        ) -> Result<(), StoreError> {
+            if !seen.insert((id.idx, id.gen)) {
+                return Ok(()); // shared subtree; already verified
+            }
+            ids.push(id);
+            // Clone to release the store borrow before recursing.
+            let (keys, children, is_leaf) = {
+                let n = st.get(id)?;
+                (n.keys.clone(), n.children.clone(), n.is_leaf())
+            };
+            for (i, key) in keys.iter().enumerate() {
+                if !is_leaf {
+                    walk(st, children[i], ids, seen, last)?;
+                }
+                if let Some(prev) = last {
+                    if *prev >= *key {
+                        return Err(StoreError::Corrupt {
+                            block: id.idx,
+                            what: "key order violated",
+                        });
+                    }
+                }
+                *last = Some(key.clone());
+            }
+            if !is_leaf {
+                walk(st, children[keys.len()], ids, seen, last)?;
+            }
+            Ok(())
+        }
+
+        let mut s = self.store.borrow_mut();
+        let mut ids = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut last = None;
+        walk(&mut *s, self.root, &mut ids, &mut seen, &mut last)?;
+        Ok(ids)
+    }
+
+    /// Flush dirty state in block-backed stores.
+    pub fn flush(&self) -> Result<(), StoreError> {
+        self.store.borrow_mut().flush()
+    }
+}
+
+impl<K, V, S: NodeStore<K, V> + Default, const T: usize> BTree<K, V, S, T> {
+    pub fn new() -> Self {
+        debug_assert!(T >= 2, "minimum degree must be >= 2");
+        let mut store = S::default();
+        let root = store.alloc(Node::leaf()).expect("alloc cannot fail here");
+        Self {
+            store: Rc::new(RefCell::new(store)),
+            root,
+            len: 0,
+            owned: true,
+            _types: std::marker::PhantomData,
+        }
+    }
+    /// Create an empty tree on an *existing* shared store (tests that run
+    /// many trees against one store for cross-tree leak checks).
+    pub fn new_on(store: Rc<RefCell<S>>) -> Result<Self, StoreError> {
+        let root = store.borrow_mut().alloc(Node::leaf())?;
+        Ok(BTree {
+            store,
+            root,
+            len: 0,
+            owned: true,
+            _types: std::marker::PhantomData,
+        })
+    }
+}
+
+impl<K: Ord + Clone, V: Clone, S: NodeStore<K, V>, const T: usize> BTree<K, V, S, T> {
     /// Shares the root with a new tree handle (refcount + 1).
     pub fn snapshot(&self) -> Self {
         let mut a = self.store.borrow_mut();
-        a.inc_ref(self.root);
+        a.inc_ref(self.root).expect("inc_ref cannot fail here");
         Self {
             store: Rc::clone(&self.store),
             root: self.root,
             len: self.len,
+            owned: true,
+            _types: std::marker::PhantomData,
         }
     }
 
-    pub fn get(&self, k: &K) -> Option<V> {
-        let a = self.store.borrow();
+    pub fn get(&self, k: &K) -> Result<Option<V>, StoreError> {
+        let mut a = self.store.borrow_mut();
         let mut id = self.root;
         loop {
-            let n = a.get(id);
+            let n = a.get(id)?;
             match n.keys.binary_search(k) {
-                Ok(pos) => return Some(n.vals[pos].clone()),
+                Ok(pos) => return Ok(Some(n.vals[pos].clone())),
                 Err(pos) => {
                     if n.is_leaf() {
-                        return None;
+                        return Ok(None);
                     }
                     id = n.children[pos];
                 }
@@ -224,12 +421,12 @@ impl<K: Ord + Clone, V: Clone, const T: usize> BTree<K, V, T> {
     }
 
     /// Inserts `k -> v`, returning the old value if `k` was present.
-    pub fn insert(&mut self, k: K, v: V) -> Option<V> {
+    pub fn insert(&mut self, k: K, v: V) -> Result<Option<V>, StoreError> {
         let mut a = self.store.borrow_mut();
-        let root = ensure_unique(&mut a, self.root);
+        let root = ensure_unique(&mut *a, self.root)?;
         self.root = root;
         let old;
-        if a.get(root).keys.len() == 2 * T - 1 {
+        if a.get(root)?.keys.len() == 2 * T - 1 {
             // Root is full: grow the tree. The old root's single reference
             // moves from this handle into the new root's child slot.
             let new_root = a.alloc(Node {
@@ -237,97 +434,155 @@ impl<K: Ord + Clone, V: Clone, const T: usize> BTree<K, V, T> {
                 vals: Vec::new(),
                 children: vec![root],
                 refcount: 1,
-            });
+            })?;
             self.root = new_root;
-            split_child::<K, V, T>(&mut a, new_root, 0);
-            old = insert_nonfull::<K, V, T>(&mut a, new_root, k, v);
+            split_child::<K, V, S, T>(&mut *a, new_root, 0)?;
+            old = insert_nonfull::<K, V, S, T>(&mut *a, new_root, k, v)?;
         } else {
-            old = insert_nonfull::<K, V, T>(&mut a, root, k, v);
+            old = insert_nonfull::<K, V, S, T>(&mut *a, root, k, v)?;
         }
         if old.is_none() {
             self.len += 1;
         }
-        old
+        Ok(old)
     }
 
     /// Removes `k`, returning its value if present.
-    pub fn remove(&mut self, k: &K) -> Option<V> {
+    pub fn remove(&mut self, k: &K) -> Result<Option<V>, StoreError> {
         let mut a = self.store.borrow_mut();
-        let root = ensure_unique(&mut a, self.root);
+        let root = ensure_unique(&mut *a, self.root)?;
         self.root = root;
-        let out = remove_from::<K, V, T>(&mut a, self.root, k);
+        let out = remove_from::<K, V, S, T>(&mut *a, self.root, k)?;
         // Shrink: an empty internal root is replaced by its only child.
         let shrink = {
-            let r = a.get(self.root);
+            let r = a.get(self.root)?;
             !r.is_leaf() && r.keys.is_empty()
         };
         if shrink {
-            let new_root = a.get(self.root).children[0];
-            a.inc_ref(new_root);
-            a.dec_ref(self.root); // frees old root, balancing the inc above
+            let new_root = a.get(self.root)?.children[0];
+            a.inc_ref(new_root)?;
+            a.dec_ref(self.root)?; // frees old root, balancing the inc above
             self.root = new_root;
         }
         if out.is_some() {
             self.len -= 1;
         }
-        out
+        Ok(out)
     }
 
-    /// Sorted contents, for tests and debugging.
-    pub fn to_sorted_vec(&self) -> Vec<(K, V)> {
-        let a = self.store.borrow();
+    /// Sorted contents, for tests and scans.
+    pub fn to_sorted_vec(&self) -> Result<Vec<(K, V)>, StoreError> {
+        let mut a = self.store.borrow_mut();
         let mut out = Vec::with_capacity(self.len);
-        collect(&a, self.root, &mut out);
-        out
+        collect(&mut *a, self.root, &mut out)?;
+        Ok(out)
     }
 
-    /// `(allocated slots, nodes reachable from root)` — leak-check aid.
-    pub fn debug_stats(&self) -> (usize, usize) {
-        let a = self.store.borrow();
-        (a.live(), a.reachable(self.root))
+    /// Sorted contents within `[lo, hi]`, for scans (e.g. readdir).
+    pub fn range(&self, lo: &K, hi: &K) -> Result<Vec<(K, V)>, StoreError> {
+        let mut a = self.store.borrow_mut();
+        let mut out = Vec::new();
+        collect_range(&mut *a, self.root, lo, hi, &mut out)?;
+        Ok(out)
+    }
+
+    /// Largest key, if any.
+    pub fn max_key(&self) -> Result<Option<K>, StoreError> {
+        let mut a = self.store.borrow_mut();
+        let mut id = self.root;
+        loop {
+            let n = a.get(id)?;
+            if n.is_leaf() {
+                return Ok(n.keys.last().cloned());
+            }
+            id = *n.children.last().expect("internal node has children");
+        }
     }
 }
 
-impl<K, V, const T: usize> Drop for BTree<K, V, T> {
+impl<K, V, S: NodeStore<K, V>, const T: usize> Drop for BTree<K, V, S, T> {
     fn drop(&mut self) {
-        // Last handle: the arena is dropped with its slots, refcounts moot.
-        if Rc::strong_count(&self.store) > 1 {
-            self.store.borrow_mut().dec_ref(self.root);
+        // Only handles that own a reference on the root release it. `open`
+        // handles borrow their root (e.g. from the superblock); the
+        // store's refcounts describe on-disk generations, not handle
+        // lifetimes. (A previous strong_count heuristic misfired during
+        // unwinding and on borrowed roots — hence the explicit flag.)
+        if self.owned {
+            let _ = self.store.borrow_mut().dec_ref(self.root);
         }
     }
 }
 
-fn collect<K: Clone, V: Clone>(a: &Arena<K, V>, id: NodeId, out: &mut Vec<(K, V)>) {
-    let n = a.get(id);
-    for i in 0..n.keys.len() {
-        if !n.is_leaf() {
-            collect(a, n.children[i], out);
+fn collect<K: Clone, V: Clone, S: NodeStore<K, V>>(
+    a: &mut S,
+    id: NodeId,
+    out: &mut Vec<(K, V)>,
+) -> Result<(), StoreError> {
+    let n = a.get(id)?;
+    let keys = n.keys.clone();
+    let vals = n.vals.clone();
+    let children = n.children.clone();
+    let leaf = n.is_leaf();
+    for i in 0..keys.len() {
+        if !leaf {
+            collect(a, children[i], out)?;
         }
-        out.push((n.keys[i].clone(), n.vals[i].clone()));
+        out.push((keys[i].clone(), vals[i].clone()));
     }
-    if !n.is_leaf() {
-        collect(a, *n.children.last().unwrap(), out);
+    if !leaf {
+        collect(
+            a,
+            *children.last().expect("internal node has children"),
+            out,
+        )?;
     }
+    Ok(())
+}
+
+fn collect_range<K: Ord + Clone, V: Clone, S: NodeStore<K, V>>(
+    a: &mut S,
+    id: NodeId,
+    lo: &K,
+    hi: &K,
+    out: &mut Vec<(K, V)>,
+) -> Result<(), StoreError> {
+    let n = a.get(id)?;
+    let keys = n.keys.clone();
+    let vals = n.vals.clone();
+    let children = n.children.clone();
+    let leaf = n.is_leaf();
+    let start = keys.partition_point(|k| k < lo);
+    let end = keys.partition_point(|k| k <= hi);
+    if !leaf {
+        collect_range(a, children[start], lo, hi, out)?;
+    }
+    for i in start..end {
+        out.push((keys[i].clone(), vals[i].clone()));
+        if !leaf {
+            collect_range(a, children[i + 1], lo, hi, out)?;
+        }
+    }
+    Ok(())
 }
 
 /// Splits the full child `parent.children[i]`. Parent must be unique.
-fn split_child<K: Ord + Clone, V: Clone, const T: usize>(
-    a: &mut Arena<K, V>,
+fn split_child<K: Ord + Clone, V: Clone, S: NodeStore<K, V>, const T: usize>(
+    a: &mut S,
     parent: NodeId,
     i: usize,
-) {
+) -> Result<(), StoreError> {
     let child_id = {
-        let c = a.get(parent).children[i];
-        ensure_unique(a, c)
+        let c = a.get(parent)?.children[i];
+        ensure_unique(a, c)?
     };
-    a.get_mut(parent).children[i] = child_id;
+    a.get_mut(parent)?.children[i] = child_id;
 
-    let leaf = a.get(child_id).is_leaf();
+    let leaf = a.get(child_id)?.is_leaf();
     let mut z_keys = Vec::with_capacity(T - 1);
     let mut z_vals = Vec::with_capacity(T - 1);
     let mut z_children = Vec::new();
     {
-        let child = a.get_mut(child_id);
+        let child = a.get_mut(child_id)?;
         z_keys.extend(child.keys.drain(T..));
         z_vals.extend(child.vals.drain(T..));
         if !leaf {
@@ -335,7 +590,7 @@ fn split_child<K: Ord + Clone, V: Clone, const T: usize>(
         }
     }
     let (mk, mv) = {
-        let child = a.get_mut(child_id);
+        let child = a.get_mut(child_id)?;
         (
             child.keys.pop().expect("full child has median"),
             child.vals.pop().expect("full child has median"),
@@ -346,77 +601,78 @@ fn split_child<K: Ord + Clone, V: Clone, const T: usize>(
         vals: z_vals,
         children: z_children,
         refcount: 1,
-    });
-    let p = a.get_mut(parent);
+    })?;
+    let p = a.get_mut(parent)?;
     p.keys.insert(i, mk);
     p.vals.insert(i, mv);
     p.children.insert(i + 1, z_id);
+    Ok(())
 }
 
 /// Inserts into a non-full, unique node. Returns the old value on replace.
-fn insert_nonfull<K: Ord + Clone, V: Clone, const T: usize>(
-    a: &mut Arena<K, V>,
+fn insert_nonfull<K: Ord + Clone, V: Clone, S: NodeStore<K, V>, const T: usize>(
+    a: &mut S,
     node: NodeId,
     k: K,
     v: V,
-) -> Option<V> {
-    let pos = a.get(node).keys.partition_point(|ek| ek < &k);
-    if a.get(node).is_leaf() {
-        let n = a.get_mut(node);
+) -> Result<Option<V>, StoreError> {
+    let pos = a.get(node)?.keys.partition_point(|ek| ek < &k);
+    if a.get(node)?.is_leaf() {
+        let n = a.get_mut(node)?;
         if pos < n.keys.len() && n.keys[pos] == k {
-            return Some(std::mem::replace(&mut n.vals[pos], v));
+            return Ok(Some(std::mem::replace(&mut n.vals[pos], v)));
         }
         n.keys.insert(pos, k);
         n.vals.insert(pos, v);
-        return None;
+        return Ok(None);
     }
-    if pos < a.get(node).keys.len() && a.get(node).keys[pos] == k {
-        let n = a.get_mut(node);
-        return Some(std::mem::replace(&mut n.vals[pos], v));
+    if pos < a.get(node)?.keys.len() && a.get(node)?.keys[pos] == k {
+        let n = a.get_mut(node)?;
+        return Ok(Some(std::mem::replace(&mut n.vals[pos], v)));
     }
     let mut child_pos = pos;
     let mut child = {
-        let c = a.get(node).children[pos];
-        ensure_unique(a, c)
+        let c = a.get(node)?.children[pos];
+        ensure_unique(a, c)?
     };
-    a.get_mut(node).children[pos] = child;
-    if a.get(child).keys.len() == 2 * T - 1 {
-        split_child::<K, V, T>(a, node, pos);
+    a.get_mut(node)?.children[pos] = child;
+    if a.get(child)?.keys.len() == 2 * T - 1 {
+        split_child::<K, V, S, T>(a, node, pos)?;
         // The median moved up to node.keys[pos]; decide where k goes.
         // (Bind first: the match scrutinee borrow must end before mutation.)
         let ord = {
-            let n = a.get(node);
+            let n = a.get(node)?;
             k.cmp(&n.keys[pos])
         };
         match ord {
             Ordering::Equal => {
-                let n = a.get_mut(node);
-                return Some(std::mem::replace(&mut n.vals[pos], v));
+                let n = a.get_mut(node)?;
+                return Ok(Some(std::mem::replace(&mut n.vals[pos], v)));
             }
             Ordering::Greater => child_pos = pos + 1,
             Ordering::Less => {}
         }
         // Both split products are unique; no ensure needed.
-        child = a.get(node).children[child_pos];
+        child = a.get(node)?.children[child_pos];
     }
-    insert_nonfull::<K, V, T>(a, child, k, v)
+    insert_nonfull::<K, V, S, T>(a, child, k, v)
 }
 
-fn max_key<K: Clone, V>(a: &Arena<K, V>, mut id: NodeId) -> K {
+fn max_key<K: Clone, V, S: NodeStore<K, V>>(a: &mut S, mut id: NodeId) -> Result<K, StoreError> {
     loop {
-        let n = a.get(id);
+        let n = a.get(id)?;
         if n.is_leaf() {
-            return n.keys.last().expect("non-empty subtree").clone();
+            return Ok(n.keys.last().expect("non-empty subtree").clone());
         }
-        id = *n.children.last().unwrap();
+        id = *n.children.last().expect("internal node has children");
     }
 }
 
-fn min_key<K: Clone, V>(a: &Arena<K, V>, mut id: NodeId) -> K {
+fn min_key<K: Clone, V, S: NodeStore<K, V>>(a: &mut S, mut id: NodeId) -> Result<K, StoreError> {
     loop {
-        let n = a.get(id);
+        let n = a.get(id)?;
         if n.is_leaf() {
-            return n.keys.first().expect("non-empty subtree").clone();
+            return Ok(n.keys.first().expect("non-empty subtree").clone());
         }
         id = n.children[0];
     }
@@ -424,50 +680,51 @@ fn min_key<K: Clone, V>(a: &Arena<K, V>, mut id: NodeId) -> K {
 
 /// Merges `node.children[i]`, `node.keys[i]`, `node.children[i+1]` into
 /// `children[i]`'s slot. Node must be unique; children are made unique first.
-fn merge_children<K: Ord + Clone, V: Clone, const T: usize>(
-    a: &mut Arena<K, V>,
+fn merge_children<K: Ord + Clone, V: Clone, S: NodeStore<K, V>, const T: usize>(
+    a: &mut S,
     node: NodeId,
     i: usize,
-) {
+) -> Result<(), StoreError> {
     let left_id = {
-        let c = a.get(node).children[i];
-        ensure_unique(a, c)
+        let c = a.get(node)?.children[i];
+        ensure_unique(a, c)?
     };
     let right_id = {
-        let c = a.get(node).children[i + 1];
-        ensure_unique(a, c)
+        let c = a.get(node)?.children[i + 1];
+        ensure_unique(a, c)?
     };
     {
-        let n = a.get_mut(node);
+        let n = a.get_mut(node)?;
         n.children[i] = left_id;
         n.children[i + 1] = right_id;
     }
     // take() frees right's slot; its child references transfer to left.
-    let right = a.take(right_id);
+    let right = a.take(right_id)?;
     let (mk, mv) = {
-        let n = a.get_mut(node);
+        let n = a.get_mut(node)?;
         (n.keys.remove(i), n.vals.remove(i))
     };
-    a.get_mut(node).children.remove(i + 1);
-    let left = a.get_mut(left_id);
+    a.get_mut(node)?.children.remove(i + 1);
+    let left = a.get_mut(left_id)?;
     left.keys.push(mk);
     left.vals.push(mv);
     left.keys.extend(right.keys);
     left.vals.extend(right.vals);
     left.children.extend(right.children);
+    Ok(())
 }
 
 /// Moves sibling's last key through the parent to the front of
 /// `node.children[pos]`. All nodes involved are unique.
-fn borrow_from_left<K: Ord + Clone, V: Clone, const T: usize>(
-    a: &mut Arena<K, V>,
+fn borrow_from_left<K: Ord + Clone, V: Clone, S: NodeStore<K, V>, const T: usize>(
+    a: &mut S,
     node: NodeId,
     pos: usize,
-) {
-    let sib_id = a.get(node).children[pos - 1];
-    let child_id = a.get(node).children[pos];
+) -> Result<(), StoreError> {
+    let sib_id = a.get(node)?.children[pos - 1];
+    let child_id = a.get(node)?.children[pos];
     let (sk, sv, sc) = {
-        let sib = a.get_mut(sib_id);
+        let sib = a.get_mut(sib_id)?;
         let k = sib.keys.pop().expect("sibling has key to lend");
         let v = sib.vals.pop().expect("sibling has key to lend");
         let c = if sib.is_leaf() {
@@ -478,31 +735,32 @@ fn borrow_from_left<K: Ord + Clone, V: Clone, const T: usize>(
         (k, v, c)
     };
     let (dk, dv) = {
-        let n = a.get_mut(node);
+        let n = a.get_mut(node)?;
         (
             std::mem::replace(&mut n.keys[pos - 1], sk),
             std::mem::replace(&mut n.vals[pos - 1], sv),
         )
     };
-    let child = a.get_mut(child_id);
+    let child = a.get_mut(child_id)?;
     child.keys.insert(0, dk);
     child.vals.insert(0, dv);
     if let Some(c) = sc {
         child.children.insert(0, c);
     }
+    Ok(())
 }
 
 /// Moves sibling's first key through the parent to the end of
 /// `node.children[pos]`. All nodes involved are unique.
-fn borrow_from_right<K: Ord + Clone, V: Clone, const T: usize>(
-    a: &mut Arena<K, V>,
+fn borrow_from_right<K: Ord + Clone, V: Clone, S: NodeStore<K, V>, const T: usize>(
+    a: &mut S,
     node: NodeId,
     pos: usize,
-) {
-    let sib_id = a.get(node).children[pos + 1];
-    let child_id = a.get(node).children[pos];
+) -> Result<(), StoreError> {
+    let sib_id = a.get(node)?.children[pos + 1];
+    let child_id = a.get(node)?.children[pos];
     let (sk, sv, sc) = {
-        let sib = a.get_mut(sib_id);
+        let sib = a.get_mut(sib_id)?;
         let k = sib.keys.remove(0);
         let v = sib.vals.remove(0);
         let c = if sib.is_leaf() {
@@ -513,123 +771,292 @@ fn borrow_from_right<K: Ord + Clone, V: Clone, const T: usize>(
         (k, v, c)
     };
     let (dk, dv) = {
-        let n = a.get_mut(node);
+        let n = a.get_mut(node)?;
         (
             std::mem::replace(&mut n.keys[pos], sk),
             std::mem::replace(&mut n.vals[pos], sv),
         )
     };
-    let child = a.get_mut(child_id);
+    let child = a.get_mut(child_id)?;
     child.keys.push(dk);
     child.vals.push(dv);
     if let Some(c) = sc {
         child.children.push(c);
     }
+    Ok(())
 }
 
 /// Ensures `node.children[pos]` has at least T keys, borrowing from a sibling
 /// or merging. Returns the child index to descend into. Node must be unique;
 /// the target child must already be unique.
-fn fill_child<K: Ord + Clone, V: Clone, const T: usize>(
-    a: &mut Arena<K, V>,
+fn fill_child<K: Ord + Clone, V: Clone, S: NodeStore<K, V>, const T: usize>(
+    a: &mut S,
     node: NodeId,
     pos: usize,
-) -> usize {
-    let nchildren = a.get(node).children.len();
+) -> Result<usize, StoreError> {
+    let nchildren = a.get(node)?.children.len();
     if pos > 0 {
         let sib = {
-            let c = a.get(node).children[pos - 1];
-            ensure_unique(a, c)
+            let c = a.get(node)?.children[pos - 1];
+            ensure_unique(a, c)?
         };
-        a.get_mut(node).children[pos - 1] = sib;
-        if a.get(sib).keys.len() >= T {
-            borrow_from_left::<K, V, T>(a, node, pos);
-            return pos;
+        a.get_mut(node)?.children[pos - 1] = sib;
+        if a.get(sib)?.keys.len() >= T {
+            borrow_from_left::<K, V, S, T>(a, node, pos)?;
+            return Ok(pos);
         }
     }
     if pos + 1 < nchildren {
         let sib = {
-            let c = a.get(node).children[pos + 1];
-            ensure_unique(a, c)
+            let c = a.get(node)?.children[pos + 1];
+            ensure_unique(a, c)?
         };
-        a.get_mut(node).children[pos + 1] = sib;
-        if a.get(sib).keys.len() >= T {
-            borrow_from_right::<K, V, T>(a, node, pos);
-            return pos;
+        a.get_mut(node)?.children[pos + 1] = sib;
+        if a.get(sib)?.keys.len() >= T {
+            borrow_from_right::<K, V, S, T>(a, node, pos)?;
+            return Ok(pos);
         }
     }
     if pos + 1 < nchildren {
-        merge_children::<K, V, T>(a, node, pos);
-        pos
+        merge_children::<K, V, S, T>(a, node, pos)?;
+        Ok(pos)
     } else {
-        merge_children::<K, V, T>(a, node, pos - 1);
-        pos - 1
+        merge_children::<K, V, S, T>(a, node, pos - 1)?;
+        Ok(pos - 1)
     }
 }
 
 /// Removes key at `node.keys[pos]` from an internal unique node.
-fn remove_from_internal<K: Ord + Clone, V: Clone, const T: usize>(
-    a: &mut Arena<K, V>,
+fn remove_from_internal<K: Ord + Clone, V: Clone, S: NodeStore<K, V>, const T: usize>(
+    a: &mut S,
     node: NodeId,
     pos: usize,
     k: &K,
-) -> Option<V> {
+) -> Result<Option<V>, StoreError> {
     let left = {
-        let c = a.get(node).children[pos];
-        ensure_unique(a, c)
+        let c = a.get(node)?.children[pos];
+        ensure_unique(a, c)?
     };
-    a.get_mut(node).children[pos] = left;
-    if a.get(left).keys.len() >= T {
-        let pk = max_key(a, left);
-        let pv = remove_from::<K, V, T>(a, left, &pk).expect("predecessor exists");
-        let n = a.get_mut(node);
+    a.get_mut(node)?.children[pos] = left;
+    if a.get(left)?.keys.len() >= T {
+        let pk = max_key(a, left)?;
+        let pv = remove_from::<K, V, S, T>(a, left, &pk)?.expect("predecessor exists");
+        let n = a.get_mut(node)?;
         n.keys[pos] = pk;
-        return Some(std::mem::replace(&mut n.vals[pos], pv));
+        return Ok(Some(std::mem::replace(&mut n.vals[pos], pv)));
     }
     let right = {
-        let c = a.get(node).children[pos + 1];
-        ensure_unique(a, c)
+        let c = a.get(node)?.children[pos + 1];
+        ensure_unique(a, c)?
     };
-    a.get_mut(node).children[pos + 1] = right;
-    if a.get(right).keys.len() >= T {
-        let sk = min_key(a, right);
-        let sv = remove_from::<K, V, T>(a, right, &sk).expect("successor exists");
-        let n = a.get_mut(node);
+    a.get_mut(node)?.children[pos + 1] = right;
+    if a.get(right)?.keys.len() >= T {
+        let sk = min_key(a, right)?;
+        let sv = remove_from::<K, V, S, T>(a, right, &sk)?.expect("successor exists");
+        let n = a.get_mut(node)?;
         n.keys[pos] = sk;
-        return Some(std::mem::replace(&mut n.vals[pos], sv));
+        return Ok(Some(std::mem::replace(&mut n.vals[pos], sv)));
     }
-    merge_children::<K, V, T>(a, node, pos);
-    let merged = a.get(node).children[pos];
-    remove_from::<K, V, T>(a, merged, k)
+    merge_children::<K, V, S, T>(a, node, pos)?;
+    let merged = a.get(node)?.children[pos];
+    remove_from::<K, V, S, T>(a, merged, k)
 }
 
 /// Removes `k` from the subtree at unique `node`. Returns the old value.
-fn remove_from<K: Ord + Clone, V: Clone, const T: usize>(
-    a: &mut Arena<K, V>,
+fn remove_from<K: Ord + Clone, V: Clone, S: NodeStore<K, V>, const T: usize>(
+    a: &mut S,
     node: NodeId,
     k: &K,
-) -> Option<V> {
-    let pos = a.get(node).keys.partition_point(|ek| ek < k);
-    let found = pos < a.get(node).keys.len() && a.get(node).keys[pos] == *k;
+) -> Result<Option<V>, StoreError> {
+    let pos = a.get(node)?.keys.partition_point(|ek| ek < k);
+    let found = pos < a.get(node)?.keys.len() && a.get(node)?.keys[pos] == *k;
     if found {
-        if a.get(node).is_leaf() {
-            let n = a.get_mut(node);
+        if a.get(node)?.is_leaf() {
+            let n = a.get_mut(node)?;
             n.keys.remove(pos);
-            return Some(n.vals.remove(pos));
+            return Ok(Some(n.vals.remove(pos)));
         }
-        return remove_from_internal::<K, V, T>(a, node, pos, k);
+        return remove_from_internal::<K, V, S, T>(a, node, pos, k);
     }
-    if a.get(node).is_leaf() {
-        return None;
+    if a.get(node)?.is_leaf() {
+        return Ok(None);
     }
     let mut child = {
-        let c = a.get(node).children[pos];
-        ensure_unique(a, c)
+        let c = a.get(node)?.children[pos];
+        ensure_unique(a, c)?
     };
-    a.get_mut(node).children[pos] = child;
-    if a.get(child).keys.len() == T - 1 {
-        let idx = fill_child::<K, V, T>(a, node, pos);
-        child = a.get(node).children[idx];
+    a.get_mut(node)?.children[pos] = child;
+    if a.get(child)?.keys.len() == T - 1 {
+        let idx = fill_child::<K, V, S, T>(a, node, pos)?;
+        child = a.get(node)?.children[idx];
     }
-    remove_from::<K, V, T>(a, child, k)
+    remove_from::<K, V, S, T>(a, child, k)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn insert_and_get() {
+        let mut t = MemBTree::<u64, u64, 4>::new();
+        for i in 0..100u64 {
+            assert_eq!(t.insert(i, i * 10).unwrap(), None);
+        }
+        assert_eq!(t.len(), 100);
+        for i in 0..100u64 {
+            assert_eq!(t.get(&i).unwrap(), Some(i * 10));
+        }
+        assert_eq!(t.get(&1000).unwrap(), None);
+        assert_eq!(t.insert(42, 999).unwrap(), Some(420));
+        assert_eq!(t.get(&42).unwrap(), Some(999));
+        assert_eq!(t.len(), 100);
+    }
+
+    #[test]
+    fn remove_basic() {
+        let mut t = MemBTree::<u64, u64, 4>::new();
+        for i in 0..50u64 {
+            t.insert(i, i).unwrap();
+        }
+        for i in (0..50u64).step_by(2) {
+            assert_eq!(t.remove(&i).unwrap(), Some(i));
+        }
+        assert_eq!(t.len(), 25);
+        for i in 0..50u64 {
+            assert_eq!(t.get(&i).unwrap(), if i % 2 == 1 { Some(i) } else { None });
+        }
+        assert_eq!(t.remove(&999).unwrap(), None);
+    }
+
+    #[test]
+    fn snapshot_isolation() {
+        let mut t = MemBTree::<u64, u64, 4>::new();
+        for i in 0..20u64 {
+            t.insert(i, i).unwrap();
+        }
+        let snap = t.snapshot();
+        for i in 0..20u64 {
+            t.insert(i, i + 1000).unwrap();
+            t.remove(&(i + 500)).unwrap();
+        }
+        for i in 0..20u64 {
+            assert_eq!(snap.get(&i).unwrap(), Some(i));
+        }
+        assert_eq!(snap.len(), 20);
+        assert_eq!(t.len(), 20);
+    }
+
+    #[test]
+    fn range_scan() {
+        let mut t = MemBTree::<u64, u64, 4>::new();
+        for i in 0..100u64 {
+            t.insert(i, i * 2).unwrap();
+        }
+        let r = t.range(&20, &29).unwrap();
+        assert_eq!(r.len(), 10);
+        assert_eq!(r[0], (20, 40));
+        assert_eq!(r[9], (29, 58));
+        assert!(t.range(&200, &300).unwrap().is_empty());
+    }
+
+    /// Deterministic xorshift64 PRNG (no external crates in core).
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+    }
+
+    fn run_model<S, F, const TT: usize>(seed: u64, ops: usize, mk: &F)
+    where
+        S: NodeStore<u64, u64>,
+        F: Fn() -> S,
+    {
+        let store = Rc::new(RefCell::new(mk()));
+        let root = store.borrow_mut().alloc(Node::leaf()).unwrap();
+        let mut t = BTree::<u64, u64, S, TT>::open(store, root, 0);
+        let mut m = BTreeMap::<u64, u64>::new();
+        let mut snaps: Vec<BTree<u64, u64, S, TT>> = Vec::new();
+        let mut snap_models: Vec<BTreeMap<u64, u64>> = Vec::new();
+        let mut rng = Rng(seed);
+
+        for _ in 0..ops {
+            match rng.next() % 10 {
+                0..=4 => {
+                    let k = rng.next() % 200;
+                    let v = rng.next() % 1000;
+                    assert_eq!(t.insert(k, v).unwrap(), m.insert(k, v));
+                }
+                5..=7 => {
+                    let k = rng.next() % 200;
+                    assert_eq!(t.remove(&k).unwrap(), m.remove(&k));
+                }
+                8 => {
+                    snaps.push(t.snapshot());
+                    snap_models.push(m.clone());
+                    if snaps.len() > 4 {
+                        snaps.remove(0);
+                        snap_models.remove(0);
+                    }
+                }
+                _ => {
+                    let k = rng.next() % 200;
+                    assert_eq!(t.get(&k).unwrap(), m.get(&k).copied());
+                }
+            }
+            if !snaps.is_empty() && rng.next() % 25 == 0 {
+                let i = (rng.next() as usize) % snaps.len();
+                let got: BTreeMap<u64, u64> =
+                    snaps[i].to_sorted_vec().unwrap().into_iter().collect();
+                assert_eq!(got, snap_models[i]);
+            }
+        }
+        let got: BTreeMap<u64, u64> = t.to_sorted_vec().unwrap().into_iter().collect();
+        assert_eq!(got, m);
+        assert_eq!(t.len(), m.len());
+        for (s, sm) in snaps.iter().zip(snap_models.iter()) {
+            let g: BTreeMap<u64, u64> = s.to_sorted_vec().unwrap().into_iter().collect();
+            assert_eq!(&g, sm);
+        }
+        // Leak check: drop snapshots first; everything allocated must then
+        // be reachable from the one live root.
+        drop(snaps);
+        let (live, reach) = t.store_stats().unwrap();
+        assert_eq!(live, reach, "leak: live={live} reachable={reach}");
+        drop(t);
+    }
+
+    #[test]
+    fn model_mem_t4() {
+        run_model::<MemArena<u64, u64>, _, 4>(0x1234_5678, 60_000, &MemArena::new);
+    }
+
+    #[test]
+    fn model_mem_t2() {
+        run_model::<MemArena<u64, u64>, _, 2>(0x9e37_79b9, 75_000, &MemArena::new);
+    }
+
+    #[test]
+    fn ascending_descending_stress() {
+        let mut t = MemBTree::<u64, u64, 4>::new();
+        for i in 0..10_000u64 {
+            t.insert(i, i).unwrap();
+        }
+        assert_eq!(t.len(), 10_000);
+        for i in (0..10_000u64).rev() {
+            assert_eq!(t.remove(&i).unwrap(), Some(i));
+        }
+        assert_eq!(t.len(), 0);
+        assert!(t.is_empty());
+        assert_eq!(t.to_sorted_vec().unwrap(), vec![]);
+        let (live, reach) = t.store_stats().unwrap();
+        assert_eq!((live, reach), (1, 1)); // just the empty root
+    }
 }

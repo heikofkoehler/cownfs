@@ -4,6 +4,10 @@
 //! transaction commits by writing the *inactive* slot with a bumped
 //! generation and syncing; a crash can only ever expose the last fully
 //! written slot, so mount always sees a consistent filesystem.
+//!
+//! v2 (P2): the superblock additionally records the four B-tree roots
+//! (block, generation, length) plus the inode/snapshot allocators, so a
+//! freshly opened filesystem can locate all metadata.
 
 use std::io;
 use std::io::Read;
@@ -14,15 +18,15 @@ use crate::checksum::checksum;
 use crate::{Block, BLOCK_SIZE};
 
 pub const MAGIC: u64 = u64::from_le_bytes(*b"cownfs01");
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 3;
 
 /// Block numbers of the two superblock slots.
 pub const SLOT_BLOCKS: [u64; 2] = [0, 1];
 
-const HDR_LEN: usize = 128;
+const HDR_LEN: usize = 256;
 const OFF_CHECKSUM: usize = 64;
 
-/// In-memory superblock. The on-disk encoding is a 128-byte little-endian
+/// In-memory superblock. The on-disk encoding is a 256-byte little-endian
 /// header at the start of the slot block; the rest of the block is zeroed.
 #[derive(Debug, Clone)]
 pub struct Superblock {
@@ -30,7 +34,30 @@ pub struct Superblock {
     pub block_count: u64,
     pub uuid: [u8; 16],
     pub bitmap_start: u64,
+    /// Blocks per bitmap area. Two areas live at
+    /// `[bitmap_start, bitmap_start + 2*bitmap_blocks)`; the slot's
+    /// `bitmap_area` selects the active one. The inactive area receives the
+    /// next commit's bitmap, so a crash between the bitmap write and the
+    /// slot write always leaves a consistent (bitmap, generation) pair.
     pub bitmap_blocks: u64,
+    /// Active bitmap area (0 or 1); flipped on every commit.
+    pub bitmap_area: u64,
+    // Tree roots: (block, generation, length).
+    pub inode_root: u64,
+    pub inode_root_gen: u32,
+    pub inode_len: u64,
+    pub dir_root: u64,
+    pub dir_root_gen: u32,
+    pub dir_len: u64,
+    pub extent_root: u64,
+    pub extent_root_gen: u32,
+    pub extent_len: u64,
+    pub snap_root: u64,
+    pub snap_root_gen: u32,
+    pub snap_len: u64,
+    // Allocators.
+    pub next_inode: u64,
+    pub next_snap: u64,
 }
 
 impl Superblock {
@@ -43,6 +70,21 @@ impl Superblock {
         hdr[32..48].copy_from_slice(&self.uuid);
         hdr[48..56].copy_from_slice(&self.bitmap_start.to_le_bytes());
         hdr[56..64].copy_from_slice(&self.bitmap_blocks.to_le_bytes());
+        hdr[184..192].copy_from_slice(&self.bitmap_area.to_le_bytes());
+        hdr[72..80].copy_from_slice(&self.inode_root.to_le_bytes());
+        hdr[80..84].copy_from_slice(&self.inode_root_gen.to_le_bytes());
+        hdr[88..96].copy_from_slice(&self.inode_len.to_le_bytes());
+        hdr[96..104].copy_from_slice(&self.dir_root.to_le_bytes());
+        hdr[104..108].copy_from_slice(&self.dir_root_gen.to_le_bytes());
+        hdr[112..120].copy_from_slice(&self.dir_len.to_le_bytes());
+        hdr[120..128].copy_from_slice(&self.extent_root.to_le_bytes());
+        hdr[128..132].copy_from_slice(&self.extent_root_gen.to_le_bytes());
+        hdr[136..144].copy_from_slice(&self.extent_len.to_le_bytes());
+        hdr[144..152].copy_from_slice(&self.snap_root.to_le_bytes());
+        hdr[152..156].copy_from_slice(&self.snap_root_gen.to_le_bytes());
+        hdr[160..168].copy_from_slice(&self.snap_len.to_le_bytes());
+        hdr[168..176].copy_from_slice(&self.next_inode.to_le_bytes());
+        hdr[176..184].copy_from_slice(&self.next_snap.to_le_bytes());
         // Checksum covers the header with the checksum field zeroed.
         let sum = checksum(&hdr);
         hdr[OFF_CHECKSUM..OFF_CHECKSUM + 8].copy_from_slice(&sum.to_le_bytes());
@@ -64,13 +106,64 @@ impl Superblock {
         if checksum(&tmp) != stored {
             return None;
         }
+        let u32_at = |o: usize| -> Option<u32> {
+            Some(u32::from_le_bytes(hdr.get(o..o + 4)?.try_into().ok()?))
+        };
+        let u64_at = |o: usize| -> Option<u64> {
+            Some(u64::from_le_bytes(hdr.get(o..o + 8)?.try_into().ok()?))
+        };
         Some(Self {
-            generation: u64::from_le_bytes(hdr[16..24].try_into().ok()?),
-            block_count: u64::from_le_bytes(hdr[24..32].try_into().ok()?),
+            generation: u64_at(16)?,
+            block_count: u64_at(24)?,
             uuid: hdr[32..48].try_into().ok()?,
-            bitmap_start: u64::from_le_bytes(hdr[48..56].try_into().ok()?),
-            bitmap_blocks: u64::from_le_bytes(hdr[56..64].try_into().ok()?),
+            bitmap_start: u64_at(48)?,
+            bitmap_blocks: u64_at(56)?,
+            bitmap_area: u64_at(184)?,
+            inode_root: u64_at(72)?,
+            inode_root_gen: u32_at(80)?,
+            inode_len: u64_at(88)?,
+            dir_root: u64_at(96)?,
+            dir_root_gen: u32_at(104)?,
+            dir_len: u64_at(112)?,
+            extent_root: u64_at(120)?,
+            extent_root_gen: u32_at(128)?,
+            extent_len: u64_at(136)?,
+            snap_root: u64_at(144)?,
+            snap_root_gen: u32_at(152)?,
+            snap_len: u64_at(160)?,
+            next_inode: u64_at(168)?,
+            next_snap: u64_at(176)?,
         })
+    }
+
+    /// Blank v3 superblock; the engine fills in roots before writing.
+    pub fn blank(block_count: u64, bitmap_start: u64, bitmap_blocks: u64) -> Self {
+        let mut uuid = [0u8; 16];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut uuid))
+            .expect("/dev/urandom readable");
+        Superblock {
+            generation: 0,
+            block_count,
+            uuid,
+            bitmap_start,
+            bitmap_blocks,
+            bitmap_area: 0,
+            inode_root: 0,
+            inode_root_gen: 0,
+            inode_len: 0,
+            dir_root: 0,
+            dir_root_gen: 0,
+            dir_len: 0,
+            extent_root: 0,
+            extent_root_gen: 0,
+            extent_len: 0,
+            snap_root: 0,
+            snap_root_gen: 0,
+            snap_len: 0,
+            next_inode: 0,
+            next_snap: 0,
+        }
     }
 }
 
@@ -78,6 +171,21 @@ fn write_slot(dev: &mut impl BlockDevice, slot: usize, sb: &Superblock) -> io::R
     let mut blk = [0u8; BLOCK_SIZE];
     blk[..HDR_LEN].copy_from_slice(&sb.encode());
     dev.write_block(SLOT_BLOCKS[slot], &blk)
+}
+
+/// Write both slots with `sb` as-is (no generation bump) and sync.
+/// Used by mkfs; the engine's transaction path uses [`commit_generation`].
+pub fn write_slots(dev: &mut impl BlockDevice, sb: &Superblock) -> io::Result<()> {
+    write_slot(dev, 0, sb)?;
+    write_slot(dev, 1, sb)?;
+    dev.sync()
+}
+
+impl Superblock {
+    /// First block of the active bitmap area.
+    pub fn bitmap_area_start(&self) -> u64 {
+        self.bitmap_start + self.bitmap_area * self.bitmap_blocks
+    }
 }
 
 /// Reads and validates one superblock slot; `None` means corrupt/unwritten.
@@ -89,11 +197,12 @@ pub fn read_slot(dev: &impl BlockDevice, slot: usize) -> Option<Superblock> {
     Superblock::decode(&hdr)
 }
 
-/// Formats a fresh filesystem: writes the bitmap and both superblock slots
-/// at generation 1. Returns the superblock.
+/// Formats a fresh P0-style image: writes the bitmap and both superblock
+/// slots at generation 1 (no filesystem trees; roots are zero).
+/// The engine's `format_fs` builds on this for full P2 images.
 pub fn format(dev: &mut impl BlockDevice, block_count: u64) -> io::Result<Superblock> {
     let bblocks = bitmap::blocks_needed(block_count);
-    let reserved = 2 + bblocks; // slots + bitmap
+    let reserved = 2 + 2 * bblocks; // slots + two alternating bitmap areas
     if block_count < reserved + 16 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -113,19 +222,9 @@ pub fn format(dev: &mut impl BlockDevice, block_count: u64) -> io::Result<Superb
         dev.write_block(2 + i as u64, &blk)?;
     }
 
-    let mut uuid = [0u8; 16];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut uuid)?;
-
-    let sb = Superblock {
-        generation: 1,
-        block_count,
-        uuid,
-        bitmap_start: 2,
-        bitmap_blocks: bblocks,
-    };
-    write_slot(dev, 0, &sb)?;
-    write_slot(dev, 1, &sb)?;
-    dev.sync()?;
+    let mut sb = Superblock::blank(block_count, 2, bblocks);
+    sb.generation = 1;
+    write_slots(dev, &sb)?;
     Ok(sb)
 }
 
@@ -135,20 +234,20 @@ pub fn open(dev: &impl BlockDevice) -> io::Result<(Superblock, usize)> {
     let mut best: Option<(Superblock, usize)> = None;
     for i in 0..SLOT_BLOCKS.len() {
         if let Some(sb) = read_slot(dev, i) {
-            let better = best.as_ref().map_or(true, |(b, _)| sb.generation > b.generation);
+            let better = best
+                .as_ref()
+                .map_or(true, |(b, _)| sb.generation > b.generation);
             if better {
                 best = Some((sb, i));
             }
         }
     }
-    best.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "no valid superblock slot")
-    })
+    best.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no valid superblock slot"))
 }
 
-/// P0 transaction commit primitive: advances the generation by writing the
-/// inactive slot and syncing. P2 extends this into a full transaction commit
-/// carrying dirty data/metadata blocks.
+/// Transaction commit: advances the generation by writing the inactive slot
+/// and syncing. The caller must have flushed dirty metadata and the bitmap
+/// first; a crash before this point exposes the previous generation.
 pub fn commit_generation(
     dev: &mut impl BlockDevice,
     sb: &mut Superblock,
