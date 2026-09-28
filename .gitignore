@@ -1,0 +1,7 @@
+build/
+*.o
+*.a
+cownfs
+cownfs-mkfs
+cownfs-fsck
+*.img
