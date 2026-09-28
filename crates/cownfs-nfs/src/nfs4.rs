@@ -388,7 +388,7 @@ fn skip_attr_value(br: &mut Reader, attr: u32) -> Result<(), NfsError> {
 }
 
 impl Op {
-    fn decode(r: &mut Reader) -> Result<Self, NfsError> {
+    pub fn decode(r: &mut Reader) -> Result<Self, NfsError> {
         let opnum = r.u32()?;
         let op = match opnum {
             OP_PUTFH => Op::PutFh(FileHandle::decode(r)?),

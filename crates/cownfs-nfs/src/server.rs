@@ -68,6 +68,9 @@ fn fs_to_nfs(e: FsError) -> u32 {
         FsError::NoSpace => NFS4ERR_NOTSUPP, // read-only in P4; real mapping in P5
         FsError::Invalid(_) => NFS4ERR_INVAL,
         FsError::Store(_) => NFS4ERR_SERVERFAULT,
+        // Injected faults (P7) never reach the wire in production;
+        // map to SERVERFAULT if they do.
+        FsError::InjectedFault(_) => NFS4ERR_SERVERFAULT,
     }
 }
 

@@ -39,6 +39,23 @@ pub type DirTree = BTree<DirKey, DirEnt, BlockArena<DirKey, DirEnt>, T_DIR>;
 pub type ExtentTree = BTree<ExtentKey, Extent, BlockArena<ExtentKey, Extent>, T_EXTENT>;
 pub type SnapTree = BTree<u64, SnapRecord, BlockArena<u64, SnapRecord>, T_SNAP>;
 
+/// Deterministic crash-injection point for P7 hardening tests.
+///
+/// When armed via `Fs::set_fault_point`, the next `commit()` aborts with
+/// `FsError::InjectedFault` *before* completing the named stage, leaving
+/// on-disk state exactly as a real crash at that point would. The test then
+/// drops the `Fs` without retrying and reopens: recovery must select either
+/// the old or the new generation, never a torn state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultPoint {
+    /// After B-tree nodes are flushed, before the bitmap is persisted.
+    AfterFlush,
+    /// After the bitmap is persisted, before the device sync.
+    AfterBitmap,
+    /// After the device sync, before the superblock slot flip.
+    AfterSync,
+}
+
 #[derive(Debug)]
 pub enum FsError {
     Store(StoreError),
@@ -50,6 +67,8 @@ pub enum FsError {
     BadName,
     NoSpace,
     Invalid(String),
+    /// Deterministic fault injected by `Fs::set_fault_point` (P7).
+    InjectedFault(FaultPoint),
 }
 
 impl std::fmt::Display for FsError {
@@ -61,6 +80,7 @@ impl std::fmt::Display for FsError {
             FsError::NotDir => write!(f, "not a directory"),
             FsError::NotFile => write!(f, "not a regular file"),
             FsError::NotEmpty => write!(f, "directory not empty"),
+            FsError::InjectedFault(p) => write!(f, "injected fault at {p:?}"),
             FsError::BadName => write!(f, "invalid file name"),
             FsError::NoSpace => write!(f, "no space left on device"),
             FsError::Invalid(s) => write!(f, "invalid: {s}"),
@@ -414,6 +434,7 @@ impl Fs {
             dev,
             bitmap,
             pending_free: Vec::new(),
+            fault_point: None,
         }));
 
         let (ia, iroot) = BlockArena::new_tree(Rc::clone(&shared), T_INODE)?;
@@ -487,6 +508,7 @@ impl Fs {
             dev,
             bitmap,
             pending_free: Vec::new(),
+            fault_point: None,
         }));
 
         let ia: Rc<RefCell<BlockArena<u64, Inode>>> =
@@ -667,16 +689,48 @@ impl Fs {
     /// previous generation stays fully consistent.
     pub fn commit(&mut self) -> Result<(), FsError> {
         self.flush_all()?;
+        self.check_fault(FaultPoint::AfterFlush)?;
         let inactive = self.sb.bitmap_start + (1 - self.sb.bitmap_area) * self.sb.bitmap_blocks;
         self.persist_bitmap(inactive)?;
+        self.check_fault(FaultPoint::AfterBitmap)?;
         // The new generation's blocks must be on stable storage *before*
         // any superblock slot points at them.
         self.shared.borrow_mut().dev.sync()?;
+        self.check_fault(FaultPoint::AfterSync)?;
         self.sync_roots();
         self.sb.bitmap_area = 1 - self.sb.bitmap_area;
         let mut sh = self.shared.borrow_mut();
         superblock::commit_generation(&mut sh.dev, &mut self.sb, &mut self.active_slot)?;
         Ok(())
+    }
+
+    /// Check for an armed fault point; if matched, disarm and abort.
+    fn check_fault(&mut self, point: FaultPoint) -> Result<(), FsError> {
+        let armed = self.shared.borrow().fault_point;
+        if armed == Some(point) {
+            self.shared.borrow_mut().fault_point = None;
+            return Err(FsError::InjectedFault(point));
+        }
+        Ok(())
+    }
+
+    /// Arm a deterministic crash point for the next `commit()` (P7).
+    /// The commit will abort with `FsError::InjectedFault` before
+    /// completing the named stage.
+    pub fn set_fault_point(&mut self, point: FaultPoint) {
+        self.shared.borrow_mut().fault_point = Some(point);
+    }
+
+    /// Disarm any fault point.
+    pub fn clear_fault_point(&mut self) {
+        self.shared.borrow_mut().fault_point = None;
+    }
+
+    /// Forcibly set a bitmap bit (P7 fault injection).
+    /// Simulates a lost free or bitmap corruption for reclaim testing.
+    /// Not for production use.
+    pub fn debug_set_bitmap_bit(&mut self, block: u64) {
+        self.shared.borrow_mut().bitmap.set(block);
     }
 
     /// Full consistency check of the committed state.
@@ -760,6 +814,55 @@ impl Fs {
             data_blocks,
             allocated_blocks,
         })
+    }
+
+    /// Reclaim unreachable allocated blocks (P7 `fsck --reclaim`).
+    ///
+    /// Walks all reachable blocks (live trees + snapshots) and clears the
+    /// bitmap bit for any allocated non-reserved block not in the reachable
+    /// set. Returns the number of blocks reclaimed. The caller must `commit()`
+    /// to persist the new bitmap.
+    pub fn reclaim_unreachable(&mut self) -> Result<u64, FsError> {
+        use std::collections::HashSet;
+
+        let mut reachable: HashSet<u64> = HashSet::new();
+        for ids in [
+            self.inodes.verify()?,
+            self.dirs.verify()?,
+            self.extents.verify()?,
+            self.snaps.verify()?,
+        ] {
+            reachable.extend(ids.iter().map(|id| id.idx));
+        }
+        for (snap_id, _) in self.snapshot_list()? {
+            let (inodes, dirs, extents) = self.snap_trees(snap_id)?;
+            for ids in [inodes.verify()?, dirs.verify()?, extents.verify()?] {
+                reachable.extend(ids.iter().map(|id| id.idx));
+            }
+            for (_, ext) in extents.to_sorted_vec()? {
+                for b in ext.blk..ext.blk + ext.len as u64 {
+                    reachable.insert(b);
+                }
+            }
+        }
+        for (_, ext) in self.extents.to_sorted_vec()? {
+            for b in ext.blk..ext.blk + ext.len as u64 {
+                reachable.insert(b);
+            }
+        }
+
+        let reserved = 2 + 2 * self.sb.bitmap_blocks;
+        let mut reclaimed = 0u64;
+        {
+            let mut sh = self.shared.borrow_mut();
+            for b in reserved..self.sb.block_count {
+                if sh.bitmap.test(b) && !reachable.contains(&b) {
+                    sh.bitmap.clear(b);
+                    reclaimed += 1;
+                }
+            }
+        }
+        Ok(reclaimed)
     }
 
     // -- block helpers -----------------------------------------------------

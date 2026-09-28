@@ -114,6 +114,8 @@ pub struct Shared {
     /// the last committed generation, so they must not be reallocated
     /// before the new generation is durable.
     pub pending_free: Vec<u64>,
+    /// Armed deterministic crash point (P7). Checked at commit boundaries.
+    pub fault_point: Option<crate::engine::FaultPoint>,
 }
 
 /// Number of blocks needed to persist a bitmap of `nbits` bits starting at
@@ -564,6 +566,7 @@ mod tests {
                     dev,
                     bitmap,
                     pending_free: Vec::new(),
+                    fault_point: None,
                 })),
                 path,
             }
