@@ -10,5 +10,6 @@ pub type Block = [u8; BLOCK_SIZE];
 
 pub mod bitmap;
 pub mod block;
+pub mod btree;
 pub mod checksum;
 pub mod superblock;
