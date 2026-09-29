@@ -56,6 +56,7 @@ pub const OP_SETCLIENTID_CONFIRM: u32 = 36;
 pub const FATTR4_TYPE: u32 = 1;
 pub const FATTR4_SIZE: u32 = 4;
 pub const FATTR4_LINK_SUPPORT: u32 = 5;
+pub const FATTR4_FSID: u32 = 8;
 pub const FATTR4_NUMLINKS: u32 = 35;
 pub const FATTR4_FILEID: u32 = 20;
 pub const FATTR4_MODE: u32 = 33;
@@ -371,6 +372,10 @@ fn skip_attr_value(br: &mut Reader, attr: u32) -> Result<(), NfsError> {
             br.u32()?;
         }
         FATTR4_SIZE | FATTR4_FILEID | FATTR4_SPACE_USED | FATTR4_MOUNTED_ON_FILEID => {
+            br.u64()?;
+        }
+        FATTR4_FSID => {
+            br.u64()?;
             br.u64()?;
         }
         FATTR4_NUMLINKS | FATTR4_MODE | FATTR4_LINK_SUPPORT => {
@@ -704,6 +709,8 @@ pub struct FileAttrs {
     pub fileid: u64,
     pub mode: u32,
     pub nlink: u32,
+    pub fsid_major: u64,
+    pub fsid_minor: u64,
     pub uid: u32,
     pub gid: u32,
     pub atime: u64,
@@ -734,6 +741,12 @@ impl AttrValues {
         }
         if requested.wants(FATTR4_LINK_SUPPORT) {
             set(FATTR4_LINK_SUPPORT, &mut |w| w.u32(1)); // hard links supported
+        }
+        if requested.wants(FATTR4_FSID) {
+            set(FATTR4_FSID, &mut |w| {
+                w.u64(a.fsid_major);
+                w.u64(a.fsid_minor);
+            });
         }
         if requested.wants(FATTR4_FILEID) {
             set(FATTR4_FILEID, &mut |w| w.u64(a.fileid));
@@ -850,6 +863,8 @@ mod tests {
             fileid: 7,
             mode: 0o755,
             nlink: 3,
+            fsid_major: 0x1111_2222_3333_4444,
+            fsid_minor: 0x5555_6666_7777_8888,
             uid: 1000,
             gid: 1000,
             atime: 111,
@@ -906,6 +921,23 @@ mod tests {
         assert_eq!(r.u32().unwrap(), 0);
         assert_eq!(r.i64().unwrap(), 222); // TIME_MODIFY
         assert_eq!(r.u32().unwrap(), 0);
+        assert!(r.is_empty());
+    }
+
+    /// FSID (attr 8) is a REQUIRED attribute; it must be returned when
+    /// requested and sit between LINK_SUPPORT(5) and FILEID(20) on the wire.
+    #[test]
+    fn fsid_returned_in_order() {
+        let av = AttrValues::encode(
+            &req_mask(&[FATTR4_LINK_SUPPORT, FATTR4_FSID, FATTR4_FILEID]),
+            &test_attrs(),
+        );
+        assert!(av.mask.wants(FATTR4_FSID));
+        let mut r = Reader::new(&av.values);
+        assert_eq!(r.u32().unwrap(), 1); // LINK_SUPPORT
+        assert_eq!(r.u64().unwrap(), 0x1111_2222_3333_4444); // FSID major
+        assert_eq!(r.u64().unwrap(), 0x5555_6666_7777_8888); // FSID minor
+        assert_eq!(r.u64().unwrap(), 7); // FILEID
         assert!(r.is_empty());
     }
 
