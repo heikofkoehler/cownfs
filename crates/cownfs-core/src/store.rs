@@ -406,6 +406,29 @@ impl<K, V> BlockArena<K, V> {
     pub fn set_live(&mut self, n: usize) {
         self.alloc_count = n as u64;
     }
+
+    /// Nodes reachable from any of `roots`, counted once (union).
+    /// Snapshot records pin tree roots that are no longer reachable from
+    /// the live trees (e.g. a root the live tree CoW-cloned away from
+    /// after the snapshot was taken); those blocks are allocated and must
+    /// be seeded, or releasing the snapshot later underflows the counter.
+    pub fn reachable_multi(&mut self, roots: &[NodeId]) -> Result<usize, StoreError>
+    where
+        K: BlockCodec,
+        V: BlockCodec,
+    {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack: Vec<NodeId> = roots.to_vec();
+        while let Some(id) = stack.pop() {
+            if !seen.insert((id.idx, id.gen)) {
+                continue;
+            }
+            // Clone child ids to end the borrow before recursing.
+            let children = self.load(id)?.node.children.clone();
+            stack.extend(children);
+        }
+        Ok(seen.len())
+    }
 }
 
 impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {

@@ -554,11 +554,30 @@ impl Fs {
         );
         // Seed each arena's live-node count from the on-disk trees; without
         // this the first take/free after reopen underflows the counter.
-        // (Counts are computed before any mutable borrow: count_reachable
-        // borrows the same RefCell.)
-        let n_inodes = inodes.count_reachable()?;
-        let n_dirs = dirs.count_reachable()?;
-        let n_extents = extents.count_reachable()?;
+        // The seed must union the live roots with every snapshot record's
+        // pinned roots: a snapshot keeps tree blocks alive that the live
+        // tree has CoW-cloned away from, and those blocks are allocated
+        // (releasing the snapshot later frees them).
+        let mut inode_roots = vec![inodes.root_id()];
+        let mut dir_roots = vec![dirs.root_id()];
+        let mut extent_roots = vec![extents.root_id()];
+        for (_, rec) in snaps.to_sorted_vec()? {
+            inode_roots.push(NodeId {
+                idx: rec.roots[0],
+                gen: rec.root_gens[0],
+            });
+            dir_roots.push(NodeId {
+                idx: rec.roots[1],
+                gen: rec.root_gens[1],
+            });
+            extent_roots.push(NodeId {
+                idx: rec.roots[2],
+                gen: rec.root_gens[2],
+            });
+        }
+        let n_inodes = ia.borrow_mut().reachable_multi(&inode_roots)?;
+        let n_dirs = da.borrow_mut().reachable_multi(&dir_roots)?;
+        let n_extents = ea.borrow_mut().reachable_multi(&extent_roots)?;
         let n_snaps = snaps.count_reachable()?;
         ia.borrow_mut().set_live(n_inodes);
         da.borrow_mut().set_live(n_dirs);
