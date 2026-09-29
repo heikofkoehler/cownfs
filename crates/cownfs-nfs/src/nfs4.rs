@@ -735,14 +735,16 @@ impl AttrValues {
         if requested.wants(FATTR4_LINK_SUPPORT) {
             set(FATTR4_LINK_SUPPORT, &mut |w| w.u32(1)); // hard links supported
         }
-        if requested.wants(FATTR4_NUMLINKS) {
-            set(FATTR4_NUMLINKS, &mut |w| w.u32(a.nlink));
-        }
         if requested.wants(FATTR4_FILEID) {
             set(FATTR4_FILEID, &mut |w| w.u64(a.fileid));
         }
         if requested.wants(FATTR4_MODE) {
             set(FATTR4_MODE, &mut |w| w.u32(a.mode));
+        }
+        // NB: attr values must be encoded in increasing attribute number
+        // order (RFC 7530 §5.5); NUMLINKS=35 sits between MODE=33 and OWNER=36.
+        if requested.wants(FATTR4_NUMLINKS) {
+            set(FATTR4_NUMLINKS, &mut |w| w.u32(a.nlink));
         }
         if requested.wants(FATTR4_OWNER) {
             let s = a.uid.to_string();
@@ -871,14 +873,21 @@ mod tests {
     #[test]
     fn link_support_and_numlinks_slots() {
         let av = AttrValues::encode(
-            &req_mask(&[FATTR4_LINK_SUPPORT, FATTR4_NUMLINKS]),
+            &req_mask(&[
+                FATTR4_LINK_SUPPORT,
+                FATTR4_FILEID,
+                FATTR4_MODE,
+                FATTR4_NUMLINKS,
+            ]),
             &test_attrs(),
         );
         assert!(av.mask.wants(FATTR4_LINK_SUPPORT));
         assert!(av.mask.wants(FATTR4_NUMLINKS));
         let mut r = Reader::new(&av.values);
-        // Attrs are in increasing number order: LINK_SUPPORT(5) then NUMLINKS(35).
+        // Attrs in increasing number order: 5, 20, 33, 35.
         assert_eq!(r.u32().unwrap(), 1); // LINK_SUPPORT = true
+        assert_eq!(r.u64().unwrap(), 7); // FILEID
+        assert_eq!(r.u32().unwrap(), 0o755); // MODE
         assert_eq!(r.u32().unwrap(), 3); // NUMLINKS = nlink
         assert!(r.is_empty());
     }
