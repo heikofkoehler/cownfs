@@ -55,7 +55,8 @@ pub const OP_SETCLIENTID_CONFIRM: u32 = 36;
 // Attribute numbers (RFC 7530 §5).
 pub const FATTR4_TYPE: u32 = 1;
 pub const FATTR4_SIZE: u32 = 4;
-pub const FATTR4_NUMLINKS: u32 = 5;
+pub const FATTR4_LINK_SUPPORT: u32 = 5;
+pub const FATTR4_NUMLINKS: u32 = 35;
 pub const FATTR4_FILEID: u32 = 20;
 pub const FATTR4_MODE: u32 = 33;
 pub const FATTR4_OWNER: u32 = 36;
@@ -372,7 +373,7 @@ fn skip_attr_value(br: &mut Reader, attr: u32) -> Result<(), NfsError> {
         FATTR4_SIZE | FATTR4_FILEID | FATTR4_SPACE_USED | FATTR4_MOUNTED_ON_FILEID => {
             br.u64()?;
         }
-        FATTR4_NUMLINKS | FATTR4_MODE => {
+        FATTR4_NUMLINKS | FATTR4_MODE | FATTR4_LINK_SUPPORT => {
             br.u32()?;
         }
         FATTR4_OWNER | FATTR4_OWNER_GROUP => {
@@ -731,6 +732,9 @@ impl AttrValues {
         if requested.wants(FATTR4_SIZE) {
             set(FATTR4_SIZE, &mut |w| w.u64(a.size));
         }
+        if requested.wants(FATTR4_LINK_SUPPORT) {
+            set(FATTR4_LINK_SUPPORT, &mut |w| w.u32(1)); // hard links supported
+        }
         if requested.wants(FATTR4_NUMLINKS) {
             set(FATTR4_NUMLINKS, &mut |w| w.u32(a.nlink));
         }
@@ -759,15 +763,15 @@ impl AttrValues {
                 w.u32(0);
             });
         }
-        if requested.wants(FATTR4_TIME_MODIFY) {
-            set(FATTR4_TIME_MODIFY, &mut |w| {
-                w.i64(a.mtime as i64);
-                w.u32(0);
-            });
-        }
         if requested.wants(FATTR4_TIME_METADATA) {
             set(FATTR4_TIME_METADATA, &mut |w| {
                 w.i64(a.ctime as i64);
+                w.u32(0);
+            });
+        }
+        if requested.wants(FATTR4_TIME_MODIFY) {
+            set(FATTR4_TIME_MODIFY, &mut |w| {
+                w.i64(a.mtime as i64);
                 w.u32(0);
             });
         }
@@ -835,6 +839,65 @@ mod tests {
             }
             _ => panic!("wrong op: {op:?}"),
         }
+    }
+
+    fn test_attrs() -> FileAttrs {
+        FileAttrs {
+            ftype: NF4DIR,
+            size: 1234,
+            fileid: 7,
+            mode: 0o755,
+            nlink: 3,
+            uid: 1000,
+            gid: 1000,
+            atime: 111,
+            mtime: 222,
+            ctime: 333,
+        }
+    }
+
+    fn req_mask(attrs: &[u32]) -> AttrMask {
+        let mut m = AttrMask { words: vec![0, 0] };
+        for &a in attrs {
+            m.words[(a / 32) as usize] |= 1 << (a % 32);
+        }
+        m
+    }
+
+    /// Regression test for the macOS mount failure ("RPC struct is bad"):
+    /// FATTR4_NUMLINKS is 35, bit 5 is FATTR4_LINK_SUPPORT (bool). The old
+    /// code had NUMLINKS=5 and wrote the link count into the LINK_SUPPORT
+    /// slot, which strict clients reject (bool must be 0/1).
+    #[test]
+    fn link_support_and_numlinks_slots() {
+        let av = AttrValues::encode(
+            &req_mask(&[FATTR4_LINK_SUPPORT, FATTR4_NUMLINKS]),
+            &test_attrs(),
+        );
+        assert!(av.mask.wants(FATTR4_LINK_SUPPORT));
+        assert!(av.mask.wants(FATTR4_NUMLINKS));
+        let mut r = Reader::new(&av.values);
+        // Attrs are in increasing number order: LINK_SUPPORT(5) then NUMLINKS(35).
+        assert_eq!(r.u32().unwrap(), 1); // LINK_SUPPORT = true
+        assert_eq!(r.u32().unwrap(), 3); // NUMLINKS = nlink
+        assert!(r.is_empty());
+    }
+
+    /// Attr values must be in increasing attribute-number order (RFC 7530 §5.5).
+    #[test]
+    fn time_attrs_in_numeric_order() {
+        let av = AttrValues::encode(
+            &req_mask(&[FATTR4_TIME_ACCESS, FATTR4_TIME_METADATA, FATTR4_TIME_MODIFY]),
+            &test_attrs(),
+        );
+        let mut r = Reader::new(&av.values);
+        assert_eq!(r.i64().unwrap(), 111); // TIME_ACCESS
+        assert_eq!(r.u32().unwrap(), 0);
+        assert_eq!(r.i64().unwrap(), 333); // TIME_METADATA
+        assert_eq!(r.u32().unwrap(), 0);
+        assert_eq!(r.i64().unwrap(), 222); // TIME_MODIFY
+        assert_eq!(r.u32().unwrap(), 0);
+        assert!(r.is_empty());
     }
 
     #[test]
