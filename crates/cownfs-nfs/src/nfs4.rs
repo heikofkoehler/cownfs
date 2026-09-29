@@ -731,6 +731,11 @@ impl AttrValues {
     /// Encode `requested` attributes of an inode. Unknown/unset
     /// attributes are silently omitted from the returned mask.
     pub fn encode(requested: &AttrMask, a: &FileAttrs) -> Self {
+        // macOS sends an empty GETATTR mask as an fh-validity probe. Returning
+        // zero attrs makes xnu's nfs_loadattrcache mark the vnode type as 0
+        // (VNON), which later surfaces as ESTALE on open/readdir. Treat an
+        // empty mask as a request for TYPE so the vnode type stays stable.
+        let empty = requested.words.iter().all(|w| *w == 0);
         let mut out_mask = AttrMask { words: vec![0; 2] };
         let mut w = Writer::new();
         let mut set = |attr: u32, body: &mut dyn FnMut(&mut Writer)| {
@@ -742,7 +747,7 @@ impl AttrValues {
             body(&mut w);
         };
 
-        if requested.wants(FATTR4_TYPE) {
+        if empty || requested.wants(FATTR4_TYPE) {
             set(FATTR4_TYPE, &mut |w| w.u32(a.ftype));
         }
         if requested.wants(FATTR4_SIZE) {
