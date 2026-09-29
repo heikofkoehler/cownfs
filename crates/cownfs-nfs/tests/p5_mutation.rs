@@ -5,7 +5,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-use cownfs_core::engine::{Fs, FTYPE_DIR, FTYPE_FILE, ROOT_INO};
+use cownfs_core::engine::{Fs, ROOT_INO};
 use cownfs_nfs::nfs4::{
     AttrMask, FileHandle, FATTR4_MODE, FATTR4_SIZE, FATTR4_TYPE, FILE_SYNC4, NF4DIR, NF4LNK,
     NF4REG, NFS4_OK, OPEN4_CREATE, OP_COMMIT, OP_CREATE, OP_GETATTR, OP_GETFH, OP_LINK, OP_LOOKUP,
@@ -172,7 +172,7 @@ impl Ops {
         self.w.u32(OP_RESTOREFH);
         self.n += 1;
     }
-    fn finish(mut self) -> Vec<u8> {
+    fn finish(self) -> Vec<u8> {
         let mut out = Writer::new();
         out.u32(self.n);
         out.raw(&self.w.into_bytes());
@@ -194,11 +194,10 @@ struct Client {
     stream: TcpStream,
     rr: RecordReader,
     xid: u32,
-    uuid: [u8; 16],
 }
 
 impl Client {
-    fn connect(addr: &str, uuid: [u8; 16]) -> Self {
+    fn connect(addr: &str) -> Self {
         // Retry: the server thread may not have bound yet.
         let mut stream = None;
         for _ in 0..50 {
@@ -214,7 +213,6 @@ impl Client {
             stream: stream.expect("connect to test server"),
             rr: RecordReader::new(),
             xid: 0x2000,
-            uuid,
         }
     }
 
@@ -397,7 +395,7 @@ fn p5_mutation_gate() {
         let _ = cownfs_nfs::server::serve("127.0.0.1:12050", &mut fs);
     });
     rx.recv().unwrap();
-    let mut c = Client::connect("127.0.0.1:12050", uuid);
+    let mut c = Client::connect("127.0.0.1:12050");
 
     // CREATE dir "d1".
     let mut ops = Ops::new();
@@ -408,7 +406,7 @@ fn p5_mutation_gate() {
     // Establish NFSv4 client (P6).
     let mut ops = Ops::new();
     ops.setclientid(b"p5test");
-    let res = c.check_ok(ops, 1);
+    c.check_ok(ops, 1);
     // Extract clientid from SETCLIENTID response.
     let clientid: u64 = {
         // We need to parse it; for the test, we know it's 1 (first client).

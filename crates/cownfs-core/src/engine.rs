@@ -771,8 +771,6 @@ impl Fs {
         ] {
             reachable.extend(ids.iter().map(|id| id.idx));
         }
-        let mut meta_blocks = reachable.len() as u64;
-
         // Snapshot trees: each snapshot's roots must verify, and their
         // blocks join the reachable set.
         let mut snap_data: Vec<u64> = Vec::new();
@@ -788,7 +786,7 @@ impl Fs {
                 }
             }
         }
-        meta_blocks = reachable.len() as u64;
+        let meta_blocks = reachable.len() as u64;
 
         let mut data_blocks = 0u64;
         for (_, ext) in self.extents.to_sorted_vec()? {

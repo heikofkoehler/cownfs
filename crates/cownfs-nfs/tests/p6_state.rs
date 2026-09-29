@@ -6,9 +6,9 @@ use std::net::TcpStream;
 
 use cownfs_core::engine::{Fs, ROOT_INO};
 use cownfs_nfs::nfs4::{
-    AttrMask, FileHandle, FATTR4_TYPE, NF4DIR, NFS4ERR_DENIED, NFS4ERR_LOCKED, NFS4_OK,
+    AttrMask, FileHandle, NF4DIR, NFS4ERR_DENIED, NFS4ERR_LOCKED, NFS4_OK,
     OPEN4_CREATE, OP_CLOSE, OP_CREATE, OP_GETFH, OP_LOCK, OP_LOCKU, OP_LOOKUP, OP_OPEN, OP_PUTFH,
-    OP_RENEW, OP_SETCLIENTID, OP_SETCLIENTID_CONFIRM, READ_LT, UNCHECKED4, WRITE_LT,
+    OP_SETCLIENTID, OP_SETCLIENTID_CONFIRM, UNCHECKED4, WRITE_LT,
 };
 use cownfs_nfs::rpc::{self, RecordReader};
 use cownfs_nfs::xdr::{Reader, Writer};
@@ -116,11 +116,6 @@ impl Ops {
         self.w.u64(length);
         self.n += 1;
     }
-    fn renew(&mut self, clientid: u64) {
-        self.w.u32(OP_RENEW);
-        self.w.u64(clientid);
-        self.n += 1;
-    }
     fn create_dir(&mut self, name: &[u8]) {
         self.w.u32(OP_CREATE);
         self.w.u32(NF4DIR);
@@ -129,7 +124,7 @@ impl Ops {
         self.w.opaque(&[]);
         self.n += 1;
     }
-    fn finish(mut self) -> Vec<u8> {
+    fn finish(self) -> Vec<u8> {
         let mut out = Writer::new();
         out.u32(self.n);
         out.raw(&self.w.into_bytes());
@@ -150,11 +145,10 @@ struct Client {
     stream: TcpStream,
     rr: RecordReader,
     xid: u32,
-    uuid: [u8; 16],
 }
 
 impl Client {
-    fn connect(addr: &str, uuid: [u8; 16]) -> Self {
+    fn connect(addr: &str) -> Self {
         let mut stream = None;
         for _ in 0..50 {
             match TcpStream::connect(addr) {
@@ -169,7 +163,6 @@ impl Client {
             stream: stream.expect("connect"),
             rr: RecordReader::new(),
             xid: 0x3000,
-            uuid,
         }
     }
 
@@ -297,7 +290,7 @@ fn p6_state_gate() {
     rx.recv().unwrap();
 
     // One TCP connection, two NFSv4 clients (identified by clientid).
-    let mut c = Client::connect("127.0.0.1:12052", uuid);
+    let mut c = Client::connect("127.0.0.1:12052");
 
     // Client 1: SETCLIENTID + CONFIRM.
     let v1 = [1u8, 2, 3, 4, 5, 6, 7, 8];
@@ -389,10 +382,10 @@ fn p6_state_gate() {
         b"lockowner1",
     );
     let res = c.call(ops.finish());
-    let lock_sid = match res[1] {
-        R::StateId(s) => s,
-        _ => panic!("no lock stateid: {res:?}"),
-    };
+    assert!(
+        matches!(res[1], R::StateId(_)),
+        "no lock stateid: {res:?}"
+    );
     println!("Client1 locked [0,1000)");
 
     // Client 2: try to LOCK overlapping range — should be LOCKED.

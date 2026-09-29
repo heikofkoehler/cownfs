@@ -392,7 +392,7 @@ mod tests {
         let (cid, _) = sm.setclientid([1u8; 8], b"test".to_vec());
         assert!(sm.confirm(cid, [1u8; 8]));
         // Create an open.
-        let rec = sm.open(cid, b"owner".to_vec(), 1, 3, 0).unwrap();
+        sm.open(cid, b"owner".to_vec(), 1, 3, 0).unwrap();
         assert!(sm.client_has_state(cid));
         // Wait for lease to expire.
         std::thread::sleep(Duration::from_millis(150));

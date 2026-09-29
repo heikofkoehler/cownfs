@@ -88,7 +88,7 @@ impl Ops {
         self.w.u32(count);
         self.n += 1;
     }
-    fn finish(mut self) -> Vec<u8> {
+    fn finish(self) -> Vec<u8> {
         let mut out = Writer::new();
         out.u32(self.n);
         out.raw(&self.w.into_bytes());
@@ -311,6 +311,8 @@ impl Client {
 }
 
 #[derive(Debug, Clone)]
+// size/mode are parsed to validate the wire format; only ftype is asserted.
+#[allow(dead_code)]
 enum OpReply {
     Ok,
     Err(u32),

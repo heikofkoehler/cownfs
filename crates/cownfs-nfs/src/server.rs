@@ -9,8 +9,8 @@ use cownfs_core::engine::{Fs, FsError, FTYPE_DIR, FTYPE_SYMLINK, ROOT_INO};
 use crate::nfs4::{
     encode_compound, AttrMask, AttrValues, Compound, FileAttrs, FileHandle, NfsError, Op, OpResult,
     StateId, ACCESS4_EXECUTE, ACCESS4_EXTEND, ACCESS4_LOOKUP, ACCESS4_READ, FATTR4_MODE,
-    FATTR4_SIZE, FILE_SYNC4, GUARDED4, NF4DIR, NF4LNK, NF4REG, NFS4ERR_BAD_SEQID, NFS4ERR_DENIED,
-    NFS4ERR_EXPIRED, NFS4ERR_INVAL, NFS4ERR_ISDIR, NFS4ERR_LOCKED, NFS4ERR_NOENT, NFS4ERR_NOTDIR,
+    FATTR4_SIZE, FILE_SYNC4, GUARDED4, NF4DIR, NF4LNK, NF4REG,
+    NFS4ERR_EXPIRED, NFS4ERR_INVAL, NFS4ERR_ISDIR, NFS4ERR_NOENT, NFS4ERR_NOTDIR,
     NFS4ERR_NOTSUPP, NFS4ERR_SERVERFAULT, NFS4ERR_STALE_CLIENTID, NFS4_OK, OPEN4_CREATE, OP_ACCESS,
     OP_CLOSE, OP_COMMIT, OP_CREATE, OP_GETATTR, OP_GETFH, OP_LINK, OP_LOCK, OP_LOCKU, OP_LOOKUP,
     OP_LOOKUPP, OP_OPEN, OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_REMOVE, OP_RENAME,
@@ -18,7 +18,7 @@ use crate::nfs4::{
     OP_WRITE, UNCHECKED4,
 };
 use crate::rpc::{self, Call, RecordReader, RpcError};
-use crate::state::{StateManager, OPEN4_SHARE_ACCESS_BOTH};
+use crate::state::StateManager;
 use crate::xdr::{Writer, XdrError};
 use cownfs_core::engine::SetAttrs;
 
@@ -760,7 +760,7 @@ impl<'f> Session<'f> {
         _open_seqid: u32,
         open_stateid: &StateId,
         _lock_seqid: u32,
-        lock_stateid: &StateId,
+        _lock_stateid: &StateId,
         lock_owner: &[u8],
     ) -> OpResult {
         let file_ino = match self.cfh {
