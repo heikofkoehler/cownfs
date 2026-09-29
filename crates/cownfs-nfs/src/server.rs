@@ -8,7 +8,8 @@ use cownfs_core::engine::{Fs, FsError, FTYPE_DIR, FTYPE_SYMLINK, ROOT_INO};
 
 use crate::nfs4::{
     encode_compound, AttrMask, AttrValues, Compound, FileAttrs, FileHandle, NfsError, Op, OpResult,
-    StateId, ACCESS4_EXECUTE, ACCESS4_EXTEND, ACCESS4_LOOKUP, ACCESS4_READ, FATTR4_MODE,
+    StateId, ACCESS4_DELETE, ACCESS4_EXECUTE, ACCESS4_EXTEND, ACCESS4_LOOKUP, ACCESS4_MODIFY,
+    ACCESS4_READ, FATTR4_MODE,
     FATTR4_SIZE, FILE_SYNC4, GUARDED4, NF4DIR, NF4LNK, NF4REG,
     NFS4ERR_EXPIRED, NFS4ERR_INVAL, NFS4ERR_ISDIR, NFS4ERR_NOENT, NFS4ERR_NOTDIR,
     NFS4ERR_NOTSUPP, NFS4ERR_SERVERFAULT, NFS4ERR_STALE_CLIENTID, NFS4_OK, OPEN4_CREATE, OP_ACCESS,
@@ -847,20 +848,27 @@ impl<'f> Session<'f> {
             Ok(i) => i,
             Err(r) => return r,
         };
-        let inode = match self.fs.getattr(ino) {
+        let _inode = match self.fs.getattr(ino) {
             Ok(i) => i,
             Err(e) => return OpResult::err(OP_ACCESS, fs_to_nfs(e)),
         };
-        // Read-only server: grant read/lookup/execute, deny modify/extend/delete.
-        let mut supported: u32 = ACCESS4_READ | ACCESS4_LOOKUP | ACCESS4_EXECUTE;
+        // Read-write server: support and grant all standard access bits.
+        // The filesystem enforces permissions; ACCESS is advisory.
+        let supported: u32 = ACCESS4_READ
+            | ACCESS4_LOOKUP
+            | ACCESS4_MODIFY
+            | ACCESS4_EXTEND
+            | ACCESS4_DELETE
+            | ACCESS4_EXECUTE;
         let mut granted: u32 = 0;
-        if inode.ftype == FTYPE_DIR {
-            supported |= ACCESS4_LOOKUP;
-        } else {
-            // Regular files: no extend/modify/delete on a read-only mount.
-            let _ = ACCESS4_EXTEND;
-        }
-        for bit in [ACCESS4_READ, ACCESS4_LOOKUP, ACCESS4_EXECUTE] {
+        for bit in [
+            ACCESS4_READ,
+            ACCESS4_LOOKUP,
+            ACCESS4_MODIFY,
+            ACCESS4_EXTEND,
+            ACCESS4_DELETE,
+            ACCESS4_EXECUTE,
+        ] {
             if access & bit != 0 && supported & bit != 0 {
                 granted |= bit;
             }
