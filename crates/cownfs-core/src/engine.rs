@@ -459,7 +459,7 @@ impl Fs {
         fs.inodes.insert(
             ROOT_INO,
             Inode {
-                mode: 0o755,
+                mode: 0o777,
                 uid: 0,
                 gid: 0,
                 nlink: 2,
