@@ -1,0 +1,7 @@
+[package]
+name = "cownfs-fsck"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cownfs-core = { path = "../cownfs-core" }
