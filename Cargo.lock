@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "cownfs-bench"
+version = "0.1.0"
+dependencies = [
+ "cownfs-core",
+ "cownfs-nfs",
+]
+
+[[package]]
 name = "cownfs-core"
 version = "0.1.0"
 dependencies = [

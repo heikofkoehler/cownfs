@@ -1,0 +1,12 @@
+[package]
+name = "cownfs-bench"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "cownfs-bench"
+path = "src/main.rs"
+
+[dependencies]
+cownfs-core = { path = "../cownfs-core" }
+cownfs-nfs = { path = "../cownfs-nfs" }
