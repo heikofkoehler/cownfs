@@ -57,6 +57,7 @@ pub const FATTR4_TYPE: u32 = 1;
 pub const FATTR4_SIZE: u32 = 4;
 pub const FATTR4_LINK_SUPPORT: u32 = 5;
 pub const FATTR4_FSID: u32 = 8;
+pub const FATTR4_FILEHANDLE: u32 = 19;
 pub const FATTR4_NUMLINKS: u32 = 35;
 pub const FATTR4_FILEID: u32 = 20;
 pub const FATTR4_MODE: u32 = 33;
@@ -155,13 +156,19 @@ pub struct FileHandle {
 }
 
 impl FileHandle {
-    pub fn encode(&self, w: &mut Writer) {
+    /// Raw FH_LEN-byte encoding (magic + uuid + inode + gen), without the
+    /// XDR opaque<> wrapper. Used for FATTR4_FILEHANDLE attr values.
+    pub fn to_bytes(&self) -> [u8; FH_LEN] {
         let mut fh = [0u8; FH_LEN];
         fh[0..4].copy_from_slice(&FH_MAGIC.to_be_bytes());
         fh[4..20].copy_from_slice(&self.fs_uuid);
         fh[20..28].copy_from_slice(&self.inode.to_be_bytes());
         // gen = 0
-        w.opaque(&fh);
+        fh
+    }
+
+    pub fn encode(&self, w: &mut Writer) {
+        w.opaque(&self.to_bytes());
     }
 
     pub fn decode(r: &mut Reader) -> Result<Self, NfsError> {
@@ -381,7 +388,7 @@ fn skip_attr_value(br: &mut Reader, attr: u32) -> Result<(), NfsError> {
         FATTR4_NUMLINKS | FATTR4_MODE | FATTR4_LINK_SUPPORT => {
             br.u32()?;
         }
-        FATTR4_OWNER | FATTR4_OWNER_GROUP => {
+        FATTR4_OWNER | FATTR4_OWNER_GROUP | FATTR4_FILEHANDLE => {
             br.opaque()?;
         }
         FATTR4_TIME_ACCESS | FATTR4_TIME_METADATA | FATTR4_TIME_MODIFY => {
@@ -711,6 +718,8 @@ pub struct FileAttrs {
     pub nlink: u32,
     pub fsid_major: u64,
     pub fsid_minor: u64,
+    /// Wire encoding of this object's filehandle (for FATTR4_FILEHANDLE).
+    pub fh: Vec<u8>,
     pub uid: u32,
     pub gid: u32,
     pub atime: u64,
@@ -747,6 +756,9 @@ impl AttrValues {
                 w.u64(a.fsid_major);
                 w.u64(a.fsid_minor);
             });
+        }
+        if requested.wants(FATTR4_FILEHANDLE) {
+            set(FATTR4_FILEHANDLE, &mut |w| w.opaque(&a.fh));
         }
         if requested.wants(FATTR4_FILEID) {
             set(FATTR4_FILEID, &mut |w| w.u64(a.fileid));
@@ -865,6 +877,7 @@ mod tests {
             nlink: 3,
             fsid_major: 0x1111_2222_3333_4444,
             fsid_minor: 0x5555_6666_7777_8888,
+            fh: vec![0xAA; 32],
             uid: 1000,
             gid: 1000,
             atime: 111,
@@ -937,6 +950,25 @@ mod tests {
         assert_eq!(r.u32().unwrap(), 1); // LINK_SUPPORT
         assert_eq!(r.u64().unwrap(), 0x1111_2222_3333_4444); // FSID major
         assert_eq!(r.u64().unwrap(), 0x5555_6666_7777_8888); // FSID minor
+        assert_eq!(r.u64().unwrap(), 7); // FILEID
+        assert!(r.is_empty());
+    }
+
+    /// macOS's mount probe requires FATTR4_FILEHANDLE in the GETATTR reply
+    /// (xnu returns EBADRPC without it); it sits between FSID(8) and
+    /// FILEID(20) on the wire.
+    #[test]
+    fn filehandle_returned_in_order() {
+        let av = AttrValues::encode(
+            &req_mask(&[FATTR4_FSID, FATTR4_FILEHANDLE, FATTR4_FILEID]),
+            &test_attrs(),
+        );
+        assert!(av.mask.wants(FATTR4_FILEHANDLE));
+        let mut r = Reader::new(&av.values);
+        assert_eq!(r.u64().unwrap(), 0x1111_2222_3333_4444); // FSID major
+        assert_eq!(r.u64().unwrap(), 0x5555_6666_7777_8888); // FSID minor
+        let fh = r.opaque().unwrap();
+        assert_eq!(fh, &[0xAA; 32]); // FILEHANDLE
         assert_eq!(r.u64().unwrap(), 7); // FILEID
         assert!(r.is_empty());
     }

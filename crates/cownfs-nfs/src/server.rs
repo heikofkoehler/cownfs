@@ -316,6 +316,12 @@ impl<'f> Session<'f> {
                 nlink: inode.nlink,
                 fsid_major: u64::from_be_bytes(self.fs.uuid()[..8].try_into().unwrap()),
                 fsid_minor: u64::from_be_bytes(self.fs.uuid()[8..].try_into().unwrap()),
+                fh: FileHandle {
+                    fs_uuid: self.fs.uuid(),
+                    inode: ino,
+                }
+                .to_bytes()
+                .to_vec(),
                 uid: inode.uid,
                 gid: inode.gid,
                 atime: inode.atime,
@@ -365,6 +371,12 @@ impl<'f> Session<'f> {
                     nlink: inode.nlink,
                     fsid_major: u64::from_be_bytes(self.fs.uuid()[..8].try_into().unwrap()),
                     fsid_minor: u64::from_be_bytes(self.fs.uuid()[8..].try_into().unwrap()),
+                    fh: FileHandle {
+                        fs_uuid: self.fs.uuid(),
+                        inode: *child_ino,
+                    }
+                    .to_bytes()
+                    .to_vec(),
                     uid: inode.uid,
                     gid: inode.gid,
                     atime: inode.atime,
