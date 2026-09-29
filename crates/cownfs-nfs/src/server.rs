@@ -862,6 +862,7 @@ fn serve_connection(stream: TcpStream, fs: &mut Fs) -> Result<(), ServerError> {
     let mut rr = RecordReader::new();
     let mut session = Session::new(fs);
     let mut buf = [0u8; 64 * 1024];
+    let debug_rpc = std::env::var("COWNFS_DEBUG_RPC").is_ok();
     loop {
         let n = stream.read(&mut buf)?;
         if n == 0 {
@@ -869,10 +870,26 @@ fn serve_connection(stream: TcpStream, fs: &mut Fs) -> Result<(), ServerError> {
         }
         rr.feed(&buf[..n]);
         while let Some(record) = rr.next_record()? {
+            if debug_rpc {
+                eprintln!("RPC> {} bytes: {}", record.len(), hex(&record));
+            }
             let reply = handle_record(&record, &mut session);
+            if debug_rpc {
+                eprintln!("RPC< {} bytes: {}", reply.len(), hex(&reply));
+            }
             stream.write_all(&reply)?;
         }
     }
+}
+
+fn hex(b: &[u8]) -> String {
+    const H: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(b.len() * 2);
+    for &x in b {
+        s.push(H[(x >> 4) as usize] as char);
+        s.push(H[(x & 15) as usize] as char);
+    }
+    s
 }
 
 fn handle_record(record: &[u8], session: &mut Session) -> Vec<u8> {
