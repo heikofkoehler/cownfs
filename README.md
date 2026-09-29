@@ -43,12 +43,41 @@ Known gaps (tracked as [GitHub issues](https://github.com/heikofkoehler/cownfs/i
 
 ## Quick start
 
+Prerequisites: a Rust toolchain — install from https://rustup.rs.
+
 ```sh
+git clone https://github.com/heikofkoehler/cownfs.git
+cd cownfs
 cargo build --release
 ./target/release/cownfs-mkfs --size 1G /tmp/cow.img
 ./target/release/cownfs-server /tmp/cow.img 127.0.0.1:2049 &
+```
+
+### Linux
+
+```sh
+sudo mkdir -p /mnt/cow
 sudo mount -t nfs -o vers=4.0,port=2049 127.0.0.1:/ /mnt/cow
-# ... use it ...
+# ... use /mnt/cow ...
+sudo umount /mnt/cow
+```
+
+### macOS
+
+```sh
+sudo mkdir -p /Volumes/cow
+sudo mount -t nfs -o vers=4.0,tcp,port=2049,resvport 127.0.0.1:/ /Volumes/cow
+# ... use /Volumes/cow ...
+sudo umount /Volumes/cow
+```
+
+(On older macOS releases that reject a `4.x` minor, use `vers=4` instead of
+`vers=4.0`. The macOS client path hasn't been exercised against
+cownfs-server yet — so far only the built-in userspace test client has.)
+
+Check and repair the image (either platform):
+
+```sh
 ./target/release/cownfs-fsck /tmp/cow.img            # check
 ./target/release/cownfs-fsck --reclaim /tmp/cow.img  # check + reclaim
 ```
