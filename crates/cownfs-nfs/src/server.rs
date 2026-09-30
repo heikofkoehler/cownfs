@@ -574,8 +574,10 @@ impl<'f> Session<'f> {
         match result {
             Ok(()) => {
                 let mut w = Writer::new();
-                w.u64(0); // cinfo before
-                w.u64(0); // cinfo after
+                // change_info4: bool(atomic) + u64(before) + u64(after)
+                w.bool(true);
+                w.u64(0); // before changeid
+                w.u64(0); // after changeid
                 OpResult::ok(OP_REMOVE, w.into_bytes())
             }
             Err(e) => OpResult::err(OP_REMOVE, fs_to_nfs(e)),
@@ -749,7 +751,13 @@ impl<'f> Session<'f> {
 
     fn op_close(&mut self, seqid: u32, stateid: &StateId) -> OpResult {
         match self.state.close(stateid, seqid) {
-            Ok(()) => OpResult::ok(OP_CLOSE, Vec::new()),
+            Ok(()) => {
+                // CLOSE4resok: return the "closed" stateid (all zeros per RFC 7530 §16.2.3)
+                let mut w = Writer::new();
+                w.u32(0xffffffff); // seqid = all-ones (invalidated)
+                w.opaque_fixed(&[0u8; 12]); // other = zeroes
+                OpResult::ok(OP_CLOSE, w.into_bytes())
+            }
             Err(NfsError::Status(s)) => OpResult::err(OP_CLOSE, s),
             Err(_) => OpResult::err(OP_CLOSE, NFS4ERR_SERVERFAULT),
         }
