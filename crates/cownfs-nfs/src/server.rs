@@ -9,9 +9,8 @@ use cownfs_core::engine::{Fs, FsError, FTYPE_DIR, FTYPE_SYMLINK, ROOT_INO};
 use crate::nfs4::{
     encode_compound, AttrMask, AttrValues, Compound, FileAttrs, FileHandle, NfsError, Op, OpResult,
     StateId, ACCESS4_DELETE, ACCESS4_EXECUTE, ACCESS4_EXTEND, ACCESS4_LOOKUP, ACCESS4_MODIFY,
-    ACCESS4_READ, FATTR4_MODE,
-    FATTR4_SIZE, FILE_SYNC4, GUARDED4, NF4DIR, NF4LNK, NF4REG,
-    NFS4ERR_EXPIRED, NFS4ERR_INVAL, NFS4ERR_ISDIR, NFS4ERR_NOENT, NFS4ERR_NOTDIR,
+    ACCESS4_READ, FATTR4_MODE, FATTR4_SIZE, FILE_SYNC4, GUARDED4, NF4DIR, NF4LNK, NF4REG,
+    NFS4ERR_EXIST, NFS4ERR_EXPIRED, NFS4ERR_INVAL, NFS4ERR_ISDIR, NFS4ERR_NOENT, NFS4ERR_NOTDIR,
     NFS4ERR_NOTSUPP, NFS4ERR_SERVERFAULT, NFS4ERR_STALE_CLIENTID, NFS4_OK, OPEN4_CREATE, OP_ACCESS,
     OP_CLOSE, OP_COMMIT, OP_CREATE, OP_GETATTR, OP_GETFH, OP_LINK, OP_LOCK, OP_LOCKU, OP_LOOKUP,
     OP_LOOKUPP, OP_OPEN, OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_REMOVE, OP_RENAME,
@@ -57,6 +56,18 @@ impl From<XdrError> for ServerError {
     }
 }
 
+/// Decode an XDR-string fattr value (u32 length + bytes + padding) to &str.
+/// The raw value captured by `parse_fattr` includes the framing, so callers
+/// must strip it before interpreting the text.
+fn fattr_str(val: &[u8]) -> Option<&str> {
+    if val.len() < 4 {
+        return None;
+    }
+    let len = u32::from_be_bytes(val[..4].try_into().ok()?) as usize;
+    let bytes = val.get(4..4 + len)?;
+    std::str::from_utf8(bytes).ok()
+}
+
 /// Map engine errors to NFS4 status codes.
 fn fs_to_nfs(e: FsError) -> u32 {
     match e {
@@ -64,7 +75,7 @@ fn fs_to_nfs(e: FsError) -> u32 {
         FsError::NotDir => NFS4ERR_NOTDIR,
         FsError::NotFile => NFS4ERR_ISDIR,
         FsError::NotEmpty => NFS4ERR_NOTSUPP,
-        FsError::AlreadyExists => NFS4ERR_NOTSUPP,
+        FsError::AlreadyExists => NFS4ERR_EXIST,
         FsError::BadName => NFS4ERR_INVAL,
         FsError::NoSpace => NFS4ERR_NOTSUPP, // read-only in P4; real mapping in P5
         FsError::Invalid(_) => NFS4ERR_INVAL,
@@ -315,9 +326,12 @@ impl<'f> Session<'f> {
             nlink: inode.nlink,
             fsid_major: u64::from_be_bytes(self.fs.uuid()[..8].try_into().unwrap()),
             fsid_minor: u64::from_be_bytes(self.fs.uuid()[8..].try_into().unwrap()),
-            fh: FileHandle { fs_uuid: self.fs.uuid(), inode: ino }
-                .to_bytes()
-                .to_vec(),
+            fh: FileHandle {
+                fs_uuid: self.fs.uuid(),
+                inode: ino,
+            }
+            .to_bytes()
+            .to_vec(),
             uid: inode.uid,
             gid: inode.gid,
             atime: inode.atime,
@@ -415,7 +429,9 @@ impl<'f> Session<'f> {
         OpResult::ok(OP_READ, w.into_bytes())
     }
 
-    /// Extract mode/uid/gid from createattrs (fattr4).
+    /// Extract mode/uid/gid from createattrs (fattr4). OWNER/OWNER_GROUP
+    /// values arrive as XDR strings (length prefix + padding); decode the
+    /// framing before parsing the "uid"/"gid" text.
     fn parse_createattrs(attrs: &[(u32, Vec<u8>)]) -> (u32, u32, u32) {
         let mut mode = 0o644u32;
         let mut uid = 0u32;
@@ -429,13 +445,13 @@ impl<'f> Session<'f> {
                 }
                 36 => {
                     // FATTR4_OWNER: "uid" string
-                    if let Ok(s) = std::str::from_utf8(val) {
+                    if let Some(s) = fattr_str(val) {
                         uid = s.parse().unwrap_or(0);
                     }
                 }
                 37 => {
                     // FATTR4_OWNER_GROUP
-                    if let Ok(s) = std::str::from_utf8(val) {
+                    if let Some(s) = fattr_str(val) {
                         gid = s.parse().unwrap_or(0);
                     }
                 }
@@ -511,7 +527,7 @@ impl<'f> Session<'f> {
         w.bool(true); // atomic
         w.u64(0); // before changeid
         w.u64(0); // after changeid
-        // rflags (OPEN4_RESULT_* bits; 0 = nothing special)
+                  // rflags (OPEN4_RESULT_* bits; 0 = nothing special)
         w.u32(0);
         // attrset: bitmap4 of attributes set during create (empty)
         AttrMask { words: vec![0, 0] }.encode(&mut w);
@@ -651,12 +667,12 @@ impl<'f> Session<'f> {
                     }
                 }
                 36 => {
-                    if let Ok(s) = std::str::from_utf8(val) {
+                    if let Some(s) = fattr_str(val) {
                         sa.uid = Some(s.parse().unwrap_or(0));
                     }
                 }
                 37 => {
-                    if let Ok(s) = std::str::from_utf8(val) {
+                    if let Some(s) = fattr_str(val) {
                         sa.gid = Some(s.parse().unwrap_or(0));
                     }
                 }
@@ -1010,13 +1026,13 @@ fn handle_record(record: &[u8], session: &mut Session, debug_rpc: bool) -> Vec<u
     rpc::frame_record(&results)
 }
 
-/// Run the server on `addr` (e.g. "127.0.0.1:2049") with one thread per
-/// connection. Returns when the listener errors.
-pub fn serve(addr: &str, fs: &mut Fs) -> Result<(), ServerError> {
-    let listener = TcpListener::bind(addr)?;
+/// Run the server on an already-bound `listener` (e.g. port 0 for an
+/// ephemeral port in tests). One thread per connection; returns when the
+/// listener errors.
+pub fn serve_listener(listener: TcpListener, fs: &mut Fs) -> Result<(), ServerError> {
     for stream in listener.incoming() {
         match stream {
-            // Single-threaded in P4: one connection at a time.
+            // Single-threaded: one connection at a time.
             Ok(s) => {
                 let _ = serve_connection(s, fs);
             }
@@ -1024,6 +1040,12 @@ pub fn serve(addr: &str, fs: &mut Fs) -> Result<(), ServerError> {
         }
     }
     Ok(())
+}
+
+/// Run the server on `addr` (e.g. "127.0.0.1:2049") with one thread per
+/// connection. Returns when the listener errors.
+pub fn serve(addr: &str, fs: &mut Fs) -> Result<(), ServerError> {
+    serve_listener(TcpListener::bind(addr)?, fs)
 }
 
 // Reference the unused import to keep the build clean in P4.

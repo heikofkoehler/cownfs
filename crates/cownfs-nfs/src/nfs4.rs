@@ -418,6 +418,32 @@ fn skip_attr_value(br: &mut Reader, attr: u32) -> Result<(), NfsError> {
         FATTR4_OWNER | FATTR4_OWNER_GROUP | FATTR4_FILEHANDLE => {
             br.opaque()?;
         }
+        FATTR4_SUPPORTED_ATTRS => {
+            // bitmap4: word count, then words
+            let n = br.u32()? as usize;
+            for _ in 0..n {
+                br.u32()?;
+            }
+        }
+        FATTR4_FH_EXPIRE_TYPE | FATTR4_LEASE_TIME | FATTR4_MAXLINK | FATTR4_MAXNAME => {
+            br.u32()?;
+        }
+        FATTR4_CHANGE | FATTR4_FILES_AVAIL | FATTR4_FILES_FREE | FATTR4_FILES_TOTAL
+        | FATTR4_MAXFILESIZE | FATTR4_MAXREAD | FATTR4_MAXWRITE | FATTR4_SPACE_AVAIL
+        | FATTR4_SPACE_FREE | FATTR4_SPACE_TOTAL => {
+            br.u64()?;
+        }
+        // Booleans are u32 on the wire, so skipping as u32 is exact.
+        FATTR4_SYMLINK_SUPPORT
+        | FATTR4_NAMED_ATTR
+        | FATTR4_UNIQUE_HANDLES
+        | FATTR4_CANSETTIME
+        | FATTR4_CASE_INSENSITIVE
+        | FATTR4_CASE_PRESERVING
+        | FATTR4_CHOWN_RESTRICTED
+        | FATTR4_HOMOGENEOUS => {
+            br.u32()?;
+        }
         FATTR4_TIME_ACCESS | FATTR4_TIME_METADATA | FATTR4_TIME_MODIFY => {
             br.i64()?;
             br.u32()?;
@@ -831,7 +857,9 @@ impl AttrValues {
         }
 
         // out_mask needs 2 words for attrs 0-63 (MOUNTED_ON_FILEID=55).
-        let mut out_mask = AttrMask { words: vec![0u32; 2] };
+        let mut out_mask = AttrMask {
+            words: vec![0u32; 2],
+        };
         let mut w = Writer::new();
         // Helper: record attr in mask and run body to write value bytes.
         let mut set = |attr: u32, body: &mut dyn FnMut(&mut Writer)| {
@@ -1050,7 +1078,7 @@ mod tests {
         w.opaque(b"testowner"); // open_owner4.owner
         w.u32(OPEN4_CREATE); // opentype
         w.u32(UNCHECKED4); // createmode
-        // createattrs: empty fattr4 (bitmap word count=2, words=0,0, empty attrlist)
+                           // createattrs: empty fattr4 (bitmap word count=2, words=0,0, empty attrlist)
         w.u32(2);
         w.u32(0);
         w.u32(0);

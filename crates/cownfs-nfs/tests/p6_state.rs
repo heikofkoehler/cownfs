@@ -6,9 +6,9 @@ use std::net::TcpStream;
 
 use cownfs_core::engine::{Fs, ROOT_INO};
 use cownfs_nfs::nfs4::{
-    AttrMask, FileHandle, NF4DIR, NFS4ERR_DENIED, NFS4ERR_LOCKED, NFS4_OK,
-    OPEN4_CREATE, OP_CLOSE, OP_CREATE, OP_GETFH, OP_LOCK, OP_LOCKU, OP_LOOKUP, OP_OPEN, OP_PUTFH,
-    OP_SETCLIENTID, OP_SETCLIENTID_CONFIRM, UNCHECKED4, WRITE_LT,
+    AttrMask, FileHandle, NF4DIR, NFS4ERR_DENIED, NFS4ERR_LOCKED, NFS4_OK, OPEN4_CREATE, OP_CLOSE,
+    OP_CREATE, OP_GETFH, OP_LOCK, OP_LOCKU, OP_LOOKUP, OP_OPEN, OP_PUTFH, OP_SETCLIENTID,
+    OP_SETCLIENTID_CONFIRM, UNCHECKED4, WRITE_LT,
 };
 use cownfs_nfs::rpc::{self, RecordReader};
 use cownfs_nfs::xdr::{Reader, Writer};
@@ -390,10 +390,7 @@ fn p6_state_gate() {
         b"lockowner1",
     );
     let res = c.call(ops.finish());
-    assert!(
-        matches!(res[1], R::StateId(_)),
-        "no lock stateid: {res:?}"
-    );
+    assert!(matches!(res[1], R::StateId(_)), "no lock stateid: {res:?}");
     println!("Client1 locked [0,1000)");
 
     // Client 2: try to LOCK overlapping range — should be LOCKED.
