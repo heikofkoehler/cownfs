@@ -6,10 +6,9 @@
 //! `(block, generation)` [`NodeId`]s, and a write-back cache batches dirty
 //! nodes for the transaction commit.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use crate::bitmap::Bitmap;
 use crate::block::BlockDevice;
@@ -300,7 +299,7 @@ struct CacheEntry<K, V> {
 /// Block-backed [`NodeStore`]: nodes live in 4 KiB blocks, cached in memory
 /// and written back on [`flush`](NodeStore::flush).
 pub struct BlockArena<K, V> {
-    shared: Rc<RefCell<Shared>>,
+    shared: Arc<Mutex<Shared>>,
     cache: HashMap<u64, CacheEntry<K, V>>,
     /// Blocks currently allocated to this arena's nodes (leak-check aid).
     alloc_count: u64,
@@ -309,7 +308,7 @@ pub struct BlockArena<K, V> {
 impl<K, V> BlockArena<K, V> {
     /// Create an arena over `shared`. `t` is the tree's minimum degree;
     /// panics in debug builds when `2t-1` keys cannot fit in a block.
-    pub fn new(shared: Rc<RefCell<Shared>>, t: usize) -> Self
+    pub fn new(shared: Arc<Mutex<Shared>>, t: usize) -> Self
     where
         K: BlockCodec,
         V: BlockCodec,
@@ -326,18 +325,18 @@ impl<K, V> BlockArena<K, V> {
         }
     }
 
-    /// Allocate a fresh empty root and return the arena in an `Rc<RefCell>`.
+    /// Allocate a fresh empty root and return the arena in an `Arc<Mutex>`.
     pub fn new_tree(
-        shared: Rc<RefCell<Shared>>,
+        shared: Arc<Mutex<Shared>>,
         t: usize,
-    ) -> Result<(Rc<RefCell<Self>>, NodeId), StoreError>
+    ) -> Result<(Arc<Mutex<Self>>, NodeId), StoreError>
     where
         K: BlockCodec + Ord + Clone,
         V: BlockCodec + Clone,
     {
         let mut arena = Self::new(shared, t);
         let root = arena.alloc(Node::leaf())?;
-        Ok((Rc::new(RefCell::new(arena)), root))
+        Ok((Arc::new(Mutex::new(arena)), root))
     }
 
     /// Load a node into the cache (verifying magic/checksum/generation).
@@ -348,7 +347,11 @@ impl<K, V> BlockArena<K, V> {
     {
         if !self.cache.contains_key(&id.idx) {
             let mut buf = [0u8; BLOCK_SIZE];
-            self.shared.borrow_mut().dev.read_block(id.idx, &mut buf)?;
+            self.shared
+                .lock()
+                .unwrap()
+                .dev
+                .read_block(id.idx, &mut buf)?;
             let (node, gen) = decode_node::<K, V>(id.idx, &buf)?;
             // A stale id (wrong generation) means a use-after-free bug: the
             // block was recycled for another node. Always fatal, like a
@@ -396,7 +399,7 @@ impl<K, V> BlockArena<K, V> {
         self.cache.remove(&block);
         // Deferred: the bit is cleared at commit, after the new bitmap
         // area is written. See `Shared::pending_free`.
-        self.shared.borrow_mut().pending_free.push(block);
+        self.shared.lock().unwrap().pending_free.push(block);
         self.alloc_count -= 1;
     }
     /// Seed the live-node count after opening an existing image. The arena
@@ -448,7 +451,8 @@ impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
         debug_assert_eq!(node.refcount, 1);
         let block = self
             .shared
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .bitmap
             .alloc()
             .ok_or(StoreError::NoSpace)?;
@@ -458,7 +462,7 @@ impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
             let mut buf = [0u8; BLOCK_SIZE];
             // Best-effort: read the previous header for its generation.
             // (A short read on a never-written block yields zeros.)
-            let _ = self.shared.borrow_mut().dev.read_block(block, &mut buf);
+            let _ = self.shared.lock().unwrap().dev.read_block(block, &mut buf);
             if u16::from_le_bytes([buf[0], buf[1]]) == NODE_MAGIC {
                 u32::from_le_bytes(buf[8..12].try_into().unwrap()).wrapping_add(1)
             } else {
@@ -482,7 +486,7 @@ impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
         let rc = self.load(id)?.node.refcount;
         debug_assert_eq!(rc, 1, "take of shared node");
         let entry = self.cache.remove(&id.idx).expect("just loaded");
-        self.shared.borrow_mut().pending_free.push(id.idx);
+        self.shared.lock().unwrap().pending_free.push(id.idx);
         self.alloc_count -= 1;
         Ok(entry.node)
     }
@@ -524,7 +528,7 @@ impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
                 let e = &self.cache[&block];
                 encode_node(&e.node, e.gen)
             };
-            self.shared.borrow_mut().dev.write_block(block, &buf)?;
+            self.shared.lock().unwrap().dev.write_block(block, &buf)?;
             self.cache.get_mut(&block).expect("dirty listed").dirty = false;
         }
         // Commit point: every cached block now belongs to the new
@@ -564,7 +568,7 @@ mod tests {
 
     /// Throwaway device + bitmap for store tests. File is removed on drop.
     pub struct TestDevice {
-        pub shared: Rc<RefCell<Shared>>,
+        pub shared: Arc<Mutex<Shared>>,
         path: std::path::PathBuf,
     }
 
@@ -585,7 +589,7 @@ mod tests {
                 bitmap.set(b);
             }
             TestDevice {
-                shared: Rc::new(RefCell::new(Shared {
+                shared: Arc::new(Mutex::new(Shared {
                     dev,
                     bitmap,
                     pending_free: Vec::new(),
@@ -598,8 +602,8 @@ mod tests {
         pub fn arena<K: BlockCodec + Ord + Clone, V: BlockCodec + Clone>(
             &self,
             t: usize,
-        ) -> Rc<RefCell<BlockArena<K, V>>> {
-            Rc::new(RefCell::new(BlockArena::new(Rc::clone(&self.shared), t)))
+        ) -> Arc<Mutex<BlockArena<K, V>>> {
+            Arc::new(Mutex::new(BlockArena::new(Arc::clone(&self.shared), t)))
         }
     }
 
@@ -642,7 +646,7 @@ mod tests {
     fn arena_alloc_get_persists() {
         let td = TestDevice::new(256);
         let arena = td.arena::<u64, u64>(4);
-        let mut a = arena.borrow_mut();
+        let mut a = arena.lock().unwrap();
         let id = a.alloc(Node::leaf()).unwrap();
         a.get_mut(id).unwrap().keys.push(1);
         a.get_mut(id).unwrap().vals.push(2);
@@ -652,7 +656,7 @@ mod tests {
         // Re-read through a fresh arena over the same device: the node must
         // come back from disk with its refcount.
         let arena2 = td.arena::<u64, u64>(4);
-        let mut b = arena2.borrow_mut();
+        let mut b = arena2.lock().unwrap();
         let n = b.get(id).unwrap();
         assert_eq!(n.keys, vec![1u64]);
         assert_eq!(n.refcount, 1);

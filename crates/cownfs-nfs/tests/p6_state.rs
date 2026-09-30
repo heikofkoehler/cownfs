@@ -291,9 +291,9 @@ fn p6_state_gate() {
     let img2 = img.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut fs = Fs::open(&img2).unwrap();
+        let fs = Fs::open(&img2).unwrap();
         tx.send(()).unwrap();
-        let _ = cownfs_nfs::server::serve("127.0.0.1:12052", &mut fs);
+        let _ = cownfs_nfs::server::serve("127.0.0.1:12052", cownfs_nfs::server::Shared::new(fs));
     });
     rx.recv().unwrap();
 

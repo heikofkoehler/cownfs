@@ -6,9 +6,8 @@
 //! lets the *same* tested algorithm run directly on 4 KiB disk blocks, with
 //! child links as `(block, generation)` [`NodeId`]s.
 
-use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use crate::store::StoreError;
 
@@ -234,7 +233,7 @@ fn ensure_unique<K: Clone, V: Clone, S: NodeStore<K, V>>(
 /// `T` is the minimum degree (nodes hold up to `2T-1` keys); `S` is the node
 /// storage backend.
 pub struct BTree<K, V, S: NodeStore<K, V>, const T: usize> {
-    store: Rc<RefCell<S>>,
+    store: Arc<Mutex<S>>,
     root: NodeId,
     len: usize,
     /// Whether this handle owns a reference on `root` (i.e. it allocated
@@ -250,7 +249,7 @@ pub type MemBTree<K, V, const T: usize = 4> = BTree<K, V, MemArena<K, V>, T>;
 impl<K, V, S: NodeStore<K, V>, const T: usize> BTree<K, V, S, T> {
     /// Create a tree from an existing store handle, root id and length
     /// (used when opening block-backed trees from disk).
-    pub fn open(store: Rc<RefCell<S>>, root: NodeId, len: usize) -> Self {
+    pub fn open(store: Arc<Mutex<S>>, root: NodeId, len: usize) -> Self {
         assert!(T >= 2, "minimum degree T must be >= 2");
         BTree {
             store,
@@ -268,24 +267,24 @@ impl<K, V, S: NodeStore<K, V>, const T: usize> BTree<K, V, S, T> {
 
     /// Share an arbitrary node (used to pin snapshot roots).
     pub fn share(&self, id: NodeId) -> Result<(), StoreError> {
-        self.store.borrow_mut().inc_ref(id)
+        self.store.lock().unwrap().inc_ref(id)
     }
 
     /// Release an arbitrary node, reclaiming unreachable blocks
     /// (used to drop snapshot roots).
     pub fn release(&self, id: NodeId) -> Result<(), StoreError> {
-        self.store.borrow_mut().dec_ref(id)
+        self.store.lock().unwrap().dec_ref(id)
     }
 
     /// Share the store handle (used to open snapshot views).
-    pub fn store_handle(&self) -> Rc<RefCell<S>> {
-        Rc::clone(&self.store)
+    pub fn store_handle(&self) -> Arc<Mutex<S>> {
+        Arc::clone(&self.store)
     }
 
     /// Nodes reachable from the current root (for seeding a reopened
     /// store's live-node count, and for leak checks).
     pub fn count_reachable(&self) -> Result<usize, StoreError> {
-        self.store.borrow_mut().reachable(self.root)
+        self.store.lock().unwrap().reachable(self.root)
     }
 
     pub fn len(&self) -> usize {
@@ -298,14 +297,14 @@ impl<K, V, S: NodeStore<K, V>, const T: usize> BTree<K, V, S, T> {
 
     /// `(allocated nodes, nodes reachable from root)` — leak-check aid.
     pub fn store_stats(&self) -> Result<(usize, usize), StoreError> {
-        let live = self.store.borrow_mut().live();
+        let live = self.store.lock().unwrap().live();
         Ok((live, self.reachable_node_count()))
     }
 
     /// Nodes reachable from this tree's root — for per-store leak checks
     /// when several trees share one store (tests).
     pub fn reachable_node_count(&self) -> usize {
-        let mut s = self.store.borrow_mut();
+        let mut s = self.store.lock().unwrap();
         let mut seen = std::collections::HashSet::new();
         let mut stack = vec![self.root];
         while let Some(id) = stack.pop() {
@@ -364,7 +363,7 @@ impl<K, V, S: NodeStore<K, V>, const T: usize> BTree<K, V, S, T> {
             Ok(())
         }
 
-        let mut s = self.store.borrow_mut();
+        let mut s = self.store.lock().unwrap();
         let mut ids = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut last = None;
@@ -374,7 +373,7 @@ impl<K, V, S: NodeStore<K, V>, const T: usize> BTree<K, V, S, T> {
 
     /// Flush dirty state in block-backed stores.
     pub fn flush(&self) -> Result<(), StoreError> {
-        self.store.borrow_mut().flush()
+        self.store.lock().unwrap().flush()
     }
 }
 
@@ -384,7 +383,7 @@ impl<K, V, S: NodeStore<K, V> + Default, const T: usize> BTree<K, V, S, T> {
         let mut store = S::default();
         let root = store.alloc(Node::leaf()).expect("alloc cannot fail here");
         Self {
-            store: Rc::new(RefCell::new(store)),
+            store: Arc::new(Mutex::new(store)),
             root,
             len: 0,
             owned: true,
@@ -393,8 +392,8 @@ impl<K, V, S: NodeStore<K, V> + Default, const T: usize> BTree<K, V, S, T> {
     }
     /// Create an empty tree on an *existing* shared store (tests that run
     /// many trees against one store for cross-tree leak checks).
-    pub fn new_on(store: Rc<RefCell<S>>) -> Result<Self, StoreError> {
-        let root = store.borrow_mut().alloc(Node::leaf())?;
+    pub fn new_on(store: Arc<Mutex<S>>) -> Result<Self, StoreError> {
+        let root = store.lock().unwrap().alloc(Node::leaf())?;
         Ok(BTree {
             store,
             root,
@@ -408,10 +407,10 @@ impl<K, V, S: NodeStore<K, V> + Default, const T: usize> BTree<K, V, S, T> {
 impl<K: Ord + Clone, V: Clone, S: NodeStore<K, V>, const T: usize> BTree<K, V, S, T> {
     /// Shares the root with a new tree handle (refcount + 1).
     pub fn snapshot(&self) -> Self {
-        let mut a = self.store.borrow_mut();
+        let mut a = self.store.lock().unwrap();
         a.inc_ref(self.root).expect("inc_ref cannot fail here");
         Self {
-            store: Rc::clone(&self.store),
+            store: Arc::clone(&self.store),
             root: self.root,
             len: self.len,
             owned: true,
@@ -420,7 +419,7 @@ impl<K: Ord + Clone, V: Clone, S: NodeStore<K, V>, const T: usize> BTree<K, V, S
     }
 
     pub fn get(&self, k: &K) -> Result<Option<V>, StoreError> {
-        let mut a = self.store.borrow_mut();
+        let mut a = self.store.lock().unwrap();
         let mut id = self.root;
         loop {
             let n = a.get(id)?;
@@ -438,7 +437,7 @@ impl<K: Ord + Clone, V: Clone, S: NodeStore<K, V>, const T: usize> BTree<K, V, S
 
     /// Inserts `k -> v`, returning the old value if `k` was present.
     pub fn insert(&mut self, k: K, v: V) -> Result<Option<V>, StoreError> {
-        let mut a = self.store.borrow_mut();
+        let mut a = self.store.lock().unwrap();
         let root = ensure_unique(&mut *a, self.root)?;
         self.root = root;
         let old;
@@ -465,7 +464,7 @@ impl<K: Ord + Clone, V: Clone, S: NodeStore<K, V>, const T: usize> BTree<K, V, S
 
     /// Removes `k`, returning its value if present.
     pub fn remove(&mut self, k: &K) -> Result<Option<V>, StoreError> {
-        let mut a = self.store.borrow_mut();
+        let mut a = self.store.lock().unwrap();
         let root = ensure_unique(&mut *a, self.root)?;
         self.root = root;
         let out = remove_from::<K, V, S, T>(&mut *a, self.root, k)?;
@@ -488,7 +487,7 @@ impl<K: Ord + Clone, V: Clone, S: NodeStore<K, V>, const T: usize> BTree<K, V, S
 
     /// Sorted contents, for tests and scans.
     pub fn to_sorted_vec(&self) -> Result<Vec<(K, V)>, StoreError> {
-        let mut a = self.store.borrow_mut();
+        let mut a = self.store.lock().unwrap();
         let mut out = Vec::with_capacity(self.len);
         collect(&mut *a, self.root, &mut out)?;
         Ok(out)
@@ -496,7 +495,7 @@ impl<K: Ord + Clone, V: Clone, S: NodeStore<K, V>, const T: usize> BTree<K, V, S
 
     /// Sorted contents within `[lo, hi]`, for scans (e.g. readdir).
     pub fn range(&self, lo: &K, hi: &K) -> Result<Vec<(K, V)>, StoreError> {
-        let mut a = self.store.borrow_mut();
+        let mut a = self.store.lock().unwrap();
         let mut out = Vec::new();
         collect_range(&mut *a, self.root, lo, hi, &mut out)?;
         Ok(out)
@@ -504,7 +503,7 @@ impl<K: Ord + Clone, V: Clone, S: NodeStore<K, V>, const T: usize> BTree<K, V, S
 
     /// Largest key, if any.
     pub fn max_key(&self) -> Result<Option<K>, StoreError> {
-        let mut a = self.store.borrow_mut();
+        let mut a = self.store.lock().unwrap();
         let mut id = self.root;
         loop {
             let n = a.get(id)?;
@@ -524,7 +523,7 @@ impl<K, V, S: NodeStore<K, V>, const T: usize> Drop for BTree<K, V, S, T> {
         // lifetimes. (A previous strong_count heuristic misfired during
         // unwinding and on borrowed roots — hence the explicit flag.)
         if self.owned {
-            let _ = self.store.borrow_mut().dec_ref(self.root);
+            let _ = self.store.lock().unwrap().dec_ref(self.root);
         }
     }
 }
@@ -995,8 +994,8 @@ mod tests {
         S: NodeStore<u64, u64>,
         F: Fn() -> S,
     {
-        let store = Rc::new(RefCell::new(mk()));
-        let root = store.borrow_mut().alloc(Node::leaf()).unwrap();
+        let store = Arc::new(Mutex::new(mk()));
+        let root = store.lock().unwrap().alloc(Node::leaf()).unwrap();
         let mut t = BTree::<u64, u64, S, TT>::open(store, root, 0);
         let mut m = BTreeMap::<u64, u64>::new();
         let mut snaps: Vec<BTree<u64, u64, S, TT>> = Vec::new();

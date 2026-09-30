@@ -7,10 +7,10 @@
 //! [`Fs::commit`] can therefore only leak blocks, never expose torn data —
 //! the previous superblock generation is always intact.
 
-use std::cell::RefCell;
 use std::io;
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::bitmap::Bitmap;
@@ -334,7 +334,7 @@ fn now_secs() -> u64 {
 /// Shared read path for the live trees and snapshot views.
 fn read_from(
     extents: &ExtentTree,
-    shared: &Rc<RefCell<Shared>>,
+    shared: &Arc<Mutex<Shared>>,
     inode: &Inode,
     ino: u64,
     offset: u64,
@@ -357,7 +357,8 @@ fn read_from(
         match extents.get(&ExtentKey { ino, off: blk_off })? {
             Some(ext) => {
                 shared
-                    .borrow_mut()
+                    .lock()
+                    .unwrap()
                     .dev
                     .read_block(ext.blk, &mut buf)
                     .map_err(StoreError::Io)?;
@@ -386,7 +387,7 @@ pub struct CheckReport {
 }
 
 pub struct Fs {
-    shared: Rc<RefCell<Shared>>,
+    shared: Arc<Mutex<Shared>>,
     sb: Superblock,
     active_slot: usize,
     inodes: InodeTree,
@@ -430,20 +431,20 @@ impl Fs {
             bitmap.set(b);
         }
         store::write_bitmap(&mut dev, &bitmap, 2, bblocks)?;
-        let shared = Rc::new(RefCell::new(Shared {
+        let shared = Arc::new(Mutex::new(Shared {
             dev,
             bitmap,
             pending_free: Vec::new(),
             fault_point: None,
         }));
 
-        let (ia, iroot) = BlockArena::new_tree(Rc::clone(&shared), T_INODE)?;
-        let (da, droot) = BlockArena::new_tree(Rc::clone(&shared), T_DIR)?;
-        let (ea, eroot) = BlockArena::new_tree(Rc::clone(&shared), T_EXTENT)?;
-        let (sa, sroot) = BlockArena::new_tree(Rc::clone(&shared), T_SNAP)?;
+        let (ia, iroot) = BlockArena::new_tree(Arc::clone(&shared), T_INODE)?;
+        let (da, droot) = BlockArena::new_tree(Arc::clone(&shared), T_DIR)?;
+        let (ea, eroot) = BlockArena::new_tree(Arc::clone(&shared), T_EXTENT)?;
+        let (sa, sroot) = BlockArena::new_tree(Arc::clone(&shared), T_SNAP)?;
 
         let mut fs = Fs {
-            shared: Rc::clone(&shared),
+            shared: Arc::clone(&shared),
             sb: Superblock::blank(blocks, 2, bblocks),
             active_slot: 0,
             inodes: InodeTree::open(ia, iroot, 0),
@@ -504,24 +505,24 @@ impl Fs {
             sb.bitmap_area_start(),
             sb.bitmap_blocks,
         )?;
-        let shared = Rc::new(RefCell::new(Shared {
+        let shared = Arc::new(Mutex::new(Shared {
             dev,
             bitmap,
             pending_free: Vec::new(),
             fault_point: None,
         }));
 
-        let ia: Rc<RefCell<BlockArena<u64, Inode>>> =
-            Rc::new(RefCell::new(BlockArena::new(Rc::clone(&shared), T_INODE)));
-        let da: Rc<RefCell<BlockArena<DirKey, DirEnt>>> =
-            Rc::new(RefCell::new(BlockArena::new(Rc::clone(&shared), T_DIR)));
-        let ea: Rc<RefCell<BlockArena<ExtentKey, Extent>>> =
-            Rc::new(RefCell::new(BlockArena::new(Rc::clone(&shared), T_EXTENT)));
-        let sa: Rc<RefCell<BlockArena<u64, SnapRecord>>> =
-            Rc::new(RefCell::new(BlockArena::new(Rc::clone(&shared), T_SNAP)));
+        let ia: Arc<Mutex<BlockArena<u64, Inode>>> =
+            Arc::new(Mutex::new(BlockArena::new(Arc::clone(&shared), T_INODE)));
+        let da: Arc<Mutex<BlockArena<DirKey, DirEnt>>> =
+            Arc::new(Mutex::new(BlockArena::new(Arc::clone(&shared), T_DIR)));
+        let ea: Arc<Mutex<BlockArena<ExtentKey, Extent>>> =
+            Arc::new(Mutex::new(BlockArena::new(Arc::clone(&shared), T_EXTENT)));
+        let sa: Arc<Mutex<BlockArena<u64, SnapRecord>>> =
+            Arc::new(Mutex::new(BlockArena::new(Arc::clone(&shared), T_SNAP)));
 
         let inodes = InodeTree::open(
-            Rc::clone(&ia),
+            Arc::clone(&ia),
             NodeId {
                 idx: sb.inode_root,
                 gen: sb.inode_root_gen,
@@ -529,7 +530,7 @@ impl Fs {
             sb.inode_len as usize,
         );
         let dirs = DirTree::open(
-            Rc::clone(&da),
+            Arc::clone(&da),
             NodeId {
                 idx: sb.dir_root,
                 gen: sb.dir_root_gen,
@@ -537,7 +538,7 @@ impl Fs {
             sb.dir_len as usize,
         );
         let extents = ExtentTree::open(
-            Rc::clone(&ea),
+            Arc::clone(&ea),
             NodeId {
                 idx: sb.extent_root,
                 gen: sb.extent_root_gen,
@@ -545,7 +546,7 @@ impl Fs {
             sb.extent_len as usize,
         );
         let snaps = SnapTree::open(
-            Rc::clone(&sa),
+            Arc::clone(&sa),
             NodeId {
                 idx: sb.snap_root,
                 gen: sb.snap_root_gen,
@@ -575,14 +576,14 @@ impl Fs {
                 gen: rec.root_gens[2],
             });
         }
-        let n_inodes = ia.borrow_mut().reachable_multi(&inode_roots)?;
-        let n_dirs = da.borrow_mut().reachable_multi(&dir_roots)?;
-        let n_extents = ea.borrow_mut().reachable_multi(&extent_roots)?;
+        let n_inodes = ia.lock().unwrap().reachable_multi(&inode_roots)?;
+        let n_dirs = da.lock().unwrap().reachable_multi(&dir_roots)?;
+        let n_extents = ea.lock().unwrap().reachable_multi(&extent_roots)?;
         let n_snaps = snaps.count_reachable()?;
-        ia.borrow_mut().set_live(n_inodes);
-        da.borrow_mut().set_live(n_dirs);
-        ea.borrow_mut().set_live(n_extents);
-        sa.borrow_mut().set_live(n_snaps);
+        ia.lock().unwrap().set_live(n_inodes);
+        da.lock().unwrap().set_live(n_dirs);
+        ea.lock().unwrap().set_live(n_extents);
+        sa.lock().unwrap().set_live(n_snaps);
 
         let mut fs = Fs {
             shared,
@@ -627,7 +628,7 @@ impl Fs {
 
     /// Number of free (unallocated) 4 KiB blocks. Scans the in-memory bitmap.
     pub fn free_block_count(&self) -> u64 {
-        let sh = self.shared.borrow();
+        let sh = self.shared.lock().unwrap();
         let total = self.sb.block_count;
         let used: u64 = (0..total).filter(|&b| sh.bitmap.test(b)).count() as u64;
         total.saturating_sub(used)
@@ -651,7 +652,7 @@ impl Fs {
     /// `area_start` (the inactive area on commit; the active area on mkfs).
     fn persist_bitmap(&mut self, area_start: u64) -> Result<(), FsError> {
         {
-            let mut sh = self.shared.borrow_mut();
+            let mut sh = self.shared.lock().unwrap();
             let freed = std::mem::take(&mut sh.pending_free);
             for b in freed {
                 sh.bitmap.clear(b);
@@ -659,8 +660,8 @@ impl Fs {
         }
         let blocks = self.sb.bitmap_blocks;
         // Serialize first (immutable borrow ends before the device write).
-        let raw = self.shared.borrow().bitmap.to_bytes();
-        let mut sh = self.shared.borrow_mut();
+        let raw = self.shared.lock().unwrap().bitmap.to_bytes();
+        let mut sh = self.shared.lock().unwrap();
         let mut buf = vec![0u8; blocks as usize * BLOCK_SIZE];
         let n = raw.len().min(buf.len());
         buf[..n].copy_from_slice(&raw[..n]);
@@ -699,9 +700,9 @@ impl Fs {
         self.flush_all()?;
         let area = self.sb.bitmap_area_start();
         self.persist_bitmap(area)?;
-        self.shared.borrow_mut().dev.sync()?;
+        self.shared.lock().unwrap().dev.sync()?;
         self.sync_roots();
-        let mut sh = self.shared.borrow_mut();
+        let mut sh = self.shared.lock().unwrap();
         superblock::write_slots(&mut sh.dev, &self.sb)?;
         Ok(())
     }
@@ -722,20 +723,20 @@ impl Fs {
         self.check_fault(FaultPoint::AfterBitmap)?;
         // The new generation's blocks must be on stable storage *before*
         // any superblock slot points at them.
-        self.shared.borrow_mut().dev.sync()?;
+        self.shared.lock().unwrap().dev.sync()?;
         self.check_fault(FaultPoint::AfterSync)?;
         self.sync_roots();
         self.sb.bitmap_area = 1 - self.sb.bitmap_area;
-        let mut sh = self.shared.borrow_mut();
+        let mut sh = self.shared.lock().unwrap();
         superblock::commit_generation(&mut sh.dev, &mut self.sb, &mut self.active_slot)?;
         Ok(())
     }
 
     /// Check for an armed fault point; if matched, disarm and abort.
     fn check_fault(&mut self, point: FaultPoint) -> Result<(), FsError> {
-        let armed = self.shared.borrow().fault_point;
+        let armed = self.shared.lock().unwrap().fault_point;
         if armed == Some(point) {
-            self.shared.borrow_mut().fault_point = None;
+            self.shared.lock().unwrap().fault_point = None;
             return Err(FsError::InjectedFault(point));
         }
         Ok(())
@@ -745,19 +746,19 @@ impl Fs {
     /// The commit will abort with `FsError::InjectedFault` before
     /// completing the named stage.
     pub fn set_fault_point(&mut self, point: FaultPoint) {
-        self.shared.borrow_mut().fault_point = Some(point);
+        self.shared.lock().unwrap().fault_point = Some(point);
     }
 
     /// Disarm any fault point.
     pub fn clear_fault_point(&mut self) {
-        self.shared.borrow_mut().fault_point = None;
+        self.shared.lock().unwrap().fault_point = None;
     }
 
     /// Forcibly set a bitmap bit (P7 fault injection).
     /// Simulates a lost free or bitmap corruption for reclaim testing.
     /// Not for production use.
     pub fn debug_set_bitmap_bit(&mut self, block: u64) {
-        self.shared.borrow_mut().bitmap.set(block);
+        self.shared.lock().unwrap().bitmap.set(block);
     }
 
     /// Full consistency check of the committed state.
@@ -812,7 +813,7 @@ impl Fs {
         }
 
         // Reconcile against the active bitmap area.
-        let sh = self.shared.borrow();
+        let sh = self.shared.lock().unwrap();
         let reserved = 2 + 2 * self.sb.bitmap_blocks;
         let mut allocated_blocks = 0u64;
         for b in 0..self.sb.block_count {
@@ -879,7 +880,7 @@ impl Fs {
         let reserved = 2 + 2 * self.sb.bitmap_blocks;
         let mut reclaimed = 0u64;
         {
-            let mut sh = self.shared.borrow_mut();
+            let mut sh = self.shared.lock().unwrap();
             for b in reserved..self.sb.block_count {
                 if sh.bitmap.test(b) && !reachable.contains(&b) {
                     sh.bitmap.clear(b);
@@ -894,7 +895,8 @@ impl Fs {
 
     fn alloc_block(&mut self) -> Result<u64, FsError> {
         self.shared
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .bitmap
             .alloc()
             .ok_or(FsError::NoSpace)
@@ -911,17 +913,17 @@ impl Fs {
             // reclaimed in `snapshot_delete` when the last pinning
             // snapshot goes away.
         } else {
-            self.shared.borrow_mut().pending_free.push(blk);
+            self.shared.lock().unwrap().pending_free.push(blk);
         }
     }
 
     fn read_block(&self, blk: u64, buf: &mut [u8; BLOCK_SIZE]) -> Result<(), FsError> {
-        self.shared.borrow_mut().dev.read_block(blk, buf)?;
+        self.shared.lock().unwrap().dev.read_block(blk, buf)?;
         Ok(())
     }
 
     fn write_block(&mut self, blk: u64, buf: &[u8; BLOCK_SIZE]) -> Result<(), FsError> {
-        self.shared.borrow_mut().dev.write_block(blk, buf)?;
+        self.shared.lock().unwrap().dev.write_block(blk, buf)?;
         Ok(())
     }
 
@@ -1444,7 +1446,7 @@ impl Fs {
         }
         for blk in deleted_blocks {
             if !self.snapshot_pinned.contains(&blk) && !live.contains(&blk) {
-                self.shared.borrow_mut().pending_free.push(blk);
+                self.shared.lock().unwrap().pending_free.push(blk);
             }
         }
         Ok(())

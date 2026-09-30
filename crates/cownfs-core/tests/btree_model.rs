@@ -6,13 +6,12 @@
 //! its model and for node leaks (store allocation == total reachable once
 //! only one tree remains).
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use cownfs_core::btree::{MemArena, NodeStore};
 
-type Store = Rc<RefCell<MemArena<u64, u64>>>;
+type Store = Arc<Mutex<MemArena<u64, u64>>>;
 type Tree<const T: usize> = cownfs_core::btree::BTree<u64, u64, MemArena<u64, u64>, T>;
 
 /// xorshift64* — deterministic, no dependency.
@@ -42,9 +41,9 @@ fn check_tree<const T: usize>(t: &Tree<T>, m: &BTreeMap<u64, u64>) {
 
 fn run_model<const T: usize>(seed: u64, ops: usize) {
     let mut rng = Rng(seed);
-    let store: Store = Rc::new(RefCell::new(MemArena::new()));
+    let store: Store = Arc::new(Mutex::new(MemArena::new()));
     let mut trees: Vec<(Tree<T>, BTreeMap<u64, u64>)> =
-        vec![(Tree::new_on(Rc::clone(&store)).unwrap(), BTreeMap::new())];
+        vec![(Tree::new_on(Arc::clone(&store)).unwrap(), BTreeMap::new())];
 
     for step in 0..ops {
         let ti = rng.below(trees.len() as u64) as usize;
@@ -98,14 +97,14 @@ fn run_model<const T: usize>(seed: u64, ops: usize) {
     // shared store must be reachable from the survivor's root.
     let (survivor, _) = trees.pop().unwrap();
     drop(trees);
-    let live = store.borrow_mut().live();
+    let live = store.lock().unwrap().live();
     let reachable = survivor.reachable_node_count();
     assert_eq!(
         live, reachable,
         "leaked nodes: {live} allocated, {reachable} reachable"
     );
     drop(survivor);
-    assert_eq!(store.borrow_mut().live(), 0, "drop of last tree leaked");
+    assert_eq!(store.lock().unwrap().live(), 0, "drop of last tree leaked");
 }
 
 #[test]
@@ -123,8 +122,8 @@ fn model_t2_stress_splits() {
 
 #[test]
 fn ascending_inserts_descending_removes() {
-    let store: Store = Rc::new(RefCell::new(MemArena::new()));
-    let mut t = Tree::<4>::new_on(Rc::clone(&store)).unwrap();
+    let store: Store = Arc::new(Mutex::new(MemArena::new()));
+    let mut t = Tree::<4>::new_on(Arc::clone(&store)).unwrap();
     for k in 0..5000 {
         t.insert(k, k * 3).unwrap();
     }
@@ -147,8 +146,8 @@ fn ascending_inserts_descending_removes() {
 
 #[test]
 fn cow_snapshot_isolation() {
-    let store: Store = Rc::new(RefCell::new(MemArena::new()));
-    let mut base = Tree::<4>::new_on(Rc::clone(&store)).unwrap();
+    let store: Store = Arc::new(Mutex::new(MemArena::new()));
+    let mut base = Tree::<4>::new_on(Arc::clone(&store)).unwrap();
     for k in 0..100 {
         base.insert(k, k).unwrap();
     }

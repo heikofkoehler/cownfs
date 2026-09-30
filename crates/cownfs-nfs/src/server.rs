@@ -1,8 +1,10 @@
-//! Minimal NFSv4.0 TCP server: one thread per connection, read-only
-//! COMPOUND execution against the engine (P4).
+//! Minimal NFSv4.0 TCP server: COMPOUND execution against the engine.
+//! Single-connection (`serve_listener`) or thread-per-connection
+//! (`serve_concurrent`) serving; filesystem and NFSv4 state are shared.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
 
 use cownfs_core::engine::{Fs, FsError, FTYPE_DIR, FTYPE_SYMLINK, ROOT_INO};
 
@@ -86,29 +88,61 @@ fn fs_to_nfs(e: FsError) -> u32 {
     }
 }
 
+/// Server state shared across all connections: the filesystem and the
+/// NFSv4 client/open/lock table (leases, open owners, byte-range locks).
+/// `cfh`/`saved_fh` stay per-connection inside [`Session`].
+#[derive(Clone)]
+pub struct Shared {
+    pub fs: Arc<Mutex<Fs>>,
+    pub state: Arc<Mutex<StateManager>>,
+}
+
+impl Shared {
+    pub fn new(fs: Fs) -> Self {
+        Shared {
+            fs: Arc::new(Mutex::new(fs)),
+            state: Arc::new(Mutex::new(StateManager::new())),
+        }
+    }
+}
+
 /// Per-connection COMPOUND execution state.
-struct Session<'f> {
-    fs: &'f mut Fs,
+struct Session {
+    shared: Shared,
     /// Current filehandle's inode (None = none selected).
     cfh: Option<u64>,
     /// Saved filehandle (SAVEFH/RESTOREFH).
     saved_fh: Option<u64>,
-    /// NFSv4 client/open/lock state (P6).
-    state: StateManager,
 }
 
-impl<'f> Session<'f> {
-    fn new(fs: &'f mut Fs) -> Self {
+impl Session {
+    fn new(shared: &Shared) -> Self {
         Session {
-            fs,
+            shared: shared.clone(),
             cfh: None,
             saved_fh: None,
-            state: StateManager::new(),
         }
     }
 
+    /// Lock the filesystem. Each op takes and releases this guard within a
+    /// single statement, so guards never nest and lock order is trivial.
+    ///
+    /// WARNING: never use `self.fs()` as a temporary method receiver twice
+    /// in one expression (e.g. two fields of one struct literal). A
+    /// temporary `MutexGuard` that is the receiver of a method call lives
+    /// until the end of the enclosing expression, so the second `self.fs()`
+    /// deadlocks the thread on itself. Bind each call to a local first.
+    fn fs(&self) -> std::sync::MutexGuard<'_, Fs> {
+        self.shared.fs.lock().unwrap()
+    }
+
+    /// Lock the NFSv4 client/open/lock table.
+    fn state(&self) -> std::sync::MutexGuard<'_, StateManager> {
+        self.shared.state.lock().unwrap()
+    }
+
     fn check_fh(&self, fh: &FileHandle) -> Result<u64, u32> {
-        if fh.fs_uuid != self.fs.uuid() {
+        if fh.fs_uuid != self.fs().uuid() {
             return Err(NFS4ERR_INVAL);
         }
         Ok(fh.inode)
@@ -144,7 +178,7 @@ impl<'f> Session<'f> {
                 Some(ino) => {
                     let mut w = Writer::new();
                     FileHandle {
-                        fs_uuid: self.fs.uuid(),
+                        fs_uuid: self.fs().uuid(),
                         inode: ino,
                     }
                     .encode(&mut w);
@@ -271,7 +305,7 @@ impl<'f> Session<'f> {
         } else if name == b".." {
             return self.op_lookupp_inner(opnum);
         } else {
-            self.fs.lookup(ino, name)
+            self.fs().lookup(ino, name)
         };
         match result {
             Ok(Some((child, _))) => {
@@ -297,7 +331,8 @@ impl<'f> Session<'f> {
             self.cfh = Some(ROOT_INO);
             return OpResult::ok(opnum, Vec::new());
         }
-        match self.fs.lookup(ino, b"..") {
+        let parent = self.fs().lookup(ino, b"..");
+        match parent {
             Ok(Some((parent, _))) => {
                 self.cfh = Some(parent);
                 OpResult::ok(opnum, Vec::new())
@@ -315,8 +350,9 @@ impl<'f> Session<'f> {
             FTYPE_SYMLINK => NF4LNK,
             _ => NF4REG,
         };
-        let total_blocks = self.fs.block_count();
-        let free_blocks = self.fs.free_block_count();
+        let total_blocks = self.fs().block_count();
+        let free_blocks = self.fs().free_block_count();
+        let fs_uuid = self.fs().uuid();
         let block_size: u64 = 4096;
         FileAttrs {
             ftype,
@@ -324,10 +360,10 @@ impl<'f> Session<'f> {
             fileid: ino,
             mode: inode.mode,
             nlink: inode.nlink,
-            fsid_major: u64::from_be_bytes(self.fs.uuid()[..8].try_into().unwrap()),
-            fsid_minor: u64::from_be_bytes(self.fs.uuid()[8..].try_into().unwrap()),
+            fsid_major: u64::from_be_bytes(fs_uuid[..8].try_into().unwrap()),
+            fsid_minor: u64::from_be_bytes(fs_uuid[8..].try_into().unwrap()),
             fh: FileHandle {
-                fs_uuid: self.fs.uuid(),
+                fs_uuid,
                 inode: ino,
             }
             .to_bytes()
@@ -354,7 +390,10 @@ impl<'f> Session<'f> {
             Ok(i) => i,
             Err(r) => return r,
         };
-        let inode = match self.fs.getattr(ino) {
+        // Bind before matching: a guard in a match scrutinee stays live
+        // for the whole match, which would deadlock a later self.fs().
+        let inode_res = self.fs().getattr(ino);
+        let inode = match inode_res {
             Ok(i) => i,
             Err(e) => return OpResult::err(OP_GETATTR, fs_to_nfs(e)),
         };
@@ -370,7 +409,7 @@ impl<'f> Session<'f> {
             Ok(i) => i,
             Err(r) => return r,
         };
-        let entries = match self.fs.readdir(ino) {
+        let entries = match self.fs().readdir(ino) {
             Ok(e) => e,
             Err(e) => return OpResult::err(OP_READDIR, fs_to_nfs(e)),
         };
@@ -383,7 +422,7 @@ impl<'f> Session<'f> {
         let max = maxcount.min(1024 * 1024);
         let mut emitted = 0usize;
         for (idx, (name, child_ino, _typ)) in entries.iter().enumerate().skip(start) {
-            let inode = match self.fs.getattr(*child_ino) {
+            let inode = match self.fs().getattr(*child_ino) {
                 Ok(i) => i,
                 Err(_) => continue,
             };
@@ -414,11 +453,11 @@ impl<'f> Session<'f> {
         };
         // READ on a directory or symlink target: symlinks are read via
         // READ in v4.0 (no READLINK needed for the P4 gate, but support it).
-        let data = match self.fs.read(ino, offset, count.min(1024 * 1024) as usize) {
+        let data = match self.fs().read(ino, offset, count.min(1024 * 1024) as usize) {
             Ok(d) => d,
             Err(e) => return OpResult::err(OP_READ, fs_to_nfs(e)),
         };
-        let inode = match self.fs.getattr(ino) {
+        let inode = match self.fs().getattr(ino) {
             Ok(i) => i,
             Err(e) => return OpResult::err(OP_READ, fs_to_nfs(e)),
         };
@@ -483,18 +522,21 @@ impl<'f> Session<'f> {
             None => return OpResult::err(OP_OPEN, NFS4ERR_INVAL),
         };
         // Check the cfh is a directory.
-        match self.fs.getattr(dir_ino) {
+        match self.fs().getattr(dir_ino) {
             Ok(inode) if inode.ftype == FTYPE_DIR => {}
             Ok(_) => return OpResult::err(OP_OPEN, NFS4ERR_NOTDIR),
             Err(e) => return OpResult::err(OP_OPEN, fs_to_nfs(e)),
         }
 
-        let existing = match self.fs.lookup(dir_ino, filename) {
+        let existing = match self.fs().lookup(dir_ino, filename) {
             Ok(o) => o,
             Err(e) => return OpResult::err(OP_OPEN, fs_to_nfs(e)),
         };
 
         let file_ino = match (existing, opentype == OPEN4_CREATE) {
+            (Some(_), _) if createmode == GUARDED4 && opentype == OPEN4_CREATE => {
+                return OpResult::err(OP_OPEN, NFS4ERR_EXIST)
+            }
             (Some((ino, _)), _) => ino,
             (None, true) => {
                 // Create the file.
@@ -502,7 +544,7 @@ impl<'f> Session<'f> {
                     return OpResult::err(OP_OPEN, NFS4ERR_NOTSUPP);
                 }
                 let (mode, uid, gid) = Self::parse_createattrs(createattrs);
-                match self.fs.create(dir_ino, filename, mode, uid, gid) {
+                match self.fs().create(dir_ino, filename, mode, uid, gid) {
                     Ok(ino) => ino,
                     Err(e) => return OpResult::err(OP_OPEN, fs_to_nfs(e)),
                 }
@@ -514,7 +556,7 @@ impl<'f> Session<'f> {
         // P6: create real open state with share reservation checking.
         let open_rec =
             match self
-                .state
+                .state()
                 .open(clientid, owner.to_vec(), file_ino, share_access, share_deny)
             {
                 Ok(rec) => rec,
@@ -549,9 +591,9 @@ impl<'f> Session<'f> {
         };
         let (mode, uid, gid) = Self::parse_createattrs(attrs);
         let result = match ftype {
-            NF4DIR => self.fs.mkdir(dir_ino, name, mode, uid, gid).map(|_| ()),
+            NF4DIR => self.fs().mkdir(dir_ino, name, mode, uid, gid).map(|_| ()),
             NF4LNK => self
-                .fs
+                .fs()
                 .symlink(dir_ino, name, linkdata, uid, gid)
                 .map(|_| ()),
             _ => return OpResult::err(OP_CREATE, NFS4ERR_NOTSUPP),
@@ -577,15 +619,15 @@ impl<'f> Session<'f> {
             None => return OpResult::err(OP_REMOVE, NFS4ERR_INVAL),
         };
         // Try unlink first; if it's a dir, use rmdir.
-        let ent = match self.fs.lookup(dir_ino, name) {
+        let ent = match self.fs().lookup(dir_ino, name) {
             Ok(Some((_, typ))) => typ,
             Ok(None) => return OpResult::err(OP_REMOVE, NFS4ERR_NOENT),
             Err(e) => return OpResult::err(OP_REMOVE, fs_to_nfs(e)),
         };
         let result = if ent == FTYPE_DIR {
-            self.fs.rmdir(dir_ino, name)
+            self.fs().rmdir(dir_ino, name)
         } else {
-            self.fs.unlink(dir_ino, name)
+            self.fs().unlink(dir_ino, name)
         };
         match result {
             Ok(()) => {
@@ -607,7 +649,7 @@ impl<'f> Session<'f> {
             None => return OpResult::err(OP_RENAME, NFS4ERR_INVAL),
         };
         let dst_dir = self.saved_fh.unwrap_or(src_dir);
-        match self.fs.rename(src_dir, old, dst_dir, new) {
+        match self.fs().rename(src_dir, old, dst_dir, new) {
             Ok(()) => {
                 let mut w = Writer::new();
                 w.u64(0);
@@ -630,7 +672,7 @@ impl<'f> Session<'f> {
             Some(i) => i,
             None => return OpResult::err(OP_LINK, NFS4ERR_INVAL),
         };
-        match self.fs.link(file_ino, dir_ino, name) {
+        match self.fs().link(file_ino, dir_ino, name) {
             Ok(()) => {
                 let mut w = Writer::new();
                 w.u64(0);
@@ -693,7 +735,7 @@ impl<'f> Session<'f> {
                 _ => return OpResult::err(OP_SETATTR, NFS4ERR_NOTSUPP),
             }
         }
-        match self.fs.setattr(ino, &sa) {
+        match self.fs().setattr(ino, &sa) {
             Ok(()) => {
                 let mut w = Writer::new();
                 // attrset: which attrs were set
@@ -717,13 +759,13 @@ impl<'f> Session<'f> {
             Some(i) => i,
             None => return OpResult::err(OP_WRITE, NFS4ERR_INVAL),
         };
-        if let Err(e) = self.fs.write(ino, offset, data) {
+        if let Err(e) = self.fs().write(ino, offset, data) {
             return OpResult::err(OP_WRITE, fs_to_nfs(e));
         }
         // Stable-write semantics: FILE_SYNC4 must hit stable storage
         // before we reply. P5: commit the transaction.
         let committed = if stable == FILE_SYNC4 {
-            match self.fs.commit() {
+            match self.fs().commit() {
                 Ok(()) => FILE_SYNC4,
                 Err(e) => return OpResult::err(OP_WRITE, fs_to_nfs(e)),
             }
@@ -739,7 +781,7 @@ impl<'f> Session<'f> {
     }
 
     fn op_commit(&mut self, _offset: u64, _count: u32) -> OpResult {
-        match self.fs.commit() {
+        match self.fs().commit() {
             Ok(()) => {
                 let mut w = Writer::new();
                 w.opaque_fixed(&[0u8; 8]); // verifier
@@ -750,7 +792,7 @@ impl<'f> Session<'f> {
     }
 
     fn op_setclientid(&mut self, verifier: [u8; 8], name: &[u8]) -> OpResult {
-        let (clientid, _) = self.state.setclientid(verifier, name.to_vec());
+        let (clientid, _) = self.state().setclientid(verifier, name.to_vec());
         let mut w = Writer::new();
         w.u64(clientid);
         w.opaque_fixed(&verifier);
@@ -758,7 +800,7 @@ impl<'f> Session<'f> {
     }
 
     fn op_setclientid_confirm(&mut self, clientid: u64, verifier: [u8; 8]) -> OpResult {
-        if self.state.confirm(clientid, verifier) {
+        if self.state().confirm(clientid, verifier) {
             OpResult::ok(OP_SETCLIENTID_CONFIRM, Vec::new())
         } else {
             OpResult::err(OP_SETCLIENTID_CONFIRM, NFS4ERR_STALE_CLIENTID)
@@ -766,7 +808,7 @@ impl<'f> Session<'f> {
     }
 
     fn op_close(&mut self, seqid: u32, stateid: &StateId) -> OpResult {
-        match self.state.close(stateid, seqid) {
+        match self.state().close(stateid, seqid) {
             Ok(()) => {
                 // CLOSE4resok: return the "closed" stateid (all zeros per RFC 7530 §16.2.3)
                 let mut w = Writer::new();
@@ -801,7 +843,7 @@ impl<'f> Session<'f> {
         // from the RPC credentials or the open_stateid. For simplicity, we
         // use a fixed clientid 1 (the test will use SETCLIENTID first).
         // Actually, let's get it from the open_stateid's client.
-        let clientid = match self.state.find_open(open_stateid) {
+        let clientid = match self.state().find_open(open_stateid) {
             Some(o) => o.clientid,
             None if !new_lock_owner => {
                 // Existing lock owner: find by lock_stateid.
@@ -814,7 +856,7 @@ impl<'f> Session<'f> {
         } else {
             None
         };
-        match self.state.lock(
+        match self.state().lock(
             clientid,
             lock_owner.to_vec(),
             file_ino,
@@ -841,7 +883,7 @@ impl<'f> Session<'f> {
         offset: u64,
         length: u64,
     ) -> OpResult {
-        match self.state.unlock(stateid, seqid, offset, length) {
+        match self.state().unlock(stateid, seqid, offset, length) {
             Ok(()) => OpResult::ok(OP_LOCKU, Vec::new()),
             Err(NfsError::Status(s)) => OpResult::err(OP_LOCKU, s),
             Err(_) => OpResult::err(OP_LOCKU, NFS4ERR_SERVERFAULT),
@@ -849,7 +891,7 @@ impl<'f> Session<'f> {
     }
 
     fn op_renew(&mut self, clientid: u64) -> OpResult {
-        if self.state.renew(clientid) {
+        if self.state().renew(clientid) {
             OpResult::ok(OP_RENEW, Vec::new())
         } else {
             OpResult::err(OP_RENEW, NFS4ERR_EXPIRED)
@@ -861,7 +903,7 @@ impl<'f> Session<'f> {
             Ok(i) => i,
             Err(r) => return r,
         };
-        let _inode = match self.fs.getattr(ino) {
+        let _inode = match self.fs().getattr(ino) {
             Ok(i) => i,
             Err(e) => return OpResult::err(OP_ACCESS, fs_to_nfs(e)),
         };
@@ -894,10 +936,10 @@ impl<'f> Session<'f> {
 }
 
 /// Serve one TCP connection to completion (client close or fatal error).
-fn serve_connection(stream: TcpStream, fs: &mut Fs) -> Result<(), ServerError> {
+fn serve_connection(stream: TcpStream, shared: &Shared) -> Result<(), ServerError> {
     let mut stream = stream;
     let mut rr = RecordReader::new();
-    let mut session = Session::new(fs);
+    let mut session = Session::new(shared);
     let mut buf = [0u8; 64 * 1024];
     let debug_rpc = std::env::var("COWNFS_DEBUG_RPC").is_ok();
     loop {
@@ -1027,14 +1069,13 @@ fn handle_record(record: &[u8], session: &mut Session, debug_rpc: bool) -> Vec<u
 }
 
 /// Run the server on an already-bound `listener` (e.g. port 0 for an
-/// ephemeral port in tests). One thread per connection; returns when the
-/// listener errors.
-pub fn serve_listener(listener: TcpListener, fs: &mut Fs) -> Result<(), ServerError> {
+/// ephemeral port in tests), serving one connection at a time. Returns
+/// when the listener errors.
+pub fn serve_listener(listener: TcpListener, shared: &Shared) -> Result<(), ServerError> {
     for stream in listener.incoming() {
         match stream {
-            // Single-threaded: one connection at a time.
             Ok(s) => {
-                let _ = serve_connection(s, fs);
+                let _ = serve_connection(s, shared);
             }
             Err(e) => return Err(ServerError::Io(e)),
         }
@@ -1042,10 +1083,28 @@ pub fn serve_listener(listener: TcpListener, fs: &mut Fs) -> Result<(), ServerEr
     Ok(())
 }
 
-/// Run the server on `addr` (e.g. "127.0.0.1:2049") with one thread per
+/// Run the server on an already-bound `listener`, spawning one thread per
+/// connection. Filesystem and NFSv4 state are shared across connections.
+/// Returns when the listener errors.
+pub fn serve_concurrent(listener: TcpListener, shared: Shared) -> Result<(), ServerError> {
+    for stream in listener.incoming() {
+        match stream {
+            Ok(s) => {
+                let shared = shared.clone();
+                std::thread::spawn(move || {
+                    let _ = serve_connection(s, &shared);
+                });
+            }
+            Err(e) => return Err(ServerError::Io(e)),
+        }
+    }
+    Ok(())
+}
+
+/// Run the server on `addr` (e.g. "127.0.0.1:2049"), one thread per
 /// connection. Returns when the listener errors.
-pub fn serve(addr: &str, fs: &mut Fs) -> Result<(), ServerError> {
-    serve_listener(TcpListener::bind(addr)?, fs)
+pub fn serve(addr: &str, shared: Shared) -> Result<(), ServerError> {
+    serve_concurrent(TcpListener::bind(addr)?, shared)
 }
 
 // Reference the unused import to keep the build clean in P4.

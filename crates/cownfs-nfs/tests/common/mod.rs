@@ -61,8 +61,32 @@ pub fn spawn_server(blocks: u64) -> TestServer {
     let addr = listener.local_addr().expect("listener local addr");
     let img2 = img.clone();
     std::thread::spawn(move || {
-        let mut fs = Fs::open(&img2).expect("open test image");
-        let _ = cownfs_nfs::server::serve_listener(listener, &mut fs);
+        let fs = Fs::open(&img2).expect("open test image");
+        let shared = cownfs_nfs::server::Shared::new(fs);
+        let _ = cownfs_nfs::server::serve_listener(listener, &shared);
+    });
+    TestServer { addr, uuid, img }
+}
+
+/// Spawn a server on an ephemeral port that serves connections concurrently
+/// (one thread per connection, shared filesystem and NFSv4 state).
+/// The image file is removed when the server is dropped.
+pub fn spawn_concurrent_server(blocks: u64) -> TestServer {
+    let n = IMG_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let img = std::env::temp_dir().join(format!("cownfs-it-{}-{n}.img", std::process::id()));
+    let _ = std::fs::remove_file(&img);
+    let mut fs = Fs::format(&img, blocks).expect("format test image");
+    fs.commit().expect("commit fresh image");
+    let uuid = fs.uuid();
+    drop(fs);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+    let addr = listener.local_addr().expect("listener local addr");
+    let img2 = img.clone();
+    std::thread::spawn(move || {
+        let fs = Fs::open(&img2).expect("open test image");
+        let shared = cownfs_nfs::server::Shared::new(fs);
+        let _ = cownfs_nfs::server::serve_concurrent(listener, shared);
     });
     TestServer { addr, uuid, img }
 }

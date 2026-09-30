@@ -322,8 +322,8 @@ fn spawn_server(img: &std::path::Path, addr: &str) {
     let img2 = img.to_path_buf();
     let addr = addr.to_string();
     std::thread::spawn(move || {
-        let mut fs = Fs::open(&img2).unwrap();
-        let _ = cownfs_nfs::server::serve(&addr, &mut fs);
+        let fs = Fs::open(&img2).unwrap();
+        let _ = cownfs_nfs::server::serve(&addr, cownfs_nfs::server::Shared::new(fs));
     });
 }
 
