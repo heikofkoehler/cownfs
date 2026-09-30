@@ -886,7 +886,7 @@ fn serve_connection(stream: TcpStream, fs: &mut Fs) -> Result<(), ServerError> {
             if debug_rpc {
                 eprintln!("RPC> {} bytes: {}", record.len(), hex(&record));
             }
-            let reply = handle_record(&record, &mut session);
+            let reply = handle_record(&record, &mut session, debug_rpc);
             if debug_rpc {
                 eprintln!("RPC< {} bytes: {}", reply.len(), hex(&reply));
             }
@@ -905,7 +905,39 @@ fn hex(b: &[u8]) -> String {
     s
 }
 
-fn handle_record(record: &[u8], session: &mut Session) -> Vec<u8> {
+fn op_name(op: u32) -> &'static str {
+    use crate::nfs4::*;
+    match op {
+        OP_ACCESS => "ACCESS",
+        OP_CLOSE => "CLOSE",
+        OP_COMMIT => "COMMIT",
+        OP_CREATE => "CREATE",
+        OP_GETATTR => "GETATTR",
+        OP_GETFH => "GETFH",
+        OP_LINK => "LINK",
+        OP_LOCK => "LOCK",
+        OP_LOCKU => "LOCKU",
+        OP_LOOKUP => "LOOKUP",
+        OP_LOOKUPP => "LOOKUPP",
+        OP_OPEN => "OPEN",
+        OP_PUTFH => "PUTFH",
+        OP_PUTROOTFH => "PUTROOTFH",
+        OP_READ => "READ",
+        OP_READDIR => "READDIR",
+        OP_REMOVE => "REMOVE",
+        OP_RENAME => "RENAME",
+        OP_RENEW => "RENEW",
+        OP_RESTOREFH => "RESTOREFH",
+        OP_SAVEFH => "SAVEFH",
+        OP_SETATTR => "SETATTR",
+        OP_SETCLIENTID => "SETCLIENTID",
+        OP_SETCLIENTID_CONFIRM => "SETCLIENTID_CONFIRM",
+        OP_WRITE => "WRITE",
+        _ => "UNKNOWN",
+    }
+}
+
+fn handle_record(record: &[u8], session: &mut Session, debug_rpc: bool) -> Vec<u8> {
     let call = match Call::decode(record) {
         Ok(c) => c,
         Err(RpcError::BadProgram) => {
@@ -927,19 +959,44 @@ fn handle_record(record: &[u8], session: &mut Session) -> Vec<u8> {
                         .find(|r| r.status != NFS4_OK)
                         .map(|r| r.status)
                         .unwrap_or(NFS4_OK);
+                    // Human-readable op log: tag [OP→status OP→status …]
+                    if debug_rpc {
+                        let ops: Vec<String> = res
+                            .iter()
+                            .map(|r| {
+                                let name = op_name(r.opnum);
+                                if r.status == NFS4_OK {
+                                    name.to_string()
+                                } else {
+                                    format!("{name}→{}", r.status)
+                                }
+                            })
+                            .collect();
+                        let tag = String::from_utf8_lossy(c.tag).trim().to_string();
+                        eprintln!("OPS [{}] {}", tag, ops.join(" "));
+                    }
                     (overall, encode_compound(c.tag, overall, &res))
                 }
-                Err(NfsError::BadOp(_)) => {
+                Err(NfsError::BadOp(n)) => {
+                    if debug_rpc {
+                        eprintln!("OPS [?] decode error: BadOp({n})");
+                    }
                     (NFS4ERR_NOTSUPP, encode_compound(b"", NFS4ERR_NOTSUPP, &[]))
                 }
-                Err(_) => (
-                    NFS4ERR_SERVERFAULT,
-                    encode_compound(b"", NFS4ERR_SERVERFAULT, &[]),
-                ),
+                Err(e) => {
+                    if debug_rpc {
+                        eprintln!("OPS [?] decode error: {e:?}");
+                    }
+                    (
+                        NFS4ERR_SERVERFAULT,
+                        encode_compound(b"", NFS4ERR_SERVERFAULT, &[]),
+                    )
+                }
             };
             let _ = overall;
             rpc::encode_reply(call.xid, &payload)
         }
+
         _ => rpc::encode_reply(call.xid, &[]),
     };
     rpc::frame_record(&results)
