@@ -53,16 +53,41 @@ pub const OP_SETCLIENTID: u32 = 35;
 pub const OP_SETCLIENTID_CONFIRM: u32 = 36;
 
 // Attribute numbers (RFC 7530 §5).
+// --- REQUIRED (MUST be returned when requested) ---
+pub const FATTR4_SUPPORTED_ATTRS: u32 = 0;
 pub const FATTR4_TYPE: u32 = 1;
+pub const FATTR4_FH_EXPIRE_TYPE: u32 = 2;
+pub const FATTR4_CHANGE: u32 = 3;
 pub const FATTR4_SIZE: u32 = 4;
 pub const FATTR4_LINK_SUPPORT: u32 = 5;
+pub const FATTR4_SYMLINK_SUPPORT: u32 = 6;
+pub const FATTR4_NAMED_ATTR: u32 = 7;
 pub const FATTR4_FSID: u32 = 8;
+pub const FATTR4_UNIQUE_HANDLES: u32 = 9;
+pub const FATTR4_LEASE_TIME: u32 = 10;
+// --- RECOMMENDED (filesystem-level) ---
+pub const FATTR4_CANSETTIME: u32 = 15;
+pub const FATTR4_CASE_INSENSITIVE: u32 = 16;
+pub const FATTR4_CASE_PRESERVING: u32 = 17;
+pub const FATTR4_CHOWN_RESTRICTED: u32 = 18;
 pub const FATTR4_FILEHANDLE: u32 = 19;
-pub const FATTR4_NUMLINKS: u32 = 35;
 pub const FATTR4_FILEID: u32 = 20;
+pub const FATTR4_FILES_AVAIL: u32 = 21;
+pub const FATTR4_FILES_FREE: u32 = 22;
+pub const FATTR4_FILES_TOTAL: u32 = 23;
+pub const FATTR4_HOMOGENEOUS: u32 = 26;
+pub const FATTR4_MAXFILESIZE: u32 = 27;
+pub const FATTR4_MAXLINK: u32 = 28;
+pub const FATTR4_MAXNAME: u32 = 29;
+pub const FATTR4_MAXREAD: u32 = 30;
+pub const FATTR4_MAXWRITE: u32 = 31;
 pub const FATTR4_MODE: u32 = 33;
+pub const FATTR4_NUMLINKS: u32 = 35;
 pub const FATTR4_OWNER: u32 = 36;
 pub const FATTR4_OWNER_GROUP: u32 = 37;
+pub const FATTR4_SPACE_AVAIL: u32 = 42;
+pub const FATTR4_SPACE_FREE: u32 = 43;
+pub const FATTR4_SPACE_TOTAL: u32 = 44;
 pub const FATTR4_SPACE_USED: u32 = 45;
 pub const FATTR4_TIME_ACCESS: u32 = 47;
 pub const FATTR4_TIME_METADATA: u32 = 52;
@@ -211,9 +236,11 @@ pub enum Op {
         access: u32,
     },
     Open {
+        seqid: u32,
+        share_access: u32,
+        share_deny: u32,
         clientid: u64,
         owner: Vec<u8>,
-        flags: u32,
         opentype: u32,
         createmode: u32,
         createattrs: Vec<(u32, Vec<u8>)>,
@@ -432,9 +459,18 @@ impl Op {
             }
             OP_ACCESS => Op::Access { access: r.u32()? },
             OP_OPEN => {
+                // RFC 7530 §16.16 / RFC 7531 OPEN4args:
+                //   seqid4 seqid;
+                //   uint32_t share_access;
+                //   uint32_t share_deny;
+                //   open_owner4 { clientid4 clientid; opaque owner<>; };
+                //   openflag4 { opentype4 opentype; [createhow4] };
+                //   open_claim4 { claim_type; ... };
+                let seqid = r.u32()?;
+                let share_access = r.u32()?;
+                let share_deny = r.u32()?;
                 let clientid = r.u64()?;
                 let owner = r.opaque()?.to_vec();
-                let flags = r.u32()?;
                 let opentype = r.u32()?;
                 let (createmode, createattrs) = if opentype == OPEN4_CREATE {
                     let mode = r.u32()?;
@@ -457,9 +493,11 @@ impl Op {
                     _ => return Err(NfsError::Xdr(XdrError::Invalid("claim_type"))),
                 };
                 Op::Open {
+                    seqid,
+                    share_access,
+                    share_deny,
                     clientid,
                     owner,
-                    flags,
                     opentype,
                     createmode,
                     createattrs,
@@ -725,6 +763,13 @@ pub struct FileAttrs {
     pub atime: u64,
     pub mtime: u64,
     pub ctime: u64,
+    /// CHANGE (attr 3): monotonically increasing change counter (use ctime).
+    pub change: u64,
+    /// Filesystem-level space counters (bytes).
+    pub space_total: u64,
+    pub space_free: u64,
+    pub files_total: u64,
+    pub files_free: u64,
 }
 
 impl AttrValues {
@@ -736,8 +781,59 @@ impl AttrValues {
         // (VNON), which later surfaces as ESTALE on open/readdir. Treat an
         // empty mask as a request for TYPE so the vnode type stays stable.
         let empty = requested.words.iter().all(|w| *w == 0);
-        let mut out_mask = AttrMask { words: vec![0; 2] };
+
+        // All attrs we are willing to return (for SUPPORTED_ATTRS).
+        // Build the bitmap4 value from these constants.
+        const SUPPORTED: &[u32] = &[
+            FATTR4_SUPPORTED_ATTRS,
+            FATTR4_TYPE,
+            FATTR4_FH_EXPIRE_TYPE,
+            FATTR4_CHANGE,
+            FATTR4_SIZE,
+            FATTR4_LINK_SUPPORT,
+            FATTR4_SYMLINK_SUPPORT,
+            FATTR4_NAMED_ATTR,
+            FATTR4_FSID,
+            FATTR4_UNIQUE_HANDLES,
+            FATTR4_LEASE_TIME,
+            FATTR4_CANSETTIME,
+            FATTR4_CASE_INSENSITIVE,
+            FATTR4_CASE_PRESERVING,
+            FATTR4_CHOWN_RESTRICTED,
+            FATTR4_FILEHANDLE,
+            FATTR4_FILEID,
+            FATTR4_FILES_AVAIL,
+            FATTR4_FILES_FREE,
+            FATTR4_FILES_TOTAL,
+            FATTR4_HOMOGENEOUS,
+            FATTR4_MAXFILESIZE,
+            FATTR4_MAXLINK,
+            FATTR4_MAXNAME,
+            FATTR4_MAXREAD,
+            FATTR4_MAXWRITE,
+            FATTR4_MODE,
+            FATTR4_NUMLINKS,
+            FATTR4_OWNER,
+            FATTR4_OWNER_GROUP,
+            FATTR4_SPACE_AVAIL,
+            FATTR4_SPACE_FREE,
+            FATTR4_SPACE_TOTAL,
+            FATTR4_SPACE_USED,
+            FATTR4_TIME_ACCESS,
+            FATTR4_TIME_METADATA,
+            FATTR4_TIME_MODIFY,
+            FATTR4_MOUNTED_ON_FILEID,
+        ];
+        // Pre-build supported_attrs bitmap4 (2 words covers attrs 0-63).
+        let mut sup_words = [0u32; 2];
+        for &attr in SUPPORTED {
+            sup_words[(attr / 32) as usize] |= 1 << (attr % 32);
+        }
+
+        // out_mask needs 2 words for attrs 0-63 (MOUNTED_ON_FILEID=55).
+        let mut out_mask = AttrMask { words: vec![0u32; 2] };
         let mut w = Writer::new();
+        // Helper: record attr in mask and run body to write value bytes.
         let mut set = |attr: u32, body: &mut dyn FnMut(&mut Writer)| {
             let word = (attr / 32) as usize;
             let bit = attr % 32;
@@ -747,66 +843,178 @@ impl AttrValues {
             body(&mut w);
         };
 
+        // Attributes MUST be emitted in strictly increasing numeric order.
+
+        // 0 — SUPPORTED_ATTRS (REQUIRED): value is a bitmap4
+        if requested.wants(FATTR4_SUPPORTED_ATTRS) {
+            set(FATTR4_SUPPORTED_ATTRS, &mut |w| {
+                w.u32(sup_words.len() as u32);
+                for &word in &sup_words {
+                    w.u32(word);
+                }
+            });
+        }
+        // 1 — TYPE (REQUIRED)
         if empty || requested.wants(FATTR4_TYPE) {
             set(FATTR4_TYPE, &mut |w| w.u32(a.ftype));
         }
+        // 2 — FH_EXPIRE_TYPE (REQUIRED): 0 = FH4_PERSISTENT (filehandles never expire)
+        if requested.wants(FATTR4_FH_EXPIRE_TYPE) {
+            set(FATTR4_FH_EXPIRE_TYPE, &mut |w| w.u32(0));
+        }
+        // 3 — CHANGE (REQUIRED): use ctime as a surrogate change counter
+        if requested.wants(FATTR4_CHANGE) {
+            set(FATTR4_CHANGE, &mut |w| w.u64(a.change));
+        }
+        // 4 — SIZE
         if requested.wants(FATTR4_SIZE) {
             set(FATTR4_SIZE, &mut |w| w.u64(a.size));
         }
+        // 5 — LINK_SUPPORT (REQUIRED)
         if requested.wants(FATTR4_LINK_SUPPORT) {
-            set(FATTR4_LINK_SUPPORT, &mut |w| w.u32(1)); // hard links supported
+            set(FATTR4_LINK_SUPPORT, &mut |w| w.bool(true));
         }
+        // 6 — SYMLINK_SUPPORT (REQUIRED)
+        if requested.wants(FATTR4_SYMLINK_SUPPORT) {
+            set(FATTR4_SYMLINK_SUPPORT, &mut |w| w.bool(true));
+        }
+        // 7 — NAMED_ATTR (REQUIRED): false = no named attributes
+        if requested.wants(FATTR4_NAMED_ATTR) {
+            set(FATTR4_NAMED_ATTR, &mut |w| w.bool(false));
+        }
+        // 8 — FSID (REQUIRED)
         if requested.wants(FATTR4_FSID) {
             set(FATTR4_FSID, &mut |w| {
                 w.u64(a.fsid_major);
                 w.u64(a.fsid_minor);
             });
         }
+        // 9 — UNIQUE_HANDLES (REQUIRED): true = different files always have different FHs
+        if requested.wants(FATTR4_UNIQUE_HANDLES) {
+            set(FATTR4_UNIQUE_HANDLES, &mut |w| w.bool(true));
+        }
+        // 10 — LEASE_TIME (REQUIRED): 90 seconds (matches state::LEASE_DURATION)
+        if requested.wants(FATTR4_LEASE_TIME) {
+            set(FATTR4_LEASE_TIME, &mut |w| w.u32(90));
+        }
+        // 15 — CANSETTIME: we allow the client to set timestamps
+        if requested.wants(FATTR4_CANSETTIME) {
+            set(FATTR4_CANSETTIME, &mut |w| w.bool(true));
+        }
+        // 16 — CASE_INSENSITIVE: false (cownfs is case-sensitive)
+        if requested.wants(FATTR4_CASE_INSENSITIVE) {
+            set(FATTR4_CASE_INSENSITIVE, &mut |w| w.bool(false));
+        }
+        // 17 — CASE_PRESERVING: true
+        if requested.wants(FATTR4_CASE_PRESERVING) {
+            set(FATTR4_CASE_PRESERVING, &mut |w| w.bool(true));
+        }
+        // 18 — CHOWN_RESTRICTED: false (root can chown freely)
+        if requested.wants(FATTR4_CHOWN_RESTRICTED) {
+            set(FATTR4_CHOWN_RESTRICTED, &mut |w| w.bool(false));
+        }
+        // 19 — FILEHANDLE
         if requested.wants(FATTR4_FILEHANDLE) {
             set(FATTR4_FILEHANDLE, &mut |w| w.opaque(&a.fh));
         }
+        // 20 — FILEID
         if requested.wants(FATTR4_FILEID) {
             set(FATTR4_FILEID, &mut |w| w.u64(a.fileid));
         }
+        // 21 — FILES_AVAIL
+        if requested.wants(FATTR4_FILES_AVAIL) {
+            set(FATTR4_FILES_AVAIL, &mut |w| w.u64(a.files_free));
+        }
+        // 22 — FILES_FREE
+        if requested.wants(FATTR4_FILES_FREE) {
+            set(FATTR4_FILES_FREE, &mut |w| w.u64(a.files_free));
+        }
+        // 23 — FILES_TOTAL
+        if requested.wants(FATTR4_FILES_TOTAL) {
+            set(FATTR4_FILES_TOTAL, &mut |w| w.u64(a.files_total));
+        }
+        // 26 — HOMOGENEOUS: true (all files on this fs have the same attrs)
+        if requested.wants(FATTR4_HOMOGENEOUS) {
+            set(FATTR4_HOMOGENEOUS, &mut |w| w.bool(true));
+        }
+        // 27 — MAXFILESIZE: up to 64-bit, cap at 1 TiB
+        if requested.wants(FATTR4_MAXFILESIZE) {
+            set(FATTR4_MAXFILESIZE, &mut |w| w.u64(1u64 << 40));
+        }
+        // 28 — MAXLINK
+        if requested.wants(FATTR4_MAXLINK) {
+            set(FATTR4_MAXLINK, &mut |w| w.u32(32767));
+        }
+        // 29 — MAXNAME
+        if requested.wants(FATTR4_MAXNAME) {
+            set(FATTR4_MAXNAME, &mut |w| w.u32(255));
+        }
+        // 30 — MAXREAD: 1 MiB
+        if requested.wants(FATTR4_MAXREAD) {
+            set(FATTR4_MAXREAD, &mut |w| w.u64(1 << 20));
+        }
+        // 31 — MAXWRITE: 1 MiB
+        if requested.wants(FATTR4_MAXWRITE) {
+            set(FATTR4_MAXWRITE, &mut |w| w.u64(1 << 20));
+        }
+        // 33 — MODE
         if requested.wants(FATTR4_MODE) {
             set(FATTR4_MODE, &mut |w| w.u32(a.mode));
         }
-        // NB: attr values must be encoded in increasing attribute number
-        // order (RFC 7530 §5.5); NUMLINKS=35 sits between MODE=33 and OWNER=36.
+        // 35 — NUMLINKS (sits between MODE=33 and OWNER=36)
         if requested.wants(FATTR4_NUMLINKS) {
             set(FATTR4_NUMLINKS, &mut |w| w.u32(a.nlink));
         }
+        // 36 — OWNER (as decimal uid string per RFC 7530 §5.8)
         if requested.wants(FATTR4_OWNER) {
             let s = a.uid.to_string();
             set(FATTR4_OWNER, &mut |w| w.string(s.as_bytes()));
         }
+        // 37 — OWNER_GROUP
         if requested.wants(FATTR4_OWNER_GROUP) {
             let s = a.gid.to_string();
             set(FATTR4_OWNER_GROUP, &mut |w| w.string(s.as_bytes()));
         }
+        // 42 — SPACE_AVAIL
+        if requested.wants(FATTR4_SPACE_AVAIL) {
+            set(FATTR4_SPACE_AVAIL, &mut |w| w.u64(a.space_free));
+        }
+        // 43 — SPACE_FREE
+        if requested.wants(FATTR4_SPACE_FREE) {
+            set(FATTR4_SPACE_FREE, &mut |w| w.u64(a.space_free));
+        }
+        // 44 — SPACE_TOTAL
+        if requested.wants(FATTR4_SPACE_TOTAL) {
+            set(FATTR4_SPACE_TOTAL, &mut |w| w.u64(a.space_total));
+        }
+        // 45 — SPACE_USED (bytes consumed by this file, rounded to block size)
         if requested.wants(FATTR4_SPACE_USED) {
             set(FATTR4_SPACE_USED, &mut |w| {
                 w.u64(a.size.div_ceil(4096) * 4096)
             });
         }
+        // 47 — TIME_ACCESS: nfstime4 { seconds: i64, nseconds: u32 }
         if requested.wants(FATTR4_TIME_ACCESS) {
             set(FATTR4_TIME_ACCESS, &mut |w| {
                 w.i64(a.atime as i64);
                 w.u32(0);
             });
         }
+        // 52 — TIME_METADATA (ctime)
         if requested.wants(FATTR4_TIME_METADATA) {
             set(FATTR4_TIME_METADATA, &mut |w| {
                 w.i64(a.ctime as i64);
                 w.u32(0);
             });
         }
+        // 53 — TIME_MODIFY (mtime)
         if requested.wants(FATTR4_TIME_MODIFY) {
             set(FATTR4_TIME_MODIFY, &mut |w| {
                 w.i64(a.mtime as i64);
                 w.u32(0);
             });
         }
+        // 55 — MOUNTED_ON_FILEID
         if requested.wants(FATTR4_MOUNTED_ON_FILEID) {
             set(FATTR4_MOUNTED_ON_FILEID, &mut |w| w.u64(a.fileid));
         }
@@ -826,6 +1034,57 @@ impl AttrValues {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for the macOS CREATE issue: the OPEN decode was missing
+    /// `seqid` and read share_access/share_deny into the wrong fields. This test
+    /// constructs a wire-correct OPEN4args (per RFC 7530 §16.16 / RFC 7531) and
+    /// verifies the decoder extracts all fields at the right offsets.
+    #[test]
+    fn open_decode_rfc7530_wire_layout() {
+        let mut w = Writer::new();
+        w.u32(OP_OPEN);
+        w.u32(7); // seqid
+        w.u32(3); // share_access: READ|WRITE
+        w.u32(0); // share_deny: NONE
+        w.u64(0xDEAD_BEEF_CAFE_1234); // open_owner4.clientid
+        w.opaque(b"testowner"); // open_owner4.owner
+        w.u32(OPEN4_CREATE); // opentype
+        w.u32(UNCHECKED4); // createmode
+        // createattrs: empty fattr4 (bitmap word count=2, words=0,0, empty attrlist)
+        w.u32(2);
+        w.u32(0);
+        w.u32(0);
+        w.opaque(&[]); // empty attrlist
+        w.u32(0); // claim_type CLAIM_NULL
+        w.string(b"myfile"); // CLAIM_NULL: filename
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        let op = Op::decode(&mut r).unwrap();
+        match op {
+            Op::Open {
+                seqid,
+                share_access,
+                share_deny,
+                clientid,
+                ref owner,
+                opentype,
+                createmode,
+                ref filename,
+                ..
+            } => {
+                assert_eq!(seqid, 7);
+                assert_eq!(share_access, 3);
+                assert_eq!(share_deny, 0);
+                assert_eq!(clientid, 0xDEAD_BEEF_CAFE_1234);
+                assert_eq!(owner, b"testowner");
+                assert_eq!(opentype, OPEN4_CREATE);
+                assert_eq!(createmode, UNCHECKED4);
+                assert_eq!(filename, b"myfile");
+            }
+            _ => panic!("wrong op: {op:?}"),
+        }
+        assert!(r.is_empty(), "leftover bytes after OPEN decode");
+    }
 
     #[test]
     fn filehandle_roundtrip() {
@@ -888,6 +1147,11 @@ mod tests {
             atime: 111,
             mtime: 222,
             ctime: 333,
+            change: 333, // same as ctime
+            space_total: 64 * 1024 * 1024,
+            space_free: 32 * 1024 * 1024,
+            files_total: 4096,
+            files_free: 2048,
         }
     }
 

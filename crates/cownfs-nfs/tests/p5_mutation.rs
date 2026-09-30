@@ -87,9 +87,11 @@ impl Ops {
     }
     fn open_create(&mut self, clientid: u64, name: &[u8], mode: u32) {
         self.w.u32(OP_OPEN);
-        self.w.u64(clientid);
-        self.w.opaque(b"owner"); // open_owner
-        self.w.u32(3); // flags: OPEN4_CREATE|...
+        self.w.u32(1); // seqid (RFC 7530 §16.16 — first field)
+        self.w.u32(3); // share_access: READ|WRITE
+        self.w.u32(0); // share_deny: NONE
+        self.w.u64(clientid); // open_owner4.clientid
+        self.w.opaque(b"owner"); // open_owner4.owner
         self.w.u32(OPEN4_CREATE); // opentype
         self.w.u32(UNCHECKED4); // createmode
                                 // createattrs: mode
@@ -306,15 +308,17 @@ impl Client {
                     out.push(R::Written(count));
                 }
                 OP_OPEN => {
-                    // Consume: stateid, changeid, rflags, attrset, delegation type.
-                    let _ = r.opaque_fixed(16).unwrap();
-                    let _ = r.u64().unwrap();
-                    let _ = r.u32().unwrap();
-                    let n = r.u32().unwrap() as usize;
+                    // OPEN4resok: stateid4(16B) + change_info4(bool+u64+u64) + rflags(u32) + attrset(bitmap4) + delegation(u32)
+                    let _ = r.opaque_fixed(16).unwrap(); // stateid
+                    let _ = r.bool().unwrap(); // atomic
+                    let _ = r.u64().unwrap(); // before changeid
+                    let _ = r.u64().unwrap(); // after changeid
+                    let _ = r.u32().unwrap(); // rflags
+                    let n = r.u32().unwrap() as usize; // attrset bitmap word count
                     for _ in 0..n {
                         let _ = r.u32().unwrap();
                     }
-                    let _ = r.u32().unwrap();
+                    let _ = r.u32().unwrap(); // delegation type
                     out.push(R::Ok);
                 }
                 OP_CREATE => {

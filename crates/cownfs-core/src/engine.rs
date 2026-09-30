@@ -625,6 +625,14 @@ impl Fs {
         self.sb.block_count
     }
 
+    /// Number of free (unallocated) 4 KiB blocks. Scans the in-memory bitmap.
+    pub fn free_block_count(&self) -> u64 {
+        let sh = self.shared.borrow();
+        let total = self.sb.block_count;
+        let used: u64 = (0..total).filter(|&b| sh.bitmap.test(b)).count() as u64;
+        total.saturating_sub(used)
+    }
+
     pub fn generation(&self) -> u64 {
         self.sb.generation
     }

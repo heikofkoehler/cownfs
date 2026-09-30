@@ -60,14 +60,20 @@ impl Ops {
         self.n += 1;
     }
     fn open(&mut self, clientid: u64, owner: &[u8], flags: u32, name: &[u8]) {
+        // flags: bits[1:0]=share_access, bits[5:4]=share_deny (same convention
+        // as the test call sites use, e.g. 0x23 = access=BOTH(3)|deny=WRITE(2)<<4).
+        let share_access = flags & 0x3;
+        let share_deny = (flags >> 4) & 0x3;
         self.w.u32(OP_OPEN);
-        self.w.u64(clientid);
-        self.w.opaque(owner);
-        self.w.u32(flags);
-        self.w.u32(OPEN4_CREATE);
-        self.w.u32(UNCHECKED4);
-        AttrMask { words: vec![0, 0] }.encode(&mut self.w);
-        self.w.opaque(&[]);
+        self.w.u32(1); // seqid (RFC 7530 §16.16 — first field)
+        self.w.u32(share_access); // share_access
+        self.w.u32(share_deny); // share_deny
+        self.w.u64(clientid); // open_owner4.clientid
+        self.w.opaque(owner); // open_owner4.owner
+        self.w.u32(OPEN4_CREATE); // opentype (always CREATE to open-or-create)
+        self.w.u32(UNCHECKED4); // createmode
+        AttrMask { words: vec![0, 0] }.encode(&mut self.w); // empty createattrs
+        self.w.opaque(&[]); // empty attrlist
         self.w.u32(0); // CLAIM_NULL
         self.w.string(name);
         self.n += 1;
@@ -237,14 +243,16 @@ impl Client {
                     let sid = r.opaque_fixed(16).unwrap();
                     let mut b = [0u8; 16];
                     b.copy_from_slice(sid);
-                    // consume rest: changeid, rflags, attrset, deleg
-                    let _ = r.u64().unwrap();
-                    let _ = r.u32().unwrap();
-                    let n = r.u32().unwrap() as usize;
+                    // OPEN4resok: change_info4(bool+u64+u64) + rflags(u32) + attrset(bitmap4) + deleg(u32)
+                    let _ = r.bool().unwrap(); // atomic
+                    let _ = r.u64().unwrap(); // before changeid
+                    let _ = r.u64().unwrap(); // after changeid
+                    let _ = r.u32().unwrap(); // rflags
+                    let n = r.u32().unwrap() as usize; // attrset bitmap word count
                     for _ in 0..n {
                         let _ = r.u32().unwrap();
                     }
-                    let _ = r.u32().unwrap();
+                    let _ = r.u32().unwrap(); // delegation type
                     out.push(R::StateId(b));
                 }
                 OP_LOCK => {

@@ -156,16 +156,19 @@ impl<'f> Session<'f> {
             Op::Open {
                 clientid,
                 owner,
-                flags,
+                share_access,
+                share_deny,
                 opentype,
                 createmode,
                 createattrs,
                 claim_type,
                 filename,
+                ..
             } => self.op_open(
                 *clientid,
                 owner,
-                *flags,
+                *share_access,
+                *share_deny,
                 *opentype,
                 *createmode,
                 createattrs,
@@ -293,6 +296,45 @@ impl<'f> Session<'f> {
         }
     }
 
+    /// Build a `FileAttrs` for the given inode, including filesystem-level
+    /// space statistics needed by the REQUIRED/RECOMMENDED GETATTR attrs.
+    fn make_file_attrs(&self, ino: u64, inode: &cownfs_core::engine::Inode) -> FileAttrs {
+        let ftype = match inode.ftype {
+            FTYPE_DIR => NF4DIR,
+            FTYPE_SYMLINK => NF4LNK,
+            _ => NF4REG,
+        };
+        let total_blocks = self.fs.block_count();
+        let free_blocks = self.fs.free_block_count();
+        let block_size: u64 = 4096;
+        FileAttrs {
+            ftype,
+            size: inode.size,
+            fileid: ino,
+            mode: inode.mode,
+            nlink: inode.nlink,
+            fsid_major: u64::from_be_bytes(self.fs.uuid()[..8].try_into().unwrap()),
+            fsid_minor: u64::from_be_bytes(self.fs.uuid()[8..].try_into().unwrap()),
+            fh: FileHandle { fs_uuid: self.fs.uuid(), inode: ino }
+                .to_bytes()
+                .to_vec(),
+            uid: inode.uid,
+            gid: inode.gid,
+            atime: inode.atime,
+            mtime: inode.mtime,
+            ctime: inode.ctime,
+            // CHANGE: use ctime as a monotonically increasing change counter.
+            // ctime is updated on every metadata/data change, so it works as
+            // a per-object change indicator (RFC 7530 §5.8.1.4).
+            change: inode.ctime,
+            space_total: total_blocks * block_size,
+            space_free: free_blocks * block_size,
+            // Rough inode estimates: 1 inode per 16 KiB (4 blocks) used.
+            files_total: total_blocks / 4,
+            files_free: free_blocks / 4,
+        }
+    }
+
     fn op_getattr(&self, mask: &AttrMask) -> OpResult {
         let ino = match self.current() {
             Ok(i) => i,
@@ -302,34 +344,8 @@ impl<'f> Session<'f> {
             Ok(i) => i,
             Err(e) => return OpResult::err(OP_GETATTR, fs_to_nfs(e)),
         };
-        let ftype = match inode.ftype {
-            FTYPE_DIR => NF4DIR,
-            FTYPE_SYMLINK => NF4LNK,
-            _ => NF4REG,
-        };
-        let vals = AttrValues::encode(
-            mask,
-            &FileAttrs {
-                ftype,
-                size: inode.size,
-                fileid: ino,
-                mode: inode.mode,
-                nlink: inode.nlink,
-                fsid_major: u64::from_be_bytes(self.fs.uuid()[..8].try_into().unwrap()),
-                fsid_minor: u64::from_be_bytes(self.fs.uuid()[8..].try_into().unwrap()),
-                fh: FileHandle {
-                    fs_uuid: self.fs.uuid(),
-                    inode: ino,
-                }
-                .to_bytes()
-                .to_vec(),
-                uid: inode.uid,
-                gid: inode.gid,
-                atime: inode.atime,
-                mtime: inode.mtime,
-                ctime: inode.ctime,
-            },
-        );
+        let fa = self.make_file_attrs(ino, &inode);
+        let vals = AttrValues::encode(mask, &fa);
         let mut w = Writer::new();
         vals.encode_result(&mut w);
         OpResult::ok(OP_GETATTR, w.into_bytes())
@@ -352,39 +368,13 @@ impl<'f> Session<'f> {
         let mut bytes_used: u32 = 16; // cookieverf + eof flag estimate
         let max = maxcount.min(1024 * 1024);
         let mut emitted = 0usize;
-        for (idx, (name, child_ino, typ)) in entries.iter().enumerate().skip(start) {
-            let ftype = match *typ {
-                FTYPE_DIR => NF4DIR,
-                FTYPE_SYMLINK => NF4LNK,
-                _ => NF4REG,
-            };
+        for (idx, (name, child_ino, _typ)) in entries.iter().enumerate().skip(start) {
             let inode = match self.fs.getattr(*child_ino) {
                 Ok(i) => i,
                 Err(_) => continue,
             };
-            let vals = AttrValues::encode(
-                mask,
-                &FileAttrs {
-                    ftype,
-                    size: inode.size,
-                    fileid: *child_ino,
-                    mode: inode.mode,
-                    nlink: inode.nlink,
-                    fsid_major: u64::from_be_bytes(self.fs.uuid()[..8].try_into().unwrap()),
-                    fsid_minor: u64::from_be_bytes(self.fs.uuid()[8..].try_into().unwrap()),
-                    fh: FileHandle {
-                        fs_uuid: self.fs.uuid(),
-                        inode: *child_ino,
-                    }
-                    .to_bytes()
-                    .to_vec(),
-                    uid: inode.uid,
-                    gid: inode.gid,
-                    atime: inode.atime,
-                    mtime: inode.mtime,
-                    ctime: inode.ctime,
-                },
-            );
+            let fa = self.make_file_attrs(*child_ino, &inode);
+            let vals = AttrValues::encode(mask, &fa);
             // entry: cookie, name, attrs, next-entry flag
             let mut ew = Writer::new();
             ew.u64((idx + 1) as u64);
@@ -403,7 +393,6 @@ impl<'f> Session<'f> {
         w.bool(true); // eof (we always return everything after `start`)
         OpResult::ok(OP_READDIR, w.into_bytes())
     }
-
     fn op_read(&self, offset: u64, count: u32) -> OpResult {
         let ino = match self.current() {
             Ok(i) => i,
@@ -460,7 +449,8 @@ impl<'f> Session<'f> {
         &mut self,
         clientid: u64,
         owner: &[u8],
-        flags: u32,
+        share_access: u32,
+        share_deny: u32,
         opentype: u32,
         createmode: u32,
         createattrs: &[(u32, Vec<u8>)],
@@ -506,9 +496,6 @@ impl<'f> Session<'f> {
 
         self.cfh = Some(file_ino);
         // P6: create real open state with share reservation checking.
-        // flags: bits 0-1 = share_access, bits 4-5 = share_deny.
-        let share_access = flags & 0x3;
-        let share_deny = (flags >> 4) & 0x3;
         let open_rec =
             match self
                 .state
@@ -520,13 +507,15 @@ impl<'f> Session<'f> {
             };
         let mut w = Writer::new();
         open_rec.stateid.encode(&mut w);
-        // changeid
-        w.u64(0);
-        // rflags
+        // change_info4: atomic(bool) + before(u64) + after(u64)  [RFC 7530 §16.16]
+        w.bool(true); // atomic
+        w.u64(0); // before changeid
+        w.u64(0); // after changeid
+        // rflags (OPEN4_RESULT_* bits; 0 = nothing special)
         w.u32(0);
-        // attrset (no delegation attrs)
-        w.u32(0);
-        // delegation type: OPEN_DELEGATE_NONE
+        // attrset: bitmap4 of attributes set during create (empty)
+        AttrMask { words: vec![0, 0] }.encode(&mut w);
+        // delegation type: OPEN_DELEGATE_NONE = 0
         w.u32(0);
         OpResult::ok(OP_OPEN, w.into_bytes())
     }
