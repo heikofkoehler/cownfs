@@ -397,6 +397,29 @@ impl Ops {
         );
     }
 
+    /// OPEN+CREATE with EXCLUSIVE4 mode and an 8-byte verifier (RFC 7530 §16.16).
+    pub fn open_exclusive(
+        &mut self,
+        clientid: u64,
+        owner: &[u8],
+        flags: u32,
+        name: &[u8],
+        verifier: &[u8; 8],
+    ) {
+        self.w.u32(nfs4::OP_OPEN);
+        self.w.u32(1); // seqid
+        self.w.u32(flags & 0x3); // share_access
+        self.w.u32((flags >> 4) & 0x3); // share_deny
+        self.w.u64(clientid);
+        self.w.opaque(owner);
+        self.w.u32(nfs4::OPEN4_CREATE);
+        self.w.u32(nfs4::EXCLUSIVE4);
+        self.w.raw(verifier); // 8-byte verifier
+        self.w.u32(0); // CLAIM_NULL
+        self.w.string(name);
+        self.op();
+    }
+
     /// Encode an fattr4: bitmap words + values. Values MUST be written in
     /// ascending attribute-number order (RFC 7530 15.1.2), so the caller's
     /// pairs are sorted; callers may pass them in any order.
@@ -800,8 +823,14 @@ impl NfsClient {
                     let n = r.u32().expect("secinfo count") as usize;
                     let mut flavors = Vec::with_capacity(n);
                     for _ in 0..n {
-                        flavors.push(r.u32().expect("flavor"));
-                        let _ = r.opaque().expect("flavor_info");
+                        let flavor = r.u32().expect("flavor");
+                        // secinfo4 is a discriminated union (RFC 7530 §16.31.3):
+                        // only RPCSEC_GSS (6) carries flavor_info; AUTH_SYS (1)
+                        // and AUTH_NONE (0) take the void arm.
+                        if flavor == 6 {
+                            let _ = r.opaque().expect("gss flavor_info");
+                        }
+                        flavors.push(flavor);
                     }
                     Reply::Secinfo(flavors)
                 }

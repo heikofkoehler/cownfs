@@ -13,11 +13,11 @@ use crate::nfs4::{
     StateId, ACCESS4_DELETE, ACCESS4_EXECUTE, ACCESS4_EXTEND, ACCESS4_LOOKUP, ACCESS4_MODIFY,
     ACCESS4_READ, FATTR4_MODE, FATTR4_SIZE, FILE_SYNC4, GUARDED4, NF4DIR, NF4LNK, NF4REG,
     NFS4ERR_EXIST, NFS4ERR_EXPIRED, NFS4ERR_INVAL, NFS4ERR_ISDIR, NFS4ERR_NOENT, NFS4ERR_NOTDIR,
-    NFS4ERR_NOTSUPP, NFS4ERR_SERVERFAULT, NFS4ERR_STALE_CLIENTID, NFS4_OK, OPEN4_CREATE, OP_ACCESS,
-    OP_CLOSE, OP_COMMIT, OP_CREATE, OP_GETATTR, OP_GETFH, OP_LINK, OP_LOCK, OP_LOCKU, OP_LOOKUP,
-    OP_LOOKUPP, OP_OPEN, OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_REMOVE, OP_RENAME,
-    OP_RENEW, OP_RESTOREFH, OP_SAVEFH, OP_SECINFO, OP_SETATTR, OP_SETCLIENTID,
-    OP_SETCLIENTID_CONFIRM, OP_WRITE, UNCHECKED4,
+    NFS4ERR_NOTSUPP, NFS4ERR_OP_ILLEGAL, NFS4ERR_SERVERFAULT, NFS4ERR_STALE_CLIENTID, NFS4_OK,
+    OPEN4_CREATE, OP_ACCESS, OP_CLOSE, OP_COMMIT, OP_CREATE, OP_GETATTR, OP_GETFH, OP_ILLEGAL,
+    OP_LINK, OP_LOCK, OP_LOCKU, OP_LOOKUP, OP_LOOKUPP, OP_OPEN, OP_PUTFH, OP_PUTROOTFH, OP_READ,
+    OP_READDIR, OP_REMOVE, OP_RENAME, OP_RENEW, OP_RESTOREFH, OP_SAVEFH, OP_SECINFO, OP_SETATTR,
+    OP_SETCLIENTID, OP_SETCLIENTID_CONFIRM, OP_WRITE, UNCHECKED4,
 };
 use crate::rpc::{self, Call, RecordReader, RpcError};
 use crate::state::StateManager;
@@ -136,6 +136,16 @@ impl Session {
         self.shared.fs.lock().unwrap()
     }
 
+    /// Validate a filename: must be valid UTF-8 (pynfs expects NFS4ERR_INVAL
+    /// for invalid UTF-8 in LOOKUP, OPEN, REMOVE, RENAME, LINK, SECINFO).
+    /// The engine's DirKey already rejects empty/overslong/slashed names.
+    fn check_name(name: &[u8], opnum: u32) -> Result<(), OpResult> {
+        if std::str::from_utf8(name).is_err() {
+            return Err(OpResult::err(opnum, NFS4ERR_INVAL));
+        }
+        Ok(())
+    }
+
     /// Lock the NFSv4 client/open/lock table.
     fn state(&self) -> std::sync::MutexGuard<'_, StateManager> {
         self.shared.state.lock().unwrap()
@@ -228,6 +238,7 @@ impl Session {
             } => self.op_create(*ftype, linkdata, name, attrs),
             Op::Remove(name) => self.op_remove(name),
             Op::Secinfo(name) => self.op_secinfo(name),
+            Op::Illegal => OpResult::err(OP_ILLEGAL, NFS4ERR_OP_ILLEGAL),
             Op::Rename { old, new } => self.op_rename(old, new),
             Op::Link(name) => self.op_link(name),
             Op::SaveFh => {
@@ -296,6 +307,9 @@ impl Session {
     }
 
     fn op_lookup(&mut self, name: &[u8], opnum: u32) -> OpResult {
+        if let Err(e) = Self::check_name(name, opnum) {
+            return e;
+        }
         let ino = match self.cfh {
             Some(i) => i,
             None => return OpResult::err(opnum, NFS4ERR_INVAL),
@@ -518,6 +532,9 @@ impl Session {
         if claim_type != 0 {
             return OpResult::err(OP_OPEN, NFS4ERR_NOTSUPP);
         }
+        if let Err(e) = Self::check_name(filename, OP_OPEN) {
+            return e;
+        }
         let dir_ino = match self.cfh {
             Some(i) => i,
             None => return OpResult::err(OP_OPEN, NFS4ERR_INVAL),
@@ -586,6 +603,9 @@ impl Session {
         name: &[u8],
         attrs: &[(u32, Vec<u8>)],
     ) -> OpResult {
+        if let Err(e) = Self::check_name(name, OP_CREATE) {
+            return e;
+        }
         let dir_ino = match self.cfh {
             Some(i) => i,
             None => return OpResult::err(OP_CREATE, NFS4ERR_INVAL),
@@ -597,6 +617,7 @@ impl Session {
                 .fs()
                 .symlink(dir_ino, name, linkdata, uid, gid)
                 .map(|_| ()),
+            NF4REG => self.fs().create(dir_ino, name, mode, uid, gid).map(|_| ()),
             _ => return OpResult::err(OP_CREATE, NFS4ERR_NOTSUPP),
         };
         match result {
@@ -615,6 +636,9 @@ impl Session {
     }
 
     fn op_remove(&mut self, name: &[u8]) -> OpResult {
+        if let Err(e) = Self::check_name(name, OP_REMOVE) {
+            return e;
+        }
         let dir_ino = match self.cfh {
             Some(i) => i,
             None => return OpResult::err(OP_REMOVE, NFS4ERR_INVAL),
@@ -643,20 +667,31 @@ impl Session {
         }
     }
 
-    fn op_secinfo(&mut self, _name: &[u8]) -> OpResult {
+    fn op_secinfo(&mut self, name: &[u8]) -> OpResult {
         // RFC 7530 §16.33: return the security flavors available for `name`.
-        // We only speak AUTH_SYS, so advertise a single secinfo4 entry with
-        // an empty flavor_info. Deliberately do not require the name to exist:
-        // macOS sends SECINFO in the create path, and a NOENT here makes it
-        // abort the operation instead of proceeding to OPEN(CREATE).
+        // secinfo4 is a discriminated union: for AUTH_SYS (and AUTH_NONE) the
+        // arm is `void` — no flavor_info follows (RFC 7530 §16.31.3). We only
+        // speak AUTH_SYS, so advertise a single secinfo4 entry. Deliberately
+        // do not require the name to exist: macOS sends SECINFO in the create
+        // path, and a NOENT here makes it abort the operation instead of
+        // proceeding to OPEN(CREATE). (pynfs st_secinfo expects NOENT for
+        // missing names; we side with macOS interop — documented deviation.)
+        if let Err(e) = Self::check_name(name, OP_SECINFO) {
+            return e;
+        }
         let mut w = Writer::new();
         w.u32(1); // one secinfo4 entry
-        w.u32(1); // rpcsec_flavor = AUTH_SYS
-        w.u32(0); // empty flavor_info<>
+        w.u32(1); // rpcsec_flavor = AUTH_SYS (default arm: void)
         OpResult::ok(OP_SECINFO, w.into_bytes())
     }
 
     fn op_rename(&mut self, old: &[u8], new: &[u8]) -> OpResult {
+        if let Err(e) = Self::check_name(old, OP_RENAME) {
+            return e;
+        }
+        if let Err(e) = Self::check_name(new, OP_RENAME) {
+            return e;
+        }
         // cfh = source dir, saved_fh = dest dir (via SAVEFH).
         let src_dir = match self.cfh {
             Some(i) => i,
@@ -677,6 +712,9 @@ impl Session {
     }
 
     fn op_link(&mut self, name: &[u8]) -> OpResult {
+        if let Err(e) = Self::check_name(name, OP_LINK) {
+            return e;
+        }
         // cfh = existing file, saved_fh = dest dir.
         let file_ino = match self.cfh {
             Some(i) => i,
@@ -1006,6 +1044,7 @@ fn op_name(op: u32) -> &'static str {
         OP_READDIR => "READDIR",
         OP_REMOVE => "REMOVE",
         OP_SECINFO => "SECINFO",
+        OP_ILLEGAL => "ILLEGAL",
         OP_RENAME => "RENAME",
         OP_RENEW => "RENEW",
         OP_RESTOREFH => "RESTOREFH",

@@ -299,11 +299,18 @@ fn create_errors() {
     let srv = spawn_server(4096);
     let mut c = NfsClient::connect(&srv.addr);
 
-    // Regular files are created via OPEN, not CREATE.
+    // CREATE supports regular files (RFC 7530 §15.3), not just dirs/symlinks.
     let mut ops = Ops::new();
     ops.putfh(&srv.uuid, ROOT_INO);
     ops.create_raw(NF4REG, None, b"f");
-    let (overall, res) = c.call(b"create-reg", ops);
+    let res = c.check_ok(b"create-reg", ops);
+    assert!(matches!(res[1], Reply::Ok));
+
+    // Unsupported ftype (e.g. socket) -> NOTSUPP.
+    let mut ops = Ops::new();
+    ops.putfh(&srv.uuid, ROOT_INO);
+    ops.create_raw(7, None, b"g"); // 7 = NF4SOCK, not supported
+    let (overall, res) = c.call(b"create-badftype", ops);
     assert_eq!(overall, NFS4ERR_NOTSUPP);
     assert!(matches!(res[1], Reply::Err(NFS4ERR_NOTSUPP)));
 

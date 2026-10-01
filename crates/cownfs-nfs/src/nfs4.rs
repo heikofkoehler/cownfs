@@ -24,6 +24,7 @@ pub const NFS4ERR_LOCKED: u32 = 10012;
 pub const NFS4ERR_DENIED: u32 = 10010;
 pub const NFS4ERR_BAD_SEQID: u32 = 10027;
 pub const NFS4ERR_STALE_CLIENTID: u32 = 10022;
+pub const NFS4ERR_OP_ILLEGAL: u32 = 10044;
 
 // Operation numbers.
 pub const OP_ACCESS: u32 = 3;
@@ -52,6 +53,7 @@ pub const OP_LOCKU: u32 = 14;
 pub const OP_RENEW: u32 = 30;
 pub const OP_SETCLIENTID: u32 = 35;
 pub const OP_SETCLIENTID_CONFIRM: u32 = 36;
+pub const OP_ILLEGAL: u32 = 10044;
 
 // Attribute numbers (RFC 7530 §5).
 // --- REQUIRED (MUST be returned when requested) ---
@@ -256,6 +258,7 @@ pub enum Op {
     },
     Remove(Vec<u8>),
     Secinfo(Vec<u8>),
+    Illegal,
     Rename {
         old: Vec<u8>,
         new: Vec<u8>,
@@ -685,6 +688,7 @@ impl Op {
                 let clientid = r.u64()?;
                 Op::Renew { clientid }
             }
+            OP_ILLEGAL => Op::Illegal,
             n => return Err(NfsError::BadOp(n)),
         };
         Ok(op)
@@ -705,6 +709,7 @@ impl Op {
             Op::Create { .. } => OP_CREATE,
             Op::Remove(_) => OP_REMOVE,
             Op::Secinfo(_) => OP_SECINFO,
+            Op::Illegal => OP_ILLEGAL,
             Op::Rename { .. } => OP_RENAME,
             Op::Link(_) => OP_LINK,
             Op::SaveFh => OP_SAVEFH,
