@@ -16,8 +16,8 @@ use crate::nfs4::{
     NFS4ERR_NOTSUPP, NFS4ERR_SERVERFAULT, NFS4ERR_STALE_CLIENTID, NFS4_OK, OPEN4_CREATE, OP_ACCESS,
     OP_CLOSE, OP_COMMIT, OP_CREATE, OP_GETATTR, OP_GETFH, OP_LINK, OP_LOCK, OP_LOCKU, OP_LOOKUP,
     OP_LOOKUPP, OP_OPEN, OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_REMOVE, OP_RENAME,
-    OP_RENEW, OP_RESTOREFH, OP_SAVEFH, OP_SETATTR, OP_SETCLIENTID, OP_SETCLIENTID_CONFIRM,
-    OP_WRITE, UNCHECKED4,
+    OP_RENEW, OP_RESTOREFH, OP_SAVEFH, OP_SECINFO, OP_SETATTR, OP_SETCLIENTID,
+    OP_SETCLIENTID_CONFIRM, OP_WRITE, UNCHECKED4,
 };
 use crate::rpc::{self, Call, RecordReader, RpcError};
 use crate::state::StateManager;
@@ -227,6 +227,7 @@ impl Session {
                 attrs,
             } => self.op_create(*ftype, linkdata, name, attrs),
             Op::Remove(name) => self.op_remove(name),
+            Op::Secinfo(name) => self.op_secinfo(name),
             Op::Rename { old, new } => self.op_rename(old, new),
             Op::Link(name) => self.op_link(name),
             Op::SaveFh => {
@@ -642,6 +643,19 @@ impl Session {
         }
     }
 
+    fn op_secinfo(&mut self, _name: &[u8]) -> OpResult {
+        // RFC 7530 §16.33: return the security flavors available for `name`.
+        // We only speak AUTH_SYS, so advertise a single secinfo4 entry with
+        // an empty flavor_info. Deliberately do not require the name to exist:
+        // macOS sends SECINFO in the create path, and a NOENT here makes it
+        // abort the operation instead of proceeding to OPEN(CREATE).
+        let mut w = Writer::new();
+        w.u32(1); // one secinfo4 entry
+        w.u32(1); // rpcsec_flavor = AUTH_SYS
+        w.u32(0); // empty flavor_info<>
+        OpResult::ok(OP_SECINFO, w.into_bytes())
+    }
+
     fn op_rename(&mut self, old: &[u8], new: &[u8]) -> OpResult {
         // cfh = source dir, saved_fh = dest dir (via SAVEFH).
         let src_dir = match self.cfh {
@@ -991,6 +1005,7 @@ fn op_name(op: u32) -> &'static str {
         OP_READ => "READ",
         OP_READDIR => "READDIR",
         OP_REMOVE => "REMOVE",
+        OP_SECINFO => "SECINFO",
         OP_RENAME => "RENAME",
         OP_RENEW => "RENEW",
         OP_RESTOREFH => "RESTOREFH",

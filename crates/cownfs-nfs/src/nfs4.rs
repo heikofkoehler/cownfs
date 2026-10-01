@@ -42,6 +42,7 @@ pub const OP_RENAME: u32 = 29;
 pub const OP_LINK: u32 = 11;
 pub const OP_RESTOREFH: u32 = 31;
 pub const OP_SAVEFH: u32 = 32;
+pub const OP_SECINFO: u32 = 33;
 pub const OP_SETATTR: u32 = 34;
 pub const OP_WRITE: u32 = 38;
 pub const OP_OPEN: u32 = 18;
@@ -254,6 +255,7 @@ pub enum Op {
         attrs: Vec<(u32, Vec<u8>)>,
     },
     Remove(Vec<u8>),
+    Secinfo(Vec<u8>),
     Rename {
         old: Vec<u8>,
         new: Vec<u8>,
@@ -553,6 +555,7 @@ impl Op {
                 }
             }
             OP_REMOVE => Op::Remove(r.string()?.to_vec()),
+            OP_SECINFO => Op::Secinfo(r.string()?.to_vec()),
             OP_RENAME => {
                 let old = r.string()?.to_vec();
                 let new = r.string()?.to_vec();
@@ -701,6 +704,7 @@ impl Op {
             Op::Open { .. } => OP_OPEN,
             Op::Create { .. } => OP_CREATE,
             Op::Remove(_) => OP_REMOVE,
+            Op::Secinfo(_) => OP_SECINFO,
             Op::Rename { .. } => OP_RENAME,
             Op::Link(_) => OP_LINK,
             Op::SaveFh => OP_SAVEFH,

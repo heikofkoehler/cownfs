@@ -136,6 +136,7 @@ pub enum Reply {
         supported: u32,
         granted: u32,
     },
+    Secinfo(Vec<u32>),
 }
 
 impl Reply {
@@ -442,6 +443,12 @@ impl Ops {
 
     pub fn remove(&mut self, name: &[u8]) {
         self.w.u32(nfs4::OP_REMOVE);
+        self.w.string(name);
+        self.op();
+    }
+
+    pub fn secinfo(&mut self, name: &[u8]) {
+        self.w.u32(nfs4::OP_SECINFO);
         self.w.string(name);
         self.op();
     }
@@ -788,6 +795,15 @@ impl NfsClient {
                         let _ = r.u32().expect("attrset word");
                     }
                     Reply::Ok
+                }
+                nfs4::OP_SECINFO => {
+                    let n = r.u32().expect("secinfo count") as usize;
+                    let mut flavors = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        flavors.push(r.u32().expect("flavor"));
+                        let _ = r.opaque().expect("flavor_info");
+                    }
+                    Reply::Secinfo(flavors)
                 }
                 _ => Reply::Ok,
             });
