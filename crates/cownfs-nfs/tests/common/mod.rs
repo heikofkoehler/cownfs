@@ -834,6 +834,29 @@ impl NfsClient {
                     }
                     Reply::Secinfo(flavors)
                 }
+                // RENAME4resok: two change_info4 (bool + u64 + u64 each).
+                nfs4::OP_RENAME => {
+                    for _ in 0..2 {
+                        let _ = r.bool().expect("rename atomic");
+                        let _ = r.u64().expect("rename before");
+                        let _ = r.u64().expect("rename after");
+                    }
+                    Reply::Ok
+                }
+                // REMOVE4resok: one change_info4.
+                nfs4::OP_REMOVE => {
+                    let _ = r.bool().expect("remove atomic");
+                    let _ = r.u64().expect("remove before");
+                    let _ = r.u64().expect("remove after");
+                    Reply::Ok
+                }
+                // LINK4resok: one change_info4.
+                nfs4::OP_LINK => {
+                    let _ = r.bool().expect("link atomic");
+                    let _ = r.u64().expect("link before");
+                    let _ = r.u64().expect("link after");
+                    Reply::Ok
+                }
                 _ => Reply::Ok,
             });
         }

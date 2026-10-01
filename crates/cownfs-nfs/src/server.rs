@@ -701,8 +701,11 @@ impl Session {
         match self.fs().rename(src_dir, old, dst_dir, new) {
             Ok(()) => {
                 let mut w = Writer::new();
+                // change_info4 x2: bool(atomic) + u64(before) + u64(after) [RFC 7530 §16.15]
+                w.bool(true);
                 w.u64(0);
                 w.u64(0);
+                w.bool(true);
                 w.u64(0);
                 w.u64(0);
                 OpResult::ok(OP_RENAME, w.into_bytes())
@@ -727,6 +730,8 @@ impl Session {
         match self.fs().link(file_ino, dir_ino, name) {
             Ok(()) => {
                 let mut w = Writer::new();
+                // change_info4: bool(atomic) + u64(before) + u64(after) [RFC 7530 §16.11]
+                w.bool(true);
                 w.u64(0);
                 w.u64(0);
                 OpResult::ok(OP_LINK, w.into_bytes())

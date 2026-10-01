@@ -332,12 +332,15 @@ impl Client {
                     out.push(R::Ok);
                 }
                 OP_REMOVE | OP_LINK => {
+                    let _ = r.bool().unwrap(); // atomic
                     let _ = r.u64().unwrap();
                     let _ = r.u64().unwrap();
                     out.push(R::Ok);
                 }
                 OP_RENAME => {
-                    for _ in 0..4 {
+                    for _ in 0..2 {
+                        let _ = r.bool().unwrap(); // atomic
+                        let _ = r.u64().unwrap();
                         let _ = r.u64().unwrap();
                     }
                     out.push(R::Ok);
