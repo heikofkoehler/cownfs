@@ -177,6 +177,7 @@ pub enum Reply {
         stateid: [u8; 16],
     },
     ClientId(u64),
+    Session([u8; 16]),
     Access {
         supported: u32,
         granted: u32,
@@ -518,6 +519,60 @@ impl Ops {
     pub fn secinfo(&mut self, name: &[u8]) {
         self.w.u32(nfs4::OP_SECINFO);
         self.w.string(name);
+        self.op();
+    }
+
+    /// NFSv4.1 EXCHANGE_ID (simplified: no state_protect arms).
+    pub fn exchange_id(&mut self, verifier: &[u8; 8], owner: &[u8]) {
+        self.w.u32(nfs4::OP_EXCHANGE_ID);
+        self.w.opaque_fixed(verifier);
+        self.w.opaque(owner);
+        self.w.u32(0); // flags
+        self.w.u32(0); // state_protect: SP4_NONE
+        self.op();
+    }
+
+    /// NFSv4.1 CREATE_SESSION (simplified channel attrs).
+    pub fn create_session(&mut self, clientid: u64, sequence: u32, max_slots: u32) {
+        self.w.u32(nfs4::OP_CREATE_SESSION);
+        self.w.u64(clientid);
+        self.w.u32(sequence);
+        self.w.u32(0); // flags
+                       // fore_chan_attrs
+        self.w.u32(0); // headerpadsize
+        self.w.u32(1024 * 1024); // maxreq_sz
+        self.w.u32(1024 * 1024); // maxresp_sz
+        self.w.u32(64 * 1024); // maxresp_cached
+        self.w.u32(16); // maxops
+        self.w.u32(max_slots); // maxreqs
+                               // back_chan_attrs (same shape, ignored)
+        for _ in 0..6 {
+            self.w.u32(0);
+        }
+        self.w.u32(0); // cb_program
+        self.op();
+    }
+
+    /// NFSv4.1 SEQUENCE. Must be the first op in the compound.
+    pub fn sequence(
+        &mut self,
+        sessionid: &[u8; 16],
+        sequenceid: u32,
+        slotid: u32,
+        cachethis: bool,
+    ) {
+        self.w.u32(nfs4::OP_SEQUENCE);
+        self.w.opaque_fixed(sessionid);
+        self.w.u32(sequenceid);
+        self.w.u32(slotid);
+        self.w.u32(0); // highest_slotid
+        self.w.u32(cachethis as u32);
+        self.op();
+    }
+
+    pub fn destroy_session(&mut self, sessionid: &[u8; 16]) {
+        self.w.u32(nfs4::OP_DESTROY_SESSION);
+        self.w.opaque_fixed(sessionid);
         self.op();
     }
 
@@ -874,6 +929,23 @@ impl NfsClient {
                     let _ = r.opaque_fixed(8).expect("verifier");
                     Reply::ClientId(clientid)
                 }
+                nfs4::OP_EXCHANGE_ID => {
+                    let clientid = r.u64().expect("clientid");
+                    // Skip sequenceid, flags, server_owner, server_scope.
+                    let _ = r.u32().expect("seq");
+                    let _ = r.u32().expect("flags");
+                    let _ = r.opaque_fixed(8).expect("server verifier");
+                    let _ = r.opaque().expect("server owner");
+                    let _ = r.opaque().expect("server scope");
+                    Reply::ClientId(clientid)
+                }
+                nfs4::OP_CREATE_SESSION => {
+                    let sid = r.opaque_fixed(16).expect("sessionid");
+                    let mut sessionid = [0u8; 16];
+                    sessionid.copy_from_slice(sid);
+                    Reply::Session(sessionid)
+                }
+                nfs4::OP_SEQUENCE => Reply::Ok,
                 nfs4::OP_CREATE => {
                     // change_info4: atomic + before + after + attrset.
                     let _ = r.bool().expect("atomic");

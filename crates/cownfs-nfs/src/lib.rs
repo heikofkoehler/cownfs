@@ -6,5 +6,6 @@
 pub mod nfs4;
 pub mod rpc;
 pub mod server;
+pub mod sessions;
 pub mod state;
 pub mod xdr;

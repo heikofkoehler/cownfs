@@ -12,13 +12,15 @@ use crate::nfs4::{
     encode_compound, AttrMask, AttrValues, Compound, FileAttrs, FileHandle, NfsError, Op, OpResult,
     StateId, ACCESS4_DELETE, ACCESS4_EXECUTE, ACCESS4_EXTEND, ACCESS4_LOOKUP, ACCESS4_MODIFY,
     ACCESS4_READ, FATTR4_MODE, FATTR4_SIZE, FILE_SYNC4, GUARDED4, NF4DIR, NF4LNK, NF4REG,
-    NFS4ERR_BADNAME, NFS4ERR_BADTYPE, NFS4ERR_BADXDR, NFS4ERR_BAD_COOKIE, NFS4ERR_EXIST,
-    NFS4ERR_EXPIRED, NFS4ERR_INVAL, NFS4ERR_ISDIR, NFS4ERR_NAMETOOLONG, NFS4ERR_NOENT,
-    NFS4ERR_NOFILEHANDLE, NFS4ERR_NOTDIR, NFS4ERR_NOTSUPP, NFS4ERR_OP_ILLEGAL, NFS4ERR_ROFS,
-    NFS4ERR_SERVERFAULT, NFS4ERR_STALE_CLIENTID, NFS4ERR_TOOSMALL, NFS4_OK, OPEN4_CREATE,
-    OP_ACCESS, OP_CLOSE, OP_COMMIT, OP_CREATE, OP_GETATTR, OP_GETFH, OP_ILLEGAL, OP_LINK, OP_LOCK,
-    OP_LOCKU, OP_LOOKUP, OP_LOOKUPP, OP_OPEN, OP_OPEN_DOWNGRADE, OP_PUTFH, OP_PUTROOTFH, OP_READ,
-    OP_READDIR, OP_REMOVE, OP_RENAME, OP_RENEW, OP_RESTOREFH, OP_SAVEFH, OP_SECINFO, OP_SETATTR,
+    NFS4ERR_BADNAME, NFS4ERR_BADSESSION, NFS4ERR_BADSLOT, NFS4ERR_BADTYPE, NFS4ERR_BADXDR,
+    NFS4ERR_BAD_COOKIE, NFS4ERR_EXIST, NFS4ERR_EXPIRED, NFS4ERR_INVAL, NFS4ERR_ISDIR,
+    NFS4ERR_NAMETOOLONG, NFS4ERR_NOENT, NFS4ERR_NOFILEHANDLE, NFS4ERR_NOTDIR, NFS4ERR_NOTSUPP,
+    NFS4ERR_OP_ILLEGAL, NFS4ERR_ROFS, NFS4ERR_SEQ_MISORDERED, NFS4ERR_SERVERFAULT,
+    NFS4ERR_STALE_CLIENTID, NFS4ERR_TOOSMALL, NFS4_OK, OPEN4_CREATE, OP_ACCESS, OP_CLOSE,
+    OP_COMMIT, OP_CREATE, OP_CREATE_SESSION, OP_DESTROY_CLIENTID, OP_DESTROY_SESSION,
+    OP_EXCHANGE_ID, OP_GETATTR, OP_GETFH, OP_ILLEGAL, OP_LINK, OP_LOCK, OP_LOCKU, OP_LOOKUP,
+    OP_LOOKUPP, OP_OPEN, OP_OPEN_DOWNGRADE, OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_REMOVE,
+    OP_RENAME, OP_RENEW, OP_RESTOREFH, OP_SAVEFH, OP_SECINFO, OP_SEQUENCE, OP_SETATTR,
     OP_SETCLIENTID, OP_SETCLIENTID_CONFIRM, OP_WRITE, UNCHECKED4,
 };
 use crate::rpc::{self, Call, RecordReader, RpcError};
@@ -97,6 +99,8 @@ fn fs_to_nfs(e: FsError) -> u32 {
 pub struct Shared {
     pub fs: Arc<Mutex<Fs>>,
     pub state: Arc<Mutex<StateManager>>,
+    /// NFSv4.1 client/session/slot table (exactly-once semantics).
+    pub sessions: Arc<Mutex<crate::sessions::SessionTable>>,
     /// When true, mutating ops return NFS4ERR_ROFS. Used for read replicas.
     pub read_only: bool,
 }
@@ -106,6 +110,7 @@ impl Shared {
         Shared {
             fs: Arc::new(Mutex::new(fs)),
             state: Arc::new(Mutex::new(StateManager::new())),
+            sessions: Arc::new(Mutex::new(crate::sessions::SessionTable::new())),
             read_only: false,
         }
     }
@@ -114,6 +119,7 @@ impl Shared {
         Shared {
             fs: Arc::new(Mutex::new(fs)),
             state: Arc::new(Mutex::new(StateManager::new())),
+            sessions: Arc::new(Mutex::new(crate::sessions::SessionTable::new())),
             read_only: true,
         }
     }
@@ -189,6 +195,17 @@ impl Session {
     }
 
     fn run(&mut self, compound: &Compound) -> Vec<OpResult> {
+        // NFSv4.1: if the first op is SEQUENCE, run with exactly-once
+        // semantics (replay detection via the session slot table).
+        if let Some(Op::Sequence {
+            sessionid,
+            sequenceid,
+            slotid,
+            cachethis,
+        }) = compound.ops.first()
+        {
+            return self.run_sessioned(compound, *sessionid, *sequenceid, *slotid, *cachethis);
+        }
         let mut out = Vec::new();
         for op in &compound.ops {
             let res = self.exec(op);
@@ -196,6 +213,82 @@ impl Session {
             out.push(res);
             if failed {
                 break;
+            }
+        }
+        out
+    }
+
+    /// Execute a compound whose first op is SEQUENCE, with replay protection.
+    fn run_sessioned(
+        &mut self,
+        compound: &Compound,
+        sessionid: [u8; 16],
+        sequenceid: u32,
+        slotid: u32,
+        cachethis: bool,
+    ) -> Vec<OpResult> {
+        // Validate session and slot, check sequence.
+        let replay: Option<Vec<OpResult>> = {
+            let mut table = self.shared.sessions.lock().unwrap();
+            let sess = match table.get_session_mut(&sessionid) {
+                Some(s) => s,
+                None => return vec![OpResult::err(OP_SEQUENCE, NFS4ERR_BADSESSION)],
+            };
+            if slotid > sess.highest_slot {
+                return vec![OpResult::err(OP_SEQUENCE, NFS4ERR_BADSLOT)];
+            }
+            let slot = &mut sess.slots[slotid as usize];
+            if sequenceid == slot.sequence {
+                // Replay: return the cached reply.
+                match &slot.cached {
+                    Some(c) => Some(c.clone()),
+                    None => {
+                        // Not cached (cachethis was false): the client must
+                        // retry as a new request; signal misordered.
+                        return vec![OpResult::err(OP_SEQUENCE, NFS4ERR_SEQ_MISORDERED)];
+                    }
+                }
+            } else if sequenceid != slot.sequence.wrapping_add(1) {
+                return vec![OpResult::err(OP_SEQUENCE, NFS4ERR_SEQ_MISORDERED)];
+            } else {
+                None
+            }
+        };
+        if let Some(cached) = replay {
+            return cached;
+        }
+
+        // New request: SEQUENCE result first, then the rest of the compound.
+        let seq_res = {
+            let table = self.shared.sessions.lock().unwrap();
+            let sess = table.get_session(&sessionid).unwrap();
+            let mut w = Writer::new();
+            w.opaque_fixed(&sessionid);
+            w.u32(sequenceid);
+            w.u32(slotid);
+            w.u32(sess.highest_slot);
+            w.u32(sess.highest_slot); // target_highest_slotid
+            w.u32(0); // status_flags
+            OpResult::ok(OP_SEQUENCE, w.into_bytes())
+        };
+        let mut out = vec![seq_res];
+        for op in &compound.ops[1..] {
+            let res = self.exec(op);
+            let failed = res.status != NFS4_OK;
+            out.push(res);
+            if failed {
+                break;
+            }
+        }
+
+        // Advance the slot and cache the reply.
+        {
+            let mut table = self.shared.sessions.lock().unwrap();
+            if let Some(sess) = table.get_session_mut(&sessionid) {
+                if let Some(slot) = sess.slots.get_mut(slotid as usize) {
+                    slot.sequence = sequenceid;
+                    slot.cached = if cachethis { Some(out.clone()) } else { None };
+                }
             }
         }
         out
@@ -372,6 +465,95 @@ impl Session {
                 length,
             } => self.op_locku(*locktype, *seqid, stateid, *offset, *length),
             Op::Renew { clientid } => self.op_renew(*clientid),
+            Op::ExchangeId {
+                verifier,
+                owner,
+                flags,
+            } => self.op_exchange_id(*verifier, owner, *flags),
+            Op::CreateSession {
+                clientid,
+                sequence,
+                max_slots,
+            } => self.op_create_session(*clientid, *sequence, *max_slots),
+            Op::DestroySession { sessionid } => self.op_destroy_session(*sessionid),
+            Op::Sequence { .. } => {
+                // SEQUENCE is handled in run(); reaching exec means it was
+                // not the first op, which is a protocol violation.
+                OpResult::err(OP_SEQUENCE, NFS4ERR_BADSESSION)
+            }
+            Op::DestroyClientid { clientid } => self.op_destroy_clientid(*clientid),
+        }
+    }
+
+    fn op_exchange_id(&mut self, verifier: [u8; 8], owner: &[u8], _flags: u32) -> OpResult {
+        let (clientid, seq) = self
+            .shared
+            .sessions
+            .lock()
+            .unwrap()
+            .exchange_id(verifier, owner.to_vec());
+        let mut w = Writer::new();
+        w.u64(clientid);
+        w.u32(seq); // sequenceid for CREATE_SESSION
+        w.u32(0); // flags
+                  // server_owner: verifier + owner
+        w.opaque_fixed(&[0u8; 8]); // server verifier (zero)
+        w.string(b"cownfs");
+        // server_scope
+        w.string(b"cownfs");
+        OpResult::ok(OP_EXCHANGE_ID, w.into_bytes())
+    }
+
+    fn op_create_session(&mut self, clientid: u64, sequence: u32, max_slots: u32) -> OpResult {
+        let sid = match self
+            .shared
+            .sessions
+            .lock()
+            .unwrap()
+            .create_session(clientid, sequence, max_slots)
+        {
+            Some(id) => id,
+            None => return OpResult::err(OP_CREATE_SESSION, NFS4ERR_STALE_CLIENTID),
+        };
+        let mut w = Writer::new();
+        w.opaque_fixed(&sid);
+        w.u32(sequence);
+        w.u32(0); // flags
+                  // fore_chan_attrs (simplified)
+        w.u32(0); // headerpadsize
+        w.u32(1024 * 1024); // maxreq_sz
+        w.u32(1024 * 1024); // maxresp_sz
+        w.u32(64 * 1024); // maxresp_cached
+        w.u32(16); // maxops
+        w.u32(max_slots); // maxreqs
+        OpResult::ok(OP_CREATE_SESSION, w.into_bytes())
+    }
+
+    fn op_destroy_session(&mut self, sessionid: [u8; 16]) -> OpResult {
+        let ok = self
+            .shared
+            .sessions
+            .lock()
+            .unwrap()
+            .destroy_session(&sessionid);
+        if ok {
+            OpResult::ok(OP_DESTROY_SESSION, Vec::new())
+        } else {
+            OpResult::err(OP_DESTROY_SESSION, NFS4ERR_BADSESSION)
+        }
+    }
+
+    fn op_destroy_clientid(&mut self, clientid: u64) -> OpResult {
+        let ok = self
+            .shared
+            .sessions
+            .lock()
+            .unwrap()
+            .destroy_client(clientid);
+        if ok {
+            OpResult::ok(OP_DESTROY_CLIENTID, Vec::new())
+        } else {
+            OpResult::err(OP_DESTROY_CLIENTID, NFS4ERR_STALE_CLIENTID)
         }
     }
 
@@ -1196,6 +1378,11 @@ fn op_name(op: u32) -> &'static str {
         OP_SETATTR => "SETATTR",
         OP_SETCLIENTID => "SETCLIENTID",
         OP_SETCLIENTID_CONFIRM => "SETCLIENTID_CONFIRM",
+        OP_EXCHANGE_ID => "EXCHANGE_ID",
+        OP_CREATE_SESSION => "CREATE_SESSION",
+        OP_DESTROY_SESSION => "DESTROY_SESSION",
+        OP_SEQUENCE => "SEQUENCE",
+        OP_DESTROY_CLIENTID => "DESTROY_CLIENTID",
         OP_WRITE => "WRITE",
         _ => "UNKNOWN",
     }

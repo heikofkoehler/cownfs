@@ -32,6 +32,10 @@ pub const NFS4ERR_DENIED: u32 = 10010;
 pub const NFS4ERR_BAD_SEQID: u32 = 10027;
 pub const NFS4ERR_STALE_CLIENTID: u32 = 10022;
 pub const NFS4ERR_OP_ILLEGAL: u32 = 10044;
+// NFSv4.1 session errors (RFC 5661 §18).
+pub const NFS4ERR_BADSESSION: u32 = 10064;
+pub const NFS4ERR_BADSLOT: u32 = 10065;
+pub const NFS4ERR_SEQ_MISORDERED: u32 = 10066;
 
 // Operation numbers.
 pub const OP_ACCESS: u32 = 3;
@@ -62,6 +66,12 @@ pub const OP_RENEW: u32 = 30;
 pub const OP_SETCLIENTID: u32 = 35;
 pub const OP_SETCLIENTID_CONFIRM: u32 = 36;
 pub const OP_ILLEGAL: u32 = 10044;
+// NFSv4.1 session ops (RFC 5661).
+pub const OP_EXCHANGE_ID: u32 = 42;
+pub const OP_CREATE_SESSION: u32 = 43;
+pub const OP_DESTROY_SESSION: u32 = 47;
+pub const OP_SEQUENCE: u32 = 44;
+pub const OP_DESTROY_CLIENTID: u32 = 57;
 
 // Attribute numbers (RFC 7530 §5).
 // --- REQUIRED (MUST be returned when requested) ---
@@ -327,6 +337,29 @@ pub enum Op {
         length: u64,
     },
     Renew {
+        clientid: u64,
+    },
+    // NFSv4.1 sessions (RFC 5661).
+    ExchangeId {
+        verifier: [u8; 8],
+        owner: Vec<u8>,
+        flags: u32,
+    },
+    CreateSession {
+        clientid: u64,
+        sequence: u32,
+        max_slots: u32,
+    },
+    DestroySession {
+        sessionid: [u8; 16],
+    },
+    Sequence {
+        sessionid: [u8; 16],
+        sequenceid: u32,
+        slotid: u32,
+        cachethis: bool,
+    },
+    DestroyClientid {
         clientid: u64,
     },
 }
@@ -714,6 +747,70 @@ impl Op {
                 let clientid = r.u64()?;
                 Op::Renew { clientid }
             }
+            OP_EXCHANGE_ID => {
+                // eia_clientowner: verifier[8] + owner opaque.
+                let verifier_bytes = r.opaque_fixed(8)?;
+                let mut verifier = [0u8; 8];
+                verifier.copy_from_slice(verifier_bytes);
+                let owner = r.opaque()?.to_vec();
+                let flags = r.u32()?;
+                // Skip state_protect (simplified: assume none).
+                let _sp_how = r.u32()?;
+                Op::ExchangeId {
+                    verifier,
+                    owner,
+                    flags,
+                }
+            }
+            OP_CREATE_SESSION => {
+                let clientid = r.u64()?;
+                let sequence = r.u32()?;
+                let flags = r.u32()?;
+                // fore_chan_attrs: headerpadsize, maxreq_sz, maxresp_sz,
+                // maxresp_cached, maxops, maxreqs.
+                let _pad = r.u32()?;
+                let _maxreq = r.u32()?;
+                let _maxresp = r.u32()?;
+                let _maxcached = r.u32()?;
+                let maxops = r.u32()?;
+                let maxreqs = r.u32()?;
+                // Skip back_chan_attrs (same shape) and cb_program.
+                for _ in 0..6 {
+                    let _ = r.u32()?;
+                }
+                let _cb = r.u32()?;
+                let _ = flags;
+                Op::CreateSession {
+                    clientid,
+                    sequence,
+                    max_slots: maxreqs.max(1).min(64).max(maxops.min(64)),
+                }
+            }
+            OP_DESTROY_SESSION => {
+                let sid = r.opaque_fixed(16)?;
+                let mut sessionid = [0u8; 16];
+                sessionid.copy_from_slice(sid);
+                Op::DestroySession { sessionid }
+            }
+            OP_SEQUENCE => {
+                let sid = r.opaque_fixed(16)?;
+                let mut sessionid = [0u8; 16];
+                sessionid.copy_from_slice(sid);
+                let sequenceid = r.u32()?;
+                let slotid = r.u32()?;
+                let _highest = r.u32()?;
+                let cachethis = r.u32()? != 0;
+                Op::Sequence {
+                    sessionid,
+                    sequenceid,
+                    slotid,
+                    cachethis,
+                }
+            }
+            OP_DESTROY_CLIENTID => {
+                let clientid = r.u64()?;
+                Op::DestroyClientid { clientid }
+            }
             OP_ILLEGAL => Op::Illegal,
             n => return Err(NfsError::BadOp(n)),
         };
@@ -750,6 +847,11 @@ impl Op {
             Op::Lock { .. } => OP_LOCK,
             Op::LockU { .. } => OP_LOCKU,
             Op::Renew { .. } => OP_RENEW,
+            Op::ExchangeId { .. } => OP_EXCHANGE_ID,
+            Op::CreateSession { .. } => OP_CREATE_SESSION,
+            Op::DestroySession { .. } => OP_DESTROY_SESSION,
+            Op::Sequence { .. } => OP_SEQUENCE,
+            Op::DestroyClientid { .. } => OP_DESTROY_CLIENTID,
         }
     }
 }
@@ -757,6 +859,7 @@ impl Op {
 // -- operation results -----------------------------------------------------
 
 /// One operation's result: status + optional XDR body.
+#[derive(Clone)]
 pub struct OpResult {
     pub opnum: u32,
     pub status: u32,
