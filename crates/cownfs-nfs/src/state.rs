@@ -7,8 +7,8 @@
 //! - Expired leases reap all client state.
 
 use crate::nfs4::{
-    NfsError, StateId, NFS4ERR_BAD_SEQID, NFS4ERR_DENIED, NFS4ERR_EXPIRED, NFS4ERR_LOCKED,
-    NFS4ERR_STALE_CLIENTID,
+    NfsError, StateId, NFS4ERR_BAD_SEQID, NFS4ERR_DENIED, NFS4ERR_EXPIRED, NFS4ERR_INVAL,
+    NFS4ERR_LOCKED, NFS4ERR_STALE_CLIENTID,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -203,6 +203,7 @@ impl StateManager {
     /// Returns the OpenRecord or an NFS error.
     pub fn open(
         &mut self,
+        seqid: u32,
         clientid: u64,
         owner: Vec<u8>,
         file_ino: u64,
@@ -230,7 +231,7 @@ impl StateManager {
             stateid: stateid.clone(),
             share_access,
             share_deny,
-            seqid: 0,
+            seqid,
         };
         self.opens.insert((clientid, owner), rec.clone());
         self.renew_lease(clientid);
@@ -270,6 +271,47 @@ impl StateManager {
     /// Find an open by stateid.
     pub fn find_open(&self, stateid: &StateId) -> Option<&OpenRecord> {
         self.opens.values().find(|o| &o.stateid == stateid)
+    }
+
+    /// OPEN_DOWNGRADE: reduce share_access/share_deny. Validates seqid.
+    pub fn open_downgrade(
+        &mut self,
+        stateid: &StateId,
+        seqid: u32,
+        share_access: u32,
+        share_deny: u32,
+    ) -> Result<StateId, NfsError> {
+        let key = self
+            .opens
+            .iter()
+            .find(|(_, o)| &o.stateid == stateid)
+            .map(|(k, _)| k.clone());
+        match key {
+            Some(k) => {
+                let (sid, clientid) = {
+                    let o = self.opens.get_mut(&k).unwrap();
+                    if seqid != o.seqid + 1 {
+                        if seqid == o.seqid {
+                            return Ok(o.stateid.clone()); // Replay.
+                        }
+                        return Err(NfsError::Status(NFS4ERR_BAD_SEQID));
+                    }
+                    // Downgrade must be a subset of current modes.
+                    if (share_access & !o.share_access) != 0 || (share_deny & !o.share_deny) != 0 {
+                        return Err(NfsError::Status(NFS4ERR_INVAL));
+                    }
+                    o.share_access = share_access;
+                    o.share_deny = share_deny;
+                    o.seqid = seqid;
+                    // Bump stateid seqid.
+                    o.stateid.seqid += 1;
+                    (o.stateid.clone(), o.clientid)
+                };
+                self.renew_lease(clientid);
+                Ok(sid)
+            }
+            None => Err(NfsError::Status(NFS4ERR_EXPIRED)),
+        }
     }
 
     /// LOCK: acquire a byte-range lock. Checks conflicts.
@@ -392,7 +434,7 @@ mod tests {
         let (cid, _) = sm.setclientid([1u8; 8], b"test".to_vec());
         assert!(sm.confirm(cid, [1u8; 8]));
         // Create an open.
-        sm.open(cid, b"owner".to_vec(), 1, 3, 0).unwrap();
+        sm.open(1, cid, b"owner".to_vec(), 1, 3, 0).unwrap();
         assert!(sm.client_has_state(cid));
         // Wait for lease to expire.
         std::thread::sleep(Duration::from_millis(150));
@@ -400,7 +442,7 @@ mod tests {
         // State should be gone.
         assert!(!sm.client_has_state(cid));
         // Open should fail with stale clientid.
-        assert!(sm.open(cid, b"owner2".to_vec(), 1, 3, 0).is_err());
+        assert!(sm.open(1, cid, b"owner2".to_vec(), 1, 3, 0).is_err());
     }
 
     #[test]
@@ -411,9 +453,9 @@ mod tests {
         sm.confirm(cid1, [1u8; 8]);
         sm.confirm(cid2, [2u8; 8]);
         // c1 opens with DENY_WRITE.
-        sm.open(cid1, b"o1".to_vec(), 1, 3, 2).unwrap();
+        sm.open(1, cid1, b"o1".to_vec(), 1, 3, 2).unwrap();
         // c2 tries to open for WRITE — should be denied.
-        let res = sm.open(cid2, b"o2".to_vec(), 1, 2, 0);
+        let res = sm.open(1, cid2, b"o2".to_vec(), 1, 2, 0);
         assert!(res.is_err());
     }
 
@@ -424,8 +466,8 @@ mod tests {
         let (cid2, _) = sm.setclientid([2u8; 8], b"c2".to_vec());
         sm.confirm(cid1, [1u8; 8]);
         sm.confirm(cid2, [2u8; 8]);
-        let o1 = sm.open(cid1, b"o1".to_vec(), 1, 3, 0).unwrap();
-        let o2 = sm.open(cid2, b"o2".to_vec(), 1, 3, 0).unwrap();
+        let o1 = sm.open(1, cid1, b"o1".to_vec(), 1, 3, 0).unwrap();
+        let o2 = sm.open(1, cid2, b"o2".to_vec(), 1, 3, 0).unwrap();
         // c1 locks [0,1000) WRITE.
         sm.lock(cid1, b"l1".to_vec(), 1, 2, 0, 1000, Some(&o1.stateid))
             .unwrap();

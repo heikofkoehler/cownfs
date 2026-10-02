@@ -17,8 +17,8 @@ use crate::nfs4::{
     NFS4ERR_NOFILEHANDLE, NFS4ERR_NOTDIR, NFS4ERR_NOTSUPP, NFS4ERR_OP_ILLEGAL, NFS4ERR_SERVERFAULT,
     NFS4ERR_STALE_CLIENTID, NFS4ERR_TOOSMALL, NFS4_OK, OPEN4_CREATE, OP_ACCESS, OP_CLOSE,
     OP_COMMIT, OP_CREATE, OP_GETATTR, OP_GETFH, OP_ILLEGAL, OP_LINK, OP_LOCK, OP_LOCKU, OP_LOOKUP,
-    OP_LOOKUPP, OP_OPEN, OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_REMOVE, OP_RENAME,
-    OP_RENEW, OP_RESTOREFH, OP_SAVEFH, OP_SECINFO, OP_SETATTR, OP_SETCLIENTID,
+    OP_LOOKUPP, OP_OPEN, OP_OPEN_DOWNGRADE, OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_REMOVE,
+    OP_RENAME, OP_RENEW, OP_RESTOREFH, OP_SAVEFH, OP_SECINFO, OP_SETATTR, OP_SETCLIENTID,
     OP_SETCLIENTID_CONFIRM, OP_WRITE, UNCHECKED4,
 };
 use crate::rpc::{self, Call, RecordReader, RpcError};
@@ -228,6 +228,7 @@ impl Session {
             Op::Read { offset, count } => self.op_read(*offset, *count),
             Op::Access { access } => self.op_access(*access),
             Op::Open {
+                seqid,
                 clientid,
                 owner,
                 share_access,
@@ -237,8 +238,8 @@ impl Session {
                 createattrs,
                 claim_type,
                 filename,
-                ..
             } => self.op_open(
+                *seqid,
                 *clientid,
                 owner,
                 *share_access,
@@ -287,6 +288,12 @@ impl Session {
                 self.op_setclientid_confirm(*clientid, *verifier)
             }
             Op::Close { seqid, stateid } => self.op_close(*seqid, stateid),
+            Op::OpenDowngrade {
+                stateid,
+                seqid,
+                share_access,
+                share_deny,
+            } => self.op_open_downgrade(stateid, *seqid, *share_access, *share_deny),
             Op::Lock {
                 locktype,
                 reclaim,
@@ -545,6 +552,7 @@ impl Session {
 
     fn op_open(
         &mut self,
+        seqid: u32,
         clientid: u64,
         owner: &[u8],
         share_access: u32,
@@ -603,15 +611,18 @@ impl Session {
 
         self.cfh = Some(file_ino);
         // P6: create real open state with share reservation checking.
-        let open_rec =
-            match self
-                .state()
-                .open(clientid, owner.to_vec(), file_ino, share_access, share_deny)
-            {
-                Ok(rec) => rec,
-                Err(NfsError::Status(s)) => return OpResult::err(OP_OPEN, s),
-                Err(_) => return OpResult::err(OP_OPEN, NFS4ERR_SERVERFAULT),
-            };
+        let open_rec = match self.state().open(
+            seqid,
+            clientid,
+            owner.to_vec(),
+            file_ino,
+            share_access,
+            share_deny,
+        ) {
+            Ok(rec) => rec,
+            Err(NfsError::Status(s)) => return OpResult::err(OP_OPEN, s),
+            Err(_) => return OpResult::err(OP_OPEN, NFS4ERR_SERVERFAULT),
+        };
         let mut w = Writer::new();
         open_rec.stateid.encode(&mut w);
         // change_info4: atomic(bool) + before(u64) + after(u64)  [RFC 7530 §16.16]
@@ -931,6 +942,27 @@ impl Session {
             }
             Err(NfsError::Status(s)) => OpResult::err(OP_CLOSE, s),
             Err(_) => OpResult::err(OP_CLOSE, NFS4ERR_SERVERFAULT),
+        }
+    }
+
+    fn op_open_downgrade(
+        &mut self,
+        stateid: &StateId,
+        seqid: u32,
+        share_access: u32,
+        share_deny: u32,
+    ) -> OpResult {
+        match self
+            .state()
+            .open_downgrade(stateid, seqid, share_access, share_deny)
+        {
+            Ok(new_stateid) => {
+                let mut w = Writer::new();
+                new_stateid.encode(&mut w);
+                OpResult::ok(OP_OPEN_DOWNGRADE, w.into_bytes())
+            }
+            Err(NfsError::Status(s)) => OpResult::err(OP_OPEN_DOWNGRADE, s),
+            Err(_) => OpResult::err(OP_OPEN_DOWNGRADE, NFS4ERR_SERVERFAULT),
         }
     }
 

@@ -54,6 +54,7 @@ pub const OP_SECINFO: u32 = 33;
 pub const OP_SETATTR: u32 = 34;
 pub const OP_WRITE: u32 = 38;
 pub const OP_OPEN: u32 = 18;
+pub const OP_OPEN_DOWNGRADE: u32 = 21;
 pub const OP_CLOSE: u32 = 4;
 pub const OP_LOCK: u32 = 12;
 pub const OP_LOCKU: u32 = 14;
@@ -299,6 +300,12 @@ pub enum Op {
     Close {
         seqid: u32,
         stateid: StateId,
+    },
+    OpenDowngrade {
+        stateid: StateId,
+        seqid: u32,
+        share_access: u32,
+        share_deny: u32,
     },
     Lock {
         locktype: u32,
@@ -627,6 +634,18 @@ impl Op {
                 let stateid = StateId::decode(r)?;
                 Op::Close { seqid, stateid }
             }
+            OP_OPEN_DOWNGRADE => {
+                let stateid = StateId::decode(r)?;
+                let seqid = r.u32()?;
+                let share_access = r.u32()?;
+                let share_deny = r.u32()?;
+                Op::OpenDowngrade {
+                    stateid,
+                    seqid,
+                    share_access,
+                    share_deny,
+                }
+            }
             OP_LOCK => {
                 let locktype = r.u32()?;
                 let reclaim = r.bool()?;
@@ -727,6 +746,7 @@ impl Op {
             Op::SetClientId { .. } => OP_SETCLIENTID,
             Op::SetClientIdConfirm { .. } => OP_SETCLIENTID_CONFIRM,
             Op::Close { .. } => OP_CLOSE,
+            Op::OpenDowngrade { .. } => OP_OPEN_DOWNGRADE,
             Op::Lock { .. } => OP_LOCK,
             Op::LockU { .. } => OP_LOCKU,
             Op::Renew { .. } => OP_RENEW,

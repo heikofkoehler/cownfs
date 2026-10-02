@@ -549,6 +549,21 @@ impl Ops {
         self.op();
     }
 
+    pub fn open_downgrade(
+        &mut self,
+        stateid: &[u8; 16],
+        seqid: u32,
+        share_access: u32,
+        share_deny: u32,
+    ) {
+        self.w.u32(nfs4::OP_OPEN_DOWNGRADE);
+        self.w.raw(stateid);
+        self.w.u32(seqid);
+        self.w.u32(share_access);
+        self.w.u32(share_deny);
+        self.op();
+    }
+
     /// LOCK with a new lock owner (lock_owner4 form).
     pub fn lock_new(
         &mut self,
@@ -802,6 +817,12 @@ impl NfsClient {
                     let mut stateid = [0u8; 16];
                     stateid.copy_from_slice(sid);
                     Reply::Lock { stateid }
+                }
+                nfs4::OP_OPEN_DOWNGRADE => {
+                    let sid = r.opaque_fixed(16).expect("stateid");
+                    let mut stateid = [0u8; 16];
+                    stateid.copy_from_slice(sid);
+                    Reply::Open { stateid }
                 }
                 nfs4::OP_SETCLIENTID => {
                     let clientid = r.u64().expect("clientid");
