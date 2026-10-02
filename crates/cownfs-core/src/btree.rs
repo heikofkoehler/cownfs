@@ -418,6 +418,62 @@ impl<K: Ord + Clone, V: Clone, S: NodeStore<K, V>, const T: usize> BTree<K, V, S
         }
     }
 
+    /// Fetch a node by id (for diff/walk utilities).
+    pub fn get_node(&self, id: NodeId) -> Result<Node<K, V>, StoreError> {
+        let mut store = self.store.lock().unwrap();
+        let node = store.get(id)?;
+        Ok(node.clone())
+    }
+
+    /// Node ids changed between two roots of the same tree.
+    ///
+    /// Walks both trees in lockstep. CoW guarantees that unchanged
+    /// subtrees share NodeIds (same idx AND generation) and are skipped
+    /// without descent, so this is O(changed nodes), not O(tree size).
+    /// When a node's child structure differs (split/merge), the entire
+    /// new subtree is collected.
+    ///
+    /// Both roots must belong to this tree's store.
+    pub fn diff_roots(
+        &self,
+        old_root: NodeId,
+        new_root: NodeId,
+    ) -> Result<Vec<NodeId>, StoreError> {
+        let mut changed = Vec::new();
+        // (old, new); old == None means "collect entire new subtree".
+        let mut stack: Vec<(Option<NodeId>, NodeId)> = vec![(Some(old_root), new_root)];
+        let mut store = self.store.lock().unwrap();
+        while let Some((old_opt, new_id)) = stack.pop() {
+            if old_opt == Some(new_id) {
+                continue; // Shared subtree — unchanged.
+            }
+            changed.push(new_id);
+            let new_node = store.get(new_id)?.clone();
+            match old_opt {
+                None => {
+                    // Collect entire subtree.
+                    for c in new_node.children {
+                        stack.push((None, c));
+                    }
+                }
+                Some(old_id) => {
+                    let old_node = store.get(old_id)?.clone();
+                    if old_node.children.len() == new_node.children.len() {
+                        for (o, n) in old_node.children.iter().zip(new_node.children.iter()) {
+                            stack.push((Some(*o), *n));
+                        }
+                    } else {
+                        // Structure changed — collect the whole new subtree.
+                        for c in new_node.children {
+                            stack.push((None, c));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(changed)
+    }
+
     pub fn get(&self, k: &K) -> Result<Option<V>, StoreError> {
         let mut a = self.store.lock().unwrap();
         let mut id = self.root;
