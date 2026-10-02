@@ -42,7 +42,7 @@ static IMG_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct TestServer {
     pub addr: SocketAddr,
     pub uuid: [u8; 16],
-    img: PathBuf,
+    img: Option<PathBuf>,
 }
 
 /// Format a fresh image and serve it on 127.0.0.1:0. The listener is bound
@@ -65,7 +65,11 @@ pub fn spawn_server(blocks: u64) -> TestServer {
         let shared = cownfs_nfs::server::Shared::new(fs);
         let _ = cownfs_nfs::server::serve_listener(listener, &shared);
     });
-    TestServer { addr, uuid, img }
+    TestServer {
+        addr,
+        uuid,
+        img: Some(img),
+    }
 }
 
 /// Spawn a server on an ephemeral port that serves connections concurrently
@@ -102,12 +106,39 @@ fn spawn_concurrent_server_inner(blocks: u64, read_only: bool) -> TestServer {
         };
         let _ = cownfs_nfs::server::serve_concurrent(listener, shared);
     });
-    TestServer { addr, uuid, img }
+    TestServer {
+        addr,
+        uuid,
+        img: Some(img),
+    }
 }
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.img);
+        if let Some(img) = &self.img {
+            let _ = std::fs::remove_file(img);
+        }
+    }
+}
+
+/// Serve an existing image file read-only on 127.0.0.1:0. The image is
+/// NOT removed on drop (caller owns it).
+pub fn spawn_read_only_server_on(img: &std::path::Path) -> TestServer {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+    let addr = listener.local_addr().expect("listener local addr");
+    let img2 = img.to_path_buf();
+    let fs = Fs::open(&img2).expect("open test image");
+    let uuid = fs.uuid();
+    drop(fs);
+    std::thread::spawn(move || {
+        let fs = Fs::open(&img2).expect("open test image");
+        let shared = cownfs_nfs::server::Shared::new_read_only(fs);
+        let _ = cownfs_nfs::server::serve_concurrent(listener, shared);
+    });
+    TestServer {
+        addr,
+        uuid,
+        img: None,
     }
 }
 
