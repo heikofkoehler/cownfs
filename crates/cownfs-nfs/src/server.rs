@@ -16,7 +16,7 @@ use crate::nfs4::{
     NFS4ERR_BADXDR, NFS4ERR_BAD_COOKIE, NFS4ERR_EXIST, NFS4ERR_EXPIRED, NFS4ERR_INVAL,
     NFS4ERR_ISDIR, NFS4ERR_NAMETOOLONG, NFS4ERR_NOENT, NFS4ERR_NOFILEHANDLE, NFS4ERR_NOTDIR,
     NFS4ERR_NOTSUPP, NFS4ERR_OP_ILLEGAL, NFS4ERR_RECALLCONFLICT, NFS4ERR_ROFS,
-    NFS4ERR_SEQ_MISORDERED, NFS4ERR_SERVERFAULT, NFS4ERR_STALE_CLIENTID, NFS4ERR_TOOSMALL, NFS4_OK,
+    NFS4ERR_SEQ_MISORDERED, NFS4ERR_SERVERFAULT, NFS4ERR_STALE, NFS4ERR_STALE_CLIENTID, NFS4ERR_TOOSMALL, NFS4_OK,
     OPEN4_CREATE, OP_ACCESS, OP_CLOSE, OP_COMMIT, OP_CREATE, OP_CREATE_SESSION,
     OP_DESTROY_CLIENTID, OP_DESTROY_SESSION, OP_EXCHANGE_ID, OP_GETATTR, OP_GETFH, OP_ILLEGAL,
     OP_LAYOUTCOMMIT, OP_LAYOUTGET, OP_LAYOUTRETURN, OP_LINK, OP_LOCK, OP_LOCKU, OP_LOOKUP,
@@ -210,6 +210,19 @@ impl Session {
         if fh.fs_uuid != self.fs().uuid() {
             return Err(NFS4ERR_INVAL);
         }
+        // Validate inode generation: reject stale filehandles for
+        // deleted/reused inodes. gen=0 skips validation (old format).
+        if fh.gen != 0 {
+            match self.fs().getattr(fh.inode) {
+                Ok(attr) => {
+                    let ino_gen = attr.gen as u32;
+                    if ino_gen != fh.gen {
+                        return Err(NFS4ERR_STALE);
+                    }
+                }
+                Err(_) => return Err(NFS4ERR_STALE),
+            }
+        }
         Ok(fh.inode)
     }
 
@@ -336,9 +349,15 @@ impl Session {
             Op::GetFh => match self.cfh {
                 Some(ino) => {
                     let mut w = Writer::new();
+                    let gen = self
+                        .fs()
+                        .getattr(ino)
+                        .map(|a| a.gen as u32)
+                        .unwrap_or(0);
                     FileHandle {
                         fs_uuid: self.fs().uuid(),
                         inode: ino,
+                        gen,
                     }
                     .encode(&mut w);
                     OpResult::ok(OP_GETFH, w.into_bytes())
@@ -854,6 +873,7 @@ impl Session {
             fh: FileHandle {
                 fs_uuid,
                 inode: ino,
+                gen: inode.gen as u32,
             }
             .to_bytes()
             .to_vec(),

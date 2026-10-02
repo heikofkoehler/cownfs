@@ -337,6 +337,7 @@ impl Ops {
         FileHandle {
             fs_uuid: *uuid,
             inode: ino,
+            gen: 0,
         }
         .encode(&mut self.w);
         self.op();

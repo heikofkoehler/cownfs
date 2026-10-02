@@ -23,7 +23,7 @@ fn macos_lookup_with_secinfo() {
     // Create a file first.
     let mut ops = Ops::new();
     ops.putrootfh();
-    ops.create_raw(NF4REG, None, b"real");
+    ops.create_raw(NF4DIR, None, b"real");
     c.check_ok(b"create", ops);
 
     // The macOS lookup compound.
@@ -77,7 +77,7 @@ fn macos_secinfo_then_remove() {
 
     let mut ops = Ops::new();
     ops.putrootfh();
-    ops.create_raw(NF4REG, None, b"doomed");
+    ops.create_raw(NF4DIR, None, b"doomed");
     c.check_ok(b"create", ops);
 
     // SECINFO then REMOVE in one compound (macOS bundles them).
@@ -108,7 +108,7 @@ fn macos_getattr_heavy_lookup() {
 
     let mut ops = Ops::new();
     ops.putrootfh();
-    ops.create_raw(NF4REG, None, b"g");
+    ops.create_raw(NF4DIR, None, b"g");
     c.check_ok(b"create", ops);
 
     let mut ops = Ops::new();
@@ -177,7 +177,7 @@ fn invalid_utf8_names_rejected() {
     // CREATE
     let mut ops = Ops::new();
     ops.putrootfh();
-    ops.create_raw(NF4REG, None, bad);
+    ops.create_raw(NF4DIR, None, bad);
     let (overall, _) = c.call(b"create-badutf8", ops);
     assert_eq!(overall, NFS4ERR_INVAL, "CREATE bad UTF-8");
 }
@@ -256,9 +256,9 @@ fn illegal_op_mid_compound() {
 
     let mut ops = Ops::new();
     ops.putrootfh();
-    ops.create_raw(NF4REG, None, b"before-illegal");
+    ops.create_raw(NF4DIR, None, b"before-illegal");
     ops.bogus_op(10044); // ILLEGAL
-    ops.create_raw(NF4REG, None, b"after-illegal");
+    ops.create_raw(NF4DIR, None, b"after-illegal");
     let (overall, res) = c.call(b"illegal-mid", ops);
     assert_eq!(overall, NFS4ERR_OP_ILLEGAL);
     assert_eq!(res.len(), 3);

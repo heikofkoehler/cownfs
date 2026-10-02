@@ -30,6 +30,7 @@ pub const NFS4ERR_EXPIRED: u32 = 10011;
 pub const NFS4ERR_LOCKED: u32 = 10012;
 pub const NFS4ERR_DENIED: u32 = 10010;
 pub const NFS4ERR_BAD_SEQID: u32 = 10026;
+pub const NFS4ERR_STALE: u32 = 70;
 pub const NFS4ERR_STALE_CLIENTID: u32 = 10022;
 pub const NFS4ERR_OP_ILLEGAL: u32 = 10044;
 // NFSv4.1 session errors (RFC 5661 §18).
@@ -206,6 +207,7 @@ pub const FH_LEN: usize = 32;
 pub struct FileHandle {
     pub fs_uuid: [u8; 16],
     pub inode: u64,
+    pub gen: u32,
 }
 
 impl FileHandle {
@@ -216,7 +218,7 @@ impl FileHandle {
         fh[0..4].copy_from_slice(&FH_MAGIC.to_be_bytes());
         fh[4..20].copy_from_slice(&self.fs_uuid);
         fh[20..28].copy_from_slice(&self.inode.to_be_bytes());
-        // gen = 0
+        fh[28..32].copy_from_slice(&self.gen.to_be_bytes());
         fh
     }
 
@@ -235,7 +237,8 @@ impl FileHandle {
         let mut fs_uuid = [0u8; 16];
         fs_uuid.copy_from_slice(&b[4..20]);
         let inode = u64::from_be_bytes(b[20..28].try_into().unwrap());
-        Ok(FileHandle { fs_uuid, inode })
+        let gen = u32::from_be_bytes(b[28..32].try_into().unwrap());
+        Ok(FileHandle { fs_uuid, inode, gen })
     }
 }
 
@@ -1347,6 +1350,7 @@ mod tests {
         let fh = FileHandle {
             fs_uuid: [7u8; 16],
             inode: 42,
+            gen: 3,
         };
         let mut w = Writer::new();
         fh.encode(&mut w);

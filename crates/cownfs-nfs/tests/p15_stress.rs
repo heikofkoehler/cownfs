@@ -84,16 +84,20 @@ fn stress_open_lock_close_cycles() {
             // the state machine still runs hot.
             let off = (i as u64) * 1024;
             let mut ops = Ops::new();
+            ops.putfh(&uuid, ROOT_INO);
+            ops.lookup(b"cycle.dat");
             ops.lock_new(id, WRITE_LT, off, 512, &ost, lock_owner.as_bytes());
             let (st, res) = c.call(b"cycle-lock", ops);
             let lst = match st {
-                NFS4_OK => Some(lock_stateid(&res[0])),
+                NFS4_OK => Some(lock_stateid(&res[2])),
                 NFS4ERR_LOCKED | NFS4ERR_DENIED => None,
                 s => panic!("t{i} iter {j}: unexpected lock status {s}"),
             };
 
             if let Some(lst) = lst {
                 let mut ops = Ops::new();
+                ops.putfh(&uuid, ROOT_INO);
+                ops.lookup(b"cycle.dat");
                 ops.locku(WRITE_LT, 1, &lst, off, 512);
                 let (st, _) = c.call(b"cycle-unlock", ops);
                 assert!(

@@ -169,25 +169,31 @@ fn lock_conflict_and_unlock() {
     common::create_file(&mut c, &srv.uuid, ida, ROOT_INO, b"f", 0o644);
     let sa = open_stateid(&open_file(&mut c, &srv.uuid, ida, b"oa", 3, b"f"));
     let sb = open_stateid(&open_file(&mut c, &srv.uuid, idb, b"ob", 3, b"f"));
-    // cfh is the file after the last OPEN; LOCK operates on the cfh.
+    // cfh is per-COMPOUND: PUTFH+LOOKUP before LOCK.
 
     let mut ops = Ops::new();
+    ops.putfh(&srv.uuid, ROOT_INO);
+    ops.lookup(b"f");
     ops.lock_new(ida, WRITE_LT, 0, 100, &sa, b"la");
     let res = c.check_ok(b"lock-a", ops);
-    let sla = lock_stateid(&res[0]);
+    let sla = lock_stateid(&res[2]);
 
     // Overlapping WRITE from another owner -> LOCKED.
     let mut ops = Ops::new();
+    ops.putfh(&srv.uuid, ROOT_INO);
+    ops.lookup(b"f");
     ops.lock_new(idb, WRITE_LT, 50, 100, &sb, b"lb");
     let (overall, res) = c.call(b"lock-conflict", ops);
     assert_eq!(overall, NFS4ERR_LOCKED);
-    assert!(matches!(res[0], Reply::Err(NFS4ERR_LOCKED)));
+    assert!(matches!(res[2], Reply::Err(NFS4ERR_LOCKED)));
 
     // Disjoint range is fine.
     let mut ops = Ops::new();
+    ops.putfh(&srv.uuid, ROOT_INO);
+    ops.lookup(b"f");
     ops.lock_new(idb, WRITE_LT, 200, 100, &sb, b"lb");
     let res = c.check_ok(b"lock-b", ops);
-    let slb = lock_stateid(&res[0]);
+    let slb = lock_stateid(&res[2]);
 
     for (sid, off, len) in [(sla, 0, 100), (slb, 200, 100)] {
         let mut ops = Ops::new();
@@ -197,6 +203,8 @@ fn lock_conflict_and_unlock() {
 
     // After unlock, B can take the range A held.
     let mut ops = Ops::new();
+    ops.putfh(&srv.uuid, ROOT_INO);
+    ops.lookup(b"f");
     ops.lock_new(idb, WRITE_LT, 0, 100, &sb, b"lb2");
     c.check_ok(b"relock", ops);
 }
@@ -212,14 +220,18 @@ fn read_locks_do_not_conflict() {
     let sb = open_stateid(&open_file(&mut c, &srv.uuid, idb, b"ob", 3, b"f"));
 
     let mut ops = Ops::new();
+    ops.putfh(&srv.uuid, ROOT_INO);
+    ops.lookup(b"f");
     ops.lock_new(ida, READ_LT, 0, 100, &sa, b"la");
     let res = c.check_ok(b"read-lock-a", ops);
-    let sla = lock_stateid(&res[0]);
+    let sla = lock_stateid(&res[2]);
 
     let mut ops = Ops::new();
+    ops.putfh(&srv.uuid, ROOT_INO);
+    ops.lookup(b"f");
     ops.lock_new(idb, READ_LT, 50, 100, &sb, b"lb");
     let res = c.check_ok(b"read-lock-b", ops);
-    let slb = lock_stateid(&res[0]);
+    let slb = lock_stateid(&res[2]);
 
     for (sid, off, len) in [(sla, 0, 100), (slb, 50, 100)] {
         let mut ops = Ops::new();
