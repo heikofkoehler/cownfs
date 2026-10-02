@@ -72,6 +72,16 @@ pub fn spawn_server(blocks: u64) -> TestServer {
 /// (one thread per connection, shared filesystem and NFSv4 state).
 /// The image file is removed when the server is dropped.
 pub fn spawn_concurrent_server(blocks: u64) -> TestServer {
+    spawn_concurrent_server_inner(blocks, false)
+}
+
+/// Same as spawn_concurrent_server but the server rejects mutating ops
+/// with NFS4ERR_ROFS.
+pub fn spawn_read_only_server(blocks: u64) -> TestServer {
+    spawn_concurrent_server_inner(blocks, true)
+}
+
+fn spawn_concurrent_server_inner(blocks: u64, read_only: bool) -> TestServer {
     let n = IMG_COUNTER.fetch_add(1, Ordering::SeqCst);
     let img = std::env::temp_dir().join(format!("cownfs-it-{}-{n}.img", std::process::id()));
     let _ = std::fs::remove_file(&img);
@@ -85,7 +95,11 @@ pub fn spawn_concurrent_server(blocks: u64) -> TestServer {
     let img2 = img.clone();
     std::thread::spawn(move || {
         let fs = Fs::open(&img2).expect("open test image");
-        let shared = cownfs_nfs::server::Shared::new(fs);
+        let shared = if read_only {
+            cownfs_nfs::server::Shared::new_read_only(fs)
+        } else {
+            cownfs_nfs::server::Shared::new(fs)
+        };
         let _ = cownfs_nfs::server::serve_concurrent(listener, shared);
     });
     TestServer { addr, uuid, img }

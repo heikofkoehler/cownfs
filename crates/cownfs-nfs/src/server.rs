@@ -14,12 +14,12 @@ use crate::nfs4::{
     ACCESS4_READ, FATTR4_MODE, FATTR4_SIZE, FILE_SYNC4, GUARDED4, NF4DIR, NF4LNK, NF4REG,
     NFS4ERR_BADNAME, NFS4ERR_BADTYPE, NFS4ERR_BADXDR, NFS4ERR_BAD_COOKIE, NFS4ERR_EXIST,
     NFS4ERR_EXPIRED, NFS4ERR_INVAL, NFS4ERR_ISDIR, NFS4ERR_NAMETOOLONG, NFS4ERR_NOENT,
-    NFS4ERR_NOFILEHANDLE, NFS4ERR_NOTDIR, NFS4ERR_NOTSUPP, NFS4ERR_OP_ILLEGAL, NFS4ERR_SERVERFAULT,
-    NFS4ERR_STALE_CLIENTID, NFS4ERR_TOOSMALL, NFS4_OK, OPEN4_CREATE, OP_ACCESS, OP_CLOSE,
-    OP_COMMIT, OP_CREATE, OP_GETATTR, OP_GETFH, OP_ILLEGAL, OP_LINK, OP_LOCK, OP_LOCKU, OP_LOOKUP,
-    OP_LOOKUPP, OP_OPEN, OP_OPEN_DOWNGRADE, OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_REMOVE,
-    OP_RENAME, OP_RENEW, OP_RESTOREFH, OP_SAVEFH, OP_SECINFO, OP_SETATTR, OP_SETCLIENTID,
-    OP_SETCLIENTID_CONFIRM, OP_WRITE, UNCHECKED4,
+    NFS4ERR_NOFILEHANDLE, NFS4ERR_NOTDIR, NFS4ERR_NOTSUPP, NFS4ERR_OP_ILLEGAL, NFS4ERR_ROFS,
+    NFS4ERR_SERVERFAULT, NFS4ERR_STALE_CLIENTID, NFS4ERR_TOOSMALL, NFS4_OK, OPEN4_CREATE,
+    OP_ACCESS, OP_CLOSE, OP_COMMIT, OP_CREATE, OP_GETATTR, OP_GETFH, OP_ILLEGAL, OP_LINK, OP_LOCK,
+    OP_LOCKU, OP_LOOKUP, OP_LOOKUPP, OP_OPEN, OP_OPEN_DOWNGRADE, OP_PUTFH, OP_PUTROOTFH, OP_READ,
+    OP_READDIR, OP_REMOVE, OP_RENAME, OP_RENEW, OP_RESTOREFH, OP_SAVEFH, OP_SECINFO, OP_SETATTR,
+    OP_SETCLIENTID, OP_SETCLIENTID_CONFIRM, OP_WRITE, UNCHECKED4,
 };
 use crate::rpc::{self, Call, RecordReader, RpcError};
 use crate::state::StateManager;
@@ -97,6 +97,8 @@ fn fs_to_nfs(e: FsError) -> u32 {
 pub struct Shared {
     pub fs: Arc<Mutex<Fs>>,
     pub state: Arc<Mutex<StateManager>>,
+    /// When true, mutating ops return NFS4ERR_ROFS. Used for read replicas.
+    pub read_only: bool,
 }
 
 impl Shared {
@@ -104,6 +106,15 @@ impl Shared {
         Shared {
             fs: Arc::new(Mutex::new(fs)),
             state: Arc::new(Mutex::new(StateManager::new())),
+            read_only: false,
+        }
+    }
+
+    pub fn new_read_only(fs: Fs) -> Self {
+        Shared {
+            fs: Arc::new(Mutex::new(fs)),
+            state: Arc::new(Mutex::new(StateManager::new())),
+            read_only: true,
         }
     }
 }
@@ -238,29 +249,55 @@ impl Session {
                 createattrs,
                 claim_type,
                 filename,
-            } => self.op_open(
-                *seqid,
-                *clientid,
-                owner,
-                *share_access,
-                *share_deny,
-                *opentype,
-                *createmode,
-                createattrs,
-                *claim_type,
-                filename,
-            ),
+            } => {
+                // OPEN with CREATE mutates the namespace.
+                if self.shared.read_only && *opentype == OPEN4_CREATE {
+                    return OpResult::err(OP_OPEN, NFS4ERR_ROFS);
+                }
+                self.op_open(
+                    *seqid,
+                    *clientid,
+                    owner,
+                    *share_access,
+                    *share_deny,
+                    *opentype,
+                    *createmode,
+                    createattrs,
+                    *claim_type,
+                    filename,
+                )
+            }
             Op::Create {
                 ftype,
                 linkdata,
                 name,
                 attrs,
-            } => self.op_create(*ftype, linkdata, name, attrs),
-            Op::Remove(name) => self.op_remove(name),
+            } => {
+                if self.shared.read_only {
+                    return OpResult::err(OP_CREATE, NFS4ERR_ROFS);
+                }
+                self.op_create(*ftype, linkdata, name, attrs)
+            }
+            Op::Remove(name) => {
+                if self.shared.read_only {
+                    return OpResult::err(OP_REMOVE, NFS4ERR_ROFS);
+                }
+                self.op_remove(name)
+            }
             Op::Secinfo(name) => self.op_secinfo(name),
             Op::Illegal => OpResult::err(OP_ILLEGAL, NFS4ERR_OP_ILLEGAL),
-            Op::Rename { old, new } => self.op_rename(old, new),
-            Op::Link(name) => self.op_link(name),
+            Op::Rename { old, new } => {
+                if self.shared.read_only {
+                    return OpResult::err(OP_RENAME, NFS4ERR_ROFS);
+                }
+                self.op_rename(old, new)
+            }
+            Op::Link(name) => {
+                if self.shared.read_only {
+                    return OpResult::err(OP_LINK, NFS4ERR_ROFS);
+                }
+                self.op_link(name)
+            }
             Op::SaveFh => {
                 self.saved_fh = self.cfh;
                 OpResult::ok(OP_SAVEFH, Vec::new())
@@ -272,12 +309,22 @@ impl Session {
                 }
                 None => OpResult::err(OP_RESTOREFH, NFS4ERR_INVAL),
             },
-            Op::SetAttr { attrs } => self.op_setattr(attrs),
+            Op::SetAttr { attrs } => {
+                if self.shared.read_only {
+                    return OpResult::err(OP_SETATTR, NFS4ERR_ROFS);
+                }
+                self.op_setattr(attrs)
+            }
             Op::Write {
                 offset,
                 stable,
                 data,
-            } => self.op_write(*offset, *stable, data),
+            } => {
+                if self.shared.read_only {
+                    return OpResult::err(OP_WRITE, NFS4ERR_ROFS);
+                }
+                self.op_write(*offset, *stable, data)
+            }
             Op::Commit { offset, count } => self.op_commit(*offset, *count),
             Op::SetClientId {
                 verifier,
