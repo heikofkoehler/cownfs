@@ -11,7 +11,7 @@ pub const NFS4ERR_IO: u32 = 5;
 pub const NFS4ERR_ACCESS: u32 = 13;
 pub const NFS4ERR_EXIST: u32 = 17;
 pub const NFS4ERR_NOTDIR: u32 = 20;
-pub const NFS4ERR_NOFILEHANDLE: u32 = 20; // same code as NOTDIR per RFC 7530
+pub const NFS4ERR_NOFILEHANDLE: u32 = 10020;
 pub const NFS4ERR_BADXDR: u32 = 10036;
 pub const NFS4ERR_NAMETOOLONG: u32 = 63;
 pub const NFS4ERR_BADNAME: u32 = 10041;
@@ -974,9 +974,9 @@ impl OpResult {
     pub fn encode(&self, w: &mut Writer) {
         w.u32(self.opnum);
         w.u32(self.status);
-        if self.status == NFS4_OK {
-            w.raw(&self.body);
-        }
+        // Some ops (e.g. SETATTR) have mandatory res fields after status
+        // even on error (RFC 7530). Write the body whenever present.
+        w.raw(&self.body);
     }
 }
 

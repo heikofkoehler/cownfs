@@ -214,6 +214,9 @@ impl Session {
     }
 
     fn run(&mut self, compound: &Compound) -> Vec<OpResult> {
+        // Current and saved filehandles are per-COMPOUND (RFC 7530 §2.6).
+        self.cfh = None;
+        self.saved_fh = None;
         // NFSv4.1: if the first op is SEQUENCE, run with exactly-once
         // semantics (replay detection via the session slot table).
         if let Some(Op::Sequence {
@@ -1250,7 +1253,17 @@ impl Session {
     fn op_setattr(&mut self, attrs: &[(u32, Vec<u8>)]) -> OpResult {
         let ino = match self.cfh {
             Some(i) => i,
-            None => return OpResult::err(OP_SETATTR, NFS4ERR_NOFILEHANDLE),
+            None => {
+                // RFC 7530 §16.34: SETATTR4res always includes attrsset,
+                // even on error.
+                let mut w = Writer::new();
+                w.u32(0); // empty bitmap
+                return OpResult {
+                    opnum: OP_SETATTR,
+                    status: NFS4ERR_NOFILEHANDLE,
+                    body: w.into_bytes(),
+                };
+            }
         };
         let mut sa = SetAttrs {
             mode: None,
