@@ -61,12 +61,15 @@ impl Ops {
         self.n += 1;
     }
     fn open(&mut self, clientid: u64, owner: &[u8], flags: u32, name: &[u8]) {
+        self.open_seqid(clientid, owner, flags, name, 1);
+    }
+    fn open_seqid(&mut self, clientid: u64, owner: &[u8], flags: u32, name: &[u8], seqid: u32) {
         // flags: bits[1:0]=share_access, bits[5:4]=share_deny (same convention
         // as the test call sites use, e.g. 0x23 = access=BOTH(3)|deny=WRITE(2)<<4).
         let share_access = flags & 0x3;
         let share_deny = (flags >> 4) & 0x3;
         self.w.u32(OP_OPEN);
-        self.w.u32(1); // seqid (RFC 7530 §16.16 — first field)
+        self.w.u32(seqid); // open_owner seqid (must increment per owner)
         self.w.u32(share_access); // share_access
         self.w.u32(share_deny); // share_deny
         self.w.u64(clientid); // open_owner4.clientid
@@ -399,12 +402,12 @@ fn p6_state_gate() {
     // Client1 has DENY_WRITE, so client2 can't open for write. Let's have
     // client1 close and reopen without deny for the lock test.
     let mut ops = Ops::new();
-    ops.close(1, &sid1);
+    ops.close(2, &sid1); // seqid 2 = next after OPEN's seqid 1
     c.call(ops.finish());
     // Reopen without deny.
     let mut ops = Ops::new();
     ops.putfh(&uuid, shared_ino);
-    ops.open(cid1, b"owner1", 0x03, b"file1");
+    ops.open_seqid(cid1, b"owner1", 0x03, b"file1", 3); // seqid 3 = next after CLOSE's 2
     let res = c.call(ops.finish());
     let sid1b = match res[1] {
         R::StateId(s) => s,

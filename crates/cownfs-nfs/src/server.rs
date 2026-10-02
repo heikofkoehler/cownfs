@@ -16,13 +16,13 @@ use crate::nfs4::{
     NFS4ERR_BADXDR, NFS4ERR_BAD_COOKIE, NFS4ERR_EXIST, NFS4ERR_EXPIRED, NFS4ERR_INVAL,
     NFS4ERR_ISDIR, NFS4ERR_NAMETOOLONG, NFS4ERR_NOENT, NFS4ERR_NOFILEHANDLE, NFS4ERR_NOTDIR,
     NFS4ERR_NOTSUPP, NFS4ERR_OP_ILLEGAL, NFS4ERR_RECALLCONFLICT, NFS4ERR_ROFS,
-    NFS4ERR_SEQ_MISORDERED, NFS4ERR_SERVERFAULT, NFS4ERR_STALE, NFS4ERR_STALE_CLIENTID, NFS4ERR_TOOSMALL, NFS4_OK,
-    OPEN4_CREATE, OP_ACCESS, OP_CLOSE, OP_COMMIT, OP_CREATE, OP_CREATE_SESSION,
-    OP_DESTROY_CLIENTID, OP_DESTROY_SESSION, OP_EXCHANGE_ID, OP_GETATTR, OP_GETFH, OP_ILLEGAL,
-    OP_LAYOUTCOMMIT, OP_LAYOUTGET, OP_LAYOUTRETURN, OP_LINK, OP_LOCK, OP_LOCKU, OP_LOOKUP,
-    OP_LOOKUPP, OP_OPEN, OP_OPEN_DOWNGRADE, OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_REMOVE,
-    OP_RENAME, OP_RENEW, OP_RESTOREFH, OP_SAVEFH, OP_SECINFO, OP_SEQUENCE, OP_SETATTR,
-    OP_SETCLIENTID, OP_SETCLIENTID_CONFIRM, OP_WRITE, UNCHECKED4,
+    NFS4ERR_SEQ_MISORDERED, NFS4ERR_SERVERFAULT, NFS4ERR_STALE, NFS4ERR_STALE_CLIENTID,
+    NFS4ERR_TOOSMALL, NFS4_OK, OPEN4_CREATE, OP_ACCESS, OP_CLOSE, OP_COMMIT, OP_CREATE,
+    OP_CREATE_SESSION, OP_DESTROY_CLIENTID, OP_DESTROY_SESSION, OP_EXCHANGE_ID, OP_GETATTR,
+    OP_GETFH, OP_ILLEGAL, OP_LAYOUTCOMMIT, OP_LAYOUTGET, OP_LAYOUTRETURN, OP_LINK, OP_LOCK,
+    OP_LOCKU, OP_LOOKUP, OP_LOOKUPP, OP_OPEN, OP_OPEN_DOWNGRADE, OP_PUTFH, OP_PUTROOTFH, OP_READ,
+    OP_READDIR, OP_REMOVE, OP_RENAME, OP_RENEW, OP_RESTOREFH, OP_SAVEFH, OP_SECINFO, OP_SEQUENCE,
+    OP_SETATTR, OP_SETCLIENTID, OP_SETCLIENTID_CONFIRM, OP_WRITE, UNCHECKED4,
 };
 use crate::rpc::{self, Call, RecordReader, RpcError};
 use crate::state::StateManager;
@@ -349,11 +349,7 @@ impl Session {
             Op::GetFh => match self.cfh {
                 Some(ino) => {
                     let mut w = Writer::new();
-                    let gen = self
-                        .fs()
-                        .getattr(ino)
-                        .map(|a| a.gen as u32)
-                        .unwrap_or(0);
+                    let gen = self.fs().getattr(ino).map(|a| a.gen as u32).unwrap_or(0);
                     FileHandle {
                         fs_uuid: self.fs().uuid(),
                         inode: ino,
@@ -931,8 +927,13 @@ impl Session {
             Err(e) => return OpResult::err(OP_READDIR, fs_to_nfs(e)),
         };
         // cookie 0 starts at the beginning; otherwise resume after the
-        // entry whose cookie matches. Cookies are 1-based indices.
-        let start = if cookie == 0 { 0 } else { cookie as usize };
+        // entry whose cookie matches. Cookies are 3-based (1 and 2 are
+        // reserved per pynfs RDDR10).
+        let start = if cookie == 0 {
+            0
+        } else {
+            (cookie - 2) as usize
+        };
         let mut w = Writer::new();
         w.u64(0); // cookieverf (we don't change directories mid-read)
         let mut bytes_used: u32 = 16; // cookieverf + eof flag estimate
@@ -947,7 +948,7 @@ impl Session {
             let vals = AttrValues::encode(mask, &fa);
             // entry: cookie, name, attrs, next-entry flag
             let mut ew = Writer::new();
-            ew.u64((idx + 1) as u64);
+            ew.u64((idx + 3) as u64); // 3-based: 1 and 2 are reserved
             ew.opaque(name);
             vals.encode_result(&mut ew);
             let entry_bytes = ew.bytes().len() as u32 + 4; // + value_follows

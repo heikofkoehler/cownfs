@@ -12,14 +12,14 @@ use cownfs_core::engine::ROOT_INO;
 use cownfs_nfs::nfs4::*;
 
 #[test]
-fn getfh_without_cfh_is_inval() {
+fn getfh_without_cfh_is_nofilehandle() {
     let srv = spawn_server(4096);
     let mut c = NfsClient::connect(&srv.addr);
     let mut ops = Ops::new();
     ops.getfh();
     let (overall, res) = c.call(b"getfh-nocfh", ops);
-    assert_eq!(overall, NFS4ERR_INVAL);
-    assert!(matches!(res[0], Reply::Err(NFS4ERR_INVAL)));
+    assert_eq!(overall, NFS4ERR_NOFILEHANDLE);
+    assert!(matches!(res[0], Reply::Err(NFS4ERR_NOFILEHANDLE)));
 }
 
 #[test]
@@ -27,14 +27,14 @@ fn bad_filehandle_fails_boundedly() {
     let srv = spawn_server(4096);
     let mut c = NfsClient::connect(&srv.addr);
 
-    // Garbage magic: the whole COMPOUND fails to decode -> SERVERFAULT,
+    // Garbage magic: the whole COMPOUND fails to decode -> BADXDR,
     // zero op results.
     let mut w = cownfs_nfs::xdr::Writer::new();
     w.opaque(&[0xFFu8; 32]);
     let mut ops = Ops::new();
     ops.putfh_raw(&w.into_bytes());
     let (overall, res) = c.call(b"bad-magic", ops);
-    assert_eq!(overall, NFS4ERR_SERVERFAULT);
+    assert_eq!(overall, NFS4ERR_BADXDR);
     assert!(res.is_empty());
 
     // Well-formed handle, foreign fs uuid -> INVAL on the op.
@@ -299,12 +299,14 @@ fn create_errors() {
     let srv = spawn_server(4096);
     let mut c = NfsClient::connect(&srv.addr);
 
-    // CREATE supports regular files (RFC 7530 §15.3), not just dirs/symlinks.
+    // Regular files are created via OPEN, not CREATE: NF4REG via CREATE
+    // is NFS4ERR_BADTYPE.
     let mut ops = Ops::new();
     ops.putfh(&srv.uuid, ROOT_INO);
     ops.create_raw(NF4REG, None, b"f");
-    let res = c.check_ok(b"create-reg", ops);
-    assert!(matches!(res[1], Reply::Ok));
+    let (overall, res) = c.call(b"create-reg", ops);
+    assert_eq!(overall, NFS4ERR_BADTYPE);
+    assert!(matches!(res[1], Reply::Err(NFS4ERR_BADTYPE)));
 
     // Unsupported ftype (e.g. socket) -> NOTSUPP.
     let mut ops = Ops::new();

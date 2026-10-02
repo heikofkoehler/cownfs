@@ -238,7 +238,11 @@ impl FileHandle {
         fs_uuid.copy_from_slice(&b[4..20]);
         let inode = u64::from_be_bytes(b[20..28].try_into().unwrap());
         let gen = u32::from_be_bytes(b[28..32].try_into().unwrap());
-        Ok(FileHandle { fs_uuid, inode, gen })
+        Ok(FileHandle {
+            fs_uuid,
+            inode,
+            gen,
+        })
     }
 }
 

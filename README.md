@@ -1,16 +1,16 @@
 # cownfs
 
 A from-scratch userspace copy-on-write filesystem in the spirit of ZFS/Btrfs,
-written in Rust, exported **only** over NFSv4.0. No local mount, no FUSE — one
-server binary, mountable from any OS with an NFS client.
+written in Rust, exported over NFS. One server binary, mountable from any OS
+with an NFS client — no local mount, no FUSE, no Ganesha.
 
 ## Status
 
-**Working prototype, not production.** All seven implementation phases (P0–P7)
-are done: the engine formats, mounts (over NFS), mutates, snapshots, and
-survives fault injection. 56 tests pass, including a 20k-op shadow-model stress
-test and an NFSv4 client-driven mutation suite. Benchmarks live in
-[docs/benchmark.md](docs/benchmark.md).
+**Working prototype, not production.** The core engine (P0–P7) is done and
+heavily tested: it formats, serves NFSv4.0, mutates, snapshots, replicates,
+and survives fault injection. 158 tests pass over the wire against the real
+server, including a kernel-tarball workload test, multi-client concurrency
+tests, and real-world client-pattern tests derived from macOS traces.
 
 What works:
 
@@ -25,21 +25,42 @@ What works:
 - **P4** — hand-rolled RPC/XDR and a read-only NFSv4.0 server
 - **P5** — NFSv4 mutation path (OPEN/CREATE/WRITE/COMMIT/REMOVE/RENAME/…)
   with a userspace test client
-- **P6** — NFSv4 state management (clientids, opens, locks, seqids)
+- **P6** — NFSv4 state management (clientids, opens, locks, seqids,
+  share/deny, OPEN_DOWNGRADE)
 - **P7** — fault injection, unreachable-block reclaim (`fsck --reclaim`),
   soak test, malformed-XDR handling
+- **P8–P11** — wire-level test harness (real TCP, ephemeral ports) + 40 tests:
+  error paths, attribute coverage, I/O semantics, state machine
+- **P12** — shared filesystem and NFSv4 state across connections; concurrent
+  per-connection serving with multi-client tests
+- **P13** — real-world client patterns: macOS `SECINFO` compounds, getattr-heavy
+  lookups, invalid UTF-8 rejection, `GUARDED4`/`EXCLUSIVE4`, `ILLEGAL` op,
+  oversized compounds
+- **P14** — kernel-tarball workload test (untar + content/metadata verification)
+- **P15** — concurrency stress tests
+- **P16** — read-only server mode (for replicas)
+- **P17–P18** — replication: snapshot diff, `cownfs-replicate` send/receive,
+  fault-injection tests, lag metrics
+- **P19** — `cownfs-ds` data server daemon (pNFS building block)
+- **P20** — NFSv4.1 session semantics (`EXCHANGE_ID`, `CREATE_SESSION`,
+  `SEQUENCE`)
+- **P21** — pNFS file layouts (single data server, layout recall)
+
+The server has been exercised against the real macOS NFS client (xnu), which
+exposed and drove fixes for: `GETATTR` with empty attribute masks (ESTALE),
+`ACCESS` write-bit grants (macOS won't attempt CREATE without them), and
+`OP_SECINFO` bundled into lookup/create/remove compounds.
 
 Known gaps (tracked as [GitHub issues](https://github.com/heikofkoehler/cownfs/issues)):
 
-- No full RFC 7530 conformance audit yet — `pynfs` is the target standard
-  but its write/state suites haven't been run
-- The server handles one TCP connection at a time; no tested concurrent
-  multi-client behavior (share/lock/replay across connections)
-- No large-scale validation yet: kernel-tree untar + content/metadata
-  comparison through a real NFS client is still pending
+- No full `pynfs` conformance run yet — it's the target standard; the
+  write/state suites haven't been run end-to-end
+- pNFS is single-data-server only; clustered MDS (phase 4 of the
+  [horizontal scaling plan](docs/horizontal-scaling-plan.md)) is deferred —
+  see [docs/phase4-deferred.md](docs/phase4-deferred.md)
+- By design, v1 has no delegations, Kerberos, or full NFSv4.1 feature set
 - Fault injection doesn't yet cover torn/reordered device writes; no
   multi-hour soak has been run
-- By design, v1 has no delegations, Kerberos, NFSv4.1 sessions, or pNFS
 
 ## Quick start
 
@@ -72,8 +93,7 @@ sudo umount /Volumes/cow
 ```
 
 (On older macOS releases that reject a `4.x` minor, use `vers=4` instead of
-`vers=4.0`. The macOS client path hasn't been exercised against
-cownfs-server yet — so far only the built-in userspace test client has.)
+`vers=4.0`.)
 
 Check and repair the image (either platform):
 
@@ -82,10 +102,16 @@ Check and repair the image (either platform):
 ./target/release/cownfs-fsck --reclaim /tmp/cow.img  # check + reclaim
 ```
 
+Replicate to a second image:
+
+```sh
+./target/release/cownfs-replicate /tmp/cow.img /tmp/replica.img
+```
+
 Tests and benchmarks:
 
 ```sh
-cargo test --workspace                       # 56 tests
+cargo test --workspace                       # 158 tests
 cargo run --release -p cownfs-bench          # throughput/latency numbers
 COWNFS_STRESS_ITERS=50000 cargo test -p cownfs-core --test stress
 ```
@@ -94,14 +120,20 @@ COWNFS_STRESS_ITERS=50000 cargo test -p cownfs-core --test stress
 
 - `crates/cownfs-core/` — block device, superblock, bitmap, checksums (P0);
   CoW B-trees and the filesystem engine (P1–P3, P7)
-- `crates/cownfs-nfs/` — hand-written RPC/XDR, NFSv4.0 COMPOUND dispatcher
-  and state manager (P4–P6); `cownfs-server` binary
+- `crates/cownfs-nfs/` — hand-written RPC/XDR, NFSv4.0 COMPOUND dispatcher,
+  state manager, v4.1 sessions, pNFS layouts (P4–P6, P12–P13, P20–P21);
+  `cownfs-server` binary
 - `crates/cownfs-bench/` — benchmark harness (engine + NFS round trips)
 - `crates/cownfs-mkfs/` — `cownfs-mkfs` binary
 - `crates/cownfs-fsck/` — `cownfs-fsck` binary
+- `crates/cownfs-replicate/` — `cownfs-replicate` binary (P17)
+- `crates/cownfs-ds/` — `cownfs-ds` data server daemon (P19)
 - `docs/` — [architecture-plan.md](docs/architecture-plan.md) (the full
-  design, on-disk format, and phase gates) and
-  [benchmark.md](docs/benchmark.md) (measured numbers)
+  design, on-disk format, and phase gates),
+  [benchmark.md](docs/benchmark.md) (measured numbers),
+  [horizontal-scaling-plan.md](docs/horizontal-scaling-plan.md) (replication
+  → sharding → pNFS → clustered MDS),
+  [sharding.md](docs/sharding.md), [p7-soak-results.md](docs/p7-soak-results.md)
 
 ## Performance snapshot
 
@@ -122,3 +154,5 @@ served from the page cache in these runs.
 - NFS is only the transport: the core engine is fully testable without it,
   and every engine test bypasses NFS.
 - Safety first: Rust, no `unsafe` in the engine's core paths.
+- Interop over purity: when a real client (macOS, Linux) and the spec
+  disagree, the client wins and the deviation is documented.
