@@ -12,12 +12,13 @@ use crate::nfs4::{
     encode_compound, AttrMask, AttrValues, Compound, FileAttrs, FileHandle, NfsError, Op, OpResult,
     StateId, ACCESS4_DELETE, ACCESS4_EXECUTE, ACCESS4_EXTEND, ACCESS4_LOOKUP, ACCESS4_MODIFY,
     ACCESS4_READ, FATTR4_MODE, FATTR4_SIZE, FILE_SYNC4, GUARDED4, NF4DIR, NF4LNK, NF4REG,
-    NFS4ERR_EXIST, NFS4ERR_EXPIRED, NFS4ERR_INVAL, NFS4ERR_ISDIR, NFS4ERR_NOENT, NFS4ERR_NOTDIR,
-    NFS4ERR_NOTSUPP, NFS4ERR_OP_ILLEGAL, NFS4ERR_SERVERFAULT, NFS4ERR_STALE_CLIENTID, NFS4_OK,
-    OPEN4_CREATE, OP_ACCESS, OP_CLOSE, OP_COMMIT, OP_CREATE, OP_GETATTR, OP_GETFH, OP_ILLEGAL,
-    OP_LINK, OP_LOCK, OP_LOCKU, OP_LOOKUP, OP_LOOKUPP, OP_OPEN, OP_PUTFH, OP_PUTROOTFH, OP_READ,
-    OP_READDIR, OP_REMOVE, OP_RENAME, OP_RENEW, OP_RESTOREFH, OP_SAVEFH, OP_SECINFO, OP_SETATTR,
-    OP_SETCLIENTID, OP_SETCLIENTID_CONFIRM, OP_WRITE, UNCHECKED4,
+    NFS4ERR_EXIST, NFS4ERR_EXPIRED, NFS4ERR_INVAL, NFS4ERR_ISDIR, NFS4ERR_NOENT,
+    NFS4ERR_NOFILEHANDLE, NFS4ERR_NOTDIR, NFS4ERR_NOTSUPP, NFS4ERR_OP_ILLEGAL, NFS4ERR_SERVERFAULT,
+    NFS4ERR_STALE_CLIENTID, NFS4_OK, OPEN4_CREATE, OP_ACCESS, OP_CLOSE, OP_COMMIT, OP_CREATE,
+    OP_GETATTR, OP_GETFH, OP_ILLEGAL, OP_LINK, OP_LOCK, OP_LOCKU, OP_LOOKUP, OP_LOOKUPP, OP_OPEN,
+    OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_REMOVE, OP_RENAME, OP_RENEW, OP_RESTOREFH,
+    OP_SAVEFH, OP_SECINFO, OP_SETATTR, OP_SETCLIENTID, OP_SETCLIENTID_CONFIRM, OP_WRITE,
+    UNCHECKED4,
 };
 use crate::rpc::{self, Call, RecordReader, RpcError};
 use crate::state::StateManager;
@@ -194,7 +195,7 @@ impl Session {
                     .encode(&mut w);
                     OpResult::ok(OP_GETFH, w.into_bytes())
                 }
-                None => OpResult::err(OP_GETFH, NFS4ERR_INVAL),
+                None => OpResult::err(OP_GETFH, NFS4ERR_NOFILEHANDLE),
             },
             Op::Lookup(name) => self.op_lookup(name, OP_LOOKUP),
             Op::LookupP => self.op_lookupp(),
@@ -302,8 +303,8 @@ impl Session {
         }
     }
 
-    fn current(&self) -> Result<u64, OpResult> {
-        self.cfh.ok_or(OpResult::err(OP_PUTFH, NFS4ERR_INVAL))
+    fn current(&self, opnum: u32) -> Result<u64, OpResult> {
+        self.cfh.ok_or(OpResult::err(opnum, NFS4ERR_NOFILEHANDLE))
     }
 
     fn op_lookup(&mut self, name: &[u8], opnum: u32) -> OpResult {
@@ -312,7 +313,7 @@ impl Session {
         }
         let ino = match self.cfh {
             Some(i) => i,
-            None => return OpResult::err(opnum, NFS4ERR_INVAL),
+            None => return OpResult::err(opnum, NFS4ERR_NOFILEHANDLE),
         };
         // "." and ".." are handled by LOOKUPP; treat "." as self.
         let result = if name == b"." {
@@ -339,7 +340,7 @@ impl Session {
     fn op_lookupp_inner(&mut self, opnum: u32) -> OpResult {
         let ino = match self.cfh {
             Some(i) => i,
-            None => return OpResult::err(opnum, NFS4ERR_INVAL),
+            None => return OpResult::err(opnum, NFS4ERR_NOFILEHANDLE),
         };
         if ino == ROOT_INO {
             // Root's parent is itself.
@@ -401,7 +402,7 @@ impl Session {
     }
 
     fn op_getattr(&self, mask: &AttrMask) -> OpResult {
-        let ino = match self.current() {
+        let ino = match self.current(OP_GETATTR) {
             Ok(i) => i,
             Err(r) => return r,
         };
@@ -420,7 +421,7 @@ impl Session {
     }
 
     fn op_readdir(&self, cookie: u64, _dircount: u32, maxcount: u32, mask: &AttrMask) -> OpResult {
-        let ino = match self.current() {
+        let ino = match self.current(OP_READDIR) {
             Ok(i) => i,
             Err(r) => return r,
         };
@@ -462,7 +463,7 @@ impl Session {
         OpResult::ok(OP_READDIR, w.into_bytes())
     }
     fn op_read(&self, offset: u64, count: u32) -> OpResult {
-        let ino = match self.current() {
+        let ino = match self.current(OP_READ) {
             Ok(i) => i,
             Err(r) => return r,
         };
@@ -537,7 +538,7 @@ impl Session {
         }
         let dir_ino = match self.cfh {
             Some(i) => i,
-            None => return OpResult::err(OP_OPEN, NFS4ERR_INVAL),
+            None => return OpResult::err(OP_OPEN, NFS4ERR_NOFILEHANDLE),
         };
         // Check the cfh is a directory.
         match self.fs().getattr(dir_ino) {
@@ -608,7 +609,7 @@ impl Session {
         }
         let dir_ino = match self.cfh {
             Some(i) => i,
-            None => return OpResult::err(OP_CREATE, NFS4ERR_INVAL),
+            None => return OpResult::err(OP_CREATE, NFS4ERR_NOFILEHANDLE),
         };
         let (mode, uid, gid) = Self::parse_createattrs(attrs);
         let result = match ftype {
@@ -641,7 +642,7 @@ impl Session {
         }
         let dir_ino = match self.cfh {
             Some(i) => i,
-            None => return OpResult::err(OP_REMOVE, NFS4ERR_INVAL),
+            None => return OpResult::err(OP_REMOVE, NFS4ERR_NOFILEHANDLE),
         };
         // Try unlink first; if it's a dir, use rmdir.
         let ent = match self.fs().lookup(dir_ino, name) {
@@ -695,7 +696,7 @@ impl Session {
         // cfh = source dir, saved_fh = dest dir (via SAVEFH).
         let src_dir = match self.cfh {
             Some(i) => i,
-            None => return OpResult::err(OP_RENAME, NFS4ERR_INVAL),
+            None => return OpResult::err(OP_RENAME, NFS4ERR_NOFILEHANDLE),
         };
         let dst_dir = self.saved_fh.unwrap_or(src_dir);
         match self.fs().rename(src_dir, old, dst_dir, new) {
@@ -721,11 +722,11 @@ impl Session {
         // cfh = existing file, saved_fh = dest dir.
         let file_ino = match self.cfh {
             Some(i) => i,
-            None => return OpResult::err(OP_LINK, NFS4ERR_INVAL),
+            None => return OpResult::err(OP_LINK, NFS4ERR_NOFILEHANDLE),
         };
         let dir_ino = match self.saved_fh {
             Some(i) => i,
-            None => return OpResult::err(OP_LINK, NFS4ERR_INVAL),
+            None => return OpResult::err(OP_LINK, NFS4ERR_NOFILEHANDLE),
         };
         match self.fs().link(file_ino, dir_ino, name) {
             Ok(()) => {
@@ -743,7 +744,7 @@ impl Session {
     fn op_setattr(&mut self, attrs: &[(u32, Vec<u8>)]) -> OpResult {
         let ino = match self.cfh {
             Some(i) => i,
-            None => return OpResult::err(OP_SETATTR, NFS4ERR_INVAL),
+            None => return OpResult::err(OP_SETATTR, NFS4ERR_NOFILEHANDLE),
         };
         let mut sa = SetAttrs {
             mode: None,
@@ -814,7 +815,7 @@ impl Session {
     fn op_write(&mut self, offset: u64, stable: u32, data: &[u8]) -> OpResult {
         let ino = match self.cfh {
             Some(i) => i,
-            None => return OpResult::err(OP_WRITE, NFS4ERR_INVAL),
+            None => return OpResult::err(OP_WRITE, NFS4ERR_NOFILEHANDLE),
         };
         if let Err(e) = self.fs().write(ino, offset, data) {
             return OpResult::err(OP_WRITE, fs_to_nfs(e));
@@ -956,7 +957,7 @@ impl Session {
     }
 
     fn op_access(&self, access: u32) -> OpResult {
-        let ino = match self.current() {
+        let ino = match self.current(OP_ACCESS) {
             Ok(i) => i,
             Err(r) => return r,
         };

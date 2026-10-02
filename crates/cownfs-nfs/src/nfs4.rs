@@ -11,6 +11,7 @@ pub const NFS4ERR_IO: u32 = 5;
 pub const NFS4ERR_ACCESS: u32 = 13;
 pub const NFS4ERR_EXIST: u32 = 17;
 pub const NFS4ERR_NOTDIR: u32 = 20;
+pub const NFS4ERR_NOFILEHANDLE: u32 = 20; // same code as NOTDIR per RFC 7530
 pub const NFS4ERR_ISDIR: u32 = 21;
 pub const NFS4ERR_INVAL: u32 = 22;
 pub const NFS4ERR_NOSPC: u32 = 28;
