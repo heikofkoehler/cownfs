@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::bitmap::Bitmap;
 use crate::block::{BlockDevice, FileDevice};
-use crate::btree::{BTree, NodeId, NodeStore};
+use crate::btree::{BTree, NodeId};
 use crate::store::{self, BlockArena, BlockCodec, Shared, StoreError};
 use crate::superblock::{self, Superblock};
 use crate::BLOCK_SIZE;
@@ -643,6 +643,14 @@ impl Fs {
         let total = self.sb.block_count;
         let used: u64 = (0..total).filter(|&b| sh.bitmap.test(b)).count() as u64;
         total.saturating_sub(used)
+    }
+
+    /// All allocated block numbers. Used for full replication sends.
+    pub fn allocated_blocks(&self) -> Vec<u64> {
+        let sh = self.shared.lock().unwrap();
+        (0..self.sb.block_count)
+            .filter(|&b| sh.bitmap.test(b))
+            .collect()
     }
 
     pub fn generation(&self) -> u64 {
@@ -1574,6 +1582,7 @@ impl Fs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::btree::NodeStore;
 
     fn test_fs(blocks: u64) -> (Fs, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!(

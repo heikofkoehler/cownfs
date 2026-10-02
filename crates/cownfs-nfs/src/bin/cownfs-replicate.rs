@@ -1,0 +1,388 @@
+//! cownfs-replicate: ship snapshots from a primary to a read replica.
+//!
+//! Usage:
+//!   cownfs-replicate send <primary-image> <replica-addr> [--state <file>]
+//!   cownfs-replicate receive <replica-image> [listen-addr]
+//!
+//! The sender diffs the primary's current roots against the last-replicated
+//! roots (stored in the state file), reads the changed 4KiB blocks, and
+//! streams them to the receiver. The receiver writes blocks to its image,
+//! verifies node-block checksums, and fsyncs on COMMIT. The superblock
+//! slots and active bitmap area are always sent, so the replica's roots,
+//! generation, and allocator state advance atomically with the data.
+
+use std::collections::HashSet;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+
+use cownfs_core::block::{BlockDevice, FileDevice};
+use cownfs_core::engine::{Fs, FsRoots};
+use cownfs_core::superblock::{self, SLOT_BLOCKS};
+use cownfs_core::{Block, BLOCK_SIZE};
+
+const MAGIC: u32 = 0x434F_5752; // "COWR"
+const VERSION: u32 = 1;
+
+const MSG_SNAPSHOT: u8 = 1;
+const MSG_BLOCK: u8 = 2;
+const MSG_COMMIT: u8 = 3;
+const MSG_ACK: u8 = 4;
+const MSG_ERROR: u8 = 5;
+
+/// Node block magic (from store.rs): used to detect node blocks for
+/// checksum verification on receipt.
+const NODE_MAGIC: u16 = 0xB72E;
+
+fn read_u32(r: &mut TcpStream) -> std::io::Result<u32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    Ok(u32::from_be_bytes(b))
+}
+
+fn read_u64(r: &mut TcpStream) -> std::io::Result<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_be_bytes(b))
+}
+
+fn write_u32(w: &mut TcpStream, v: u32) -> std::io::Result<()> {
+    w.write_all(&v.to_be_bytes())
+}
+
+fn write_u64(w: &mut TcpStream, v: u64) -> std::io::Result<()> {
+    w.write_all(&v.to_be_bytes())
+}
+
+fn read_roots(r: &mut TcpStream) -> std::io::Result<(FsRoots, u64)> {
+    let mut get = || -> std::io::Result<(u64, u32)> {
+        let blk = read_u64(r)?;
+        let gen = read_u32(r)?;
+        Ok((blk, gen))
+    };
+    let (ib, ig) = get()?;
+    let (db, dg) = get()?;
+    let (eb, eg) = get()?;
+    let (sb, sg) = get()?;
+    let generation = read_u64(r)?;
+    Ok((
+        FsRoots {
+            inode: cownfs_core::btree::NodeId { idx: ib, gen: ig },
+            dir: cownfs_core::btree::NodeId { idx: db, gen: dg },
+            extent: cownfs_core::btree::NodeId { idx: eb, gen: eg },
+            snap: cownfs_core::btree::NodeId { idx: sb, gen: sg },
+        },
+        generation,
+    ))
+}
+
+fn write_roots(w: &mut TcpStream, roots: &FsRoots, generation: u64) -> std::io::Result<()> {
+    for (blk, gen) in [
+        (roots.inode.idx, roots.inode.gen),
+        (roots.dir.idx, roots.dir.gen),
+        (roots.extent.idx, roots.extent.gen),
+        (roots.snap.idx, roots.snap.gen),
+    ] {
+        write_u64(w, blk)?;
+        write_u32(w, gen)?;
+    }
+    write_u64(w, generation)
+}
+
+fn state_path(image: &Path, override_: Option<&str>) -> PathBuf {
+    match override_ {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let mut p = image.as_os_str().to_owned();
+            p.push(".repl");
+            PathBuf::from(p)
+        }
+    }
+}
+
+fn load_state(path: &Path) -> Option<(FsRoots, u64)> {
+    let data = std::fs::read(path).ok()?;
+    if data.len() != 4 * 12 + 8 {
+        return None;
+    }
+    let mut off = 0;
+    let mut get = || {
+        let blk = u64::from_be_bytes(data[off..off + 8].try_into().unwrap());
+        let gen = u32::from_be_bytes(data[off + 8..off + 12].try_into().unwrap());
+        off += 12;
+        (blk, gen)
+    };
+    let (ib, ig) = get();
+    let (db, dg) = get();
+    let (eb, eg) = get();
+    let (sb, sg) = get();
+    let generation = u64::from_be_bytes(data[off..off + 8].try_into().unwrap());
+    Some((
+        FsRoots {
+            inode: cownfs_core::btree::NodeId { idx: ib, gen: ig },
+            dir: cownfs_core::btree::NodeId { idx: db, gen: dg },
+            extent: cownfs_core::btree::NodeId { idx: eb, gen: eg },
+            snap: cownfs_core::btree::NodeId { idx: sb, gen: sg },
+        },
+        generation,
+    ))
+}
+
+fn save_state(path: &Path, roots: &FsRoots, generation: u64) -> std::io::Result<()> {
+    let mut data = Vec::with_capacity(4 * 12 + 8);
+    for (blk, gen) in [
+        (roots.inode.idx, roots.inode.gen),
+        (roots.dir.idx, roots.dir.gen),
+        (roots.extent.idx, roots.extent.gen),
+        (roots.snap.idx, roots.snap.gen),
+    ] {
+        data.extend_from_slice(&blk.to_be_bytes());
+        data.extend_from_slice(&gen.to_be_bytes());
+    }
+    data.extend_from_slice(&generation.to_be_bytes());
+    std::fs::write(path, data)
+}
+
+fn send_error(s: &mut TcpStream, msg: &str) {
+    let _ = write_u32(s, MAGIC);
+    let _ = write_u32(s, VERSION);
+    let _ = s.write_all(&[MSG_ERROR]);
+    let b = msg.as_bytes();
+    let _ = write_u32(s, b.len() as u32);
+    let _ = s.write_all(b);
+}
+
+fn do_send(primary: &Path, replica_addr: &str, state_file: Option<&str>) -> Result<(), String> {
+    let spath = state_path(primary, state_file);
+    let mut fs = Fs::open(primary).map_err(|e| format!("open primary: {e:?}"))?;
+    let dev = FileDevice::open(primary).map_err(|e| format!("open device: {e}"))?;
+
+    let cur_roots = fs.roots();
+    let cur_gen = fs.generation();
+
+    // Determine the block set: incremental diff or full send.
+    let mut blocks: HashSet<u64> = HashSet::new();
+    let is_incremental = match load_state(&spath) {
+        Some((old_roots, _)) => {
+            let diff = fs
+                .diff_roots(&old_roots)
+                .map_err(|e| format!("diff: {e:?}"))?;
+            blocks.extend(diff);
+            true
+        }
+        None => {
+            blocks.extend(fs.allocated_blocks());
+            false
+        }
+    };
+
+    // Always send superblock slots and the active bitmap area: the
+    // replica's roots, generation, and allocator advance with the data.
+    let (sb, _) = superblock::open(&dev).map_err(|e| format!("read sb: {e:?}"))?;
+    let bitmap_start = sb.bitmap_start;
+    let bitmap_blocks = sb.bitmap_blocks;
+    let bitmap_area = sb.bitmap_area;
+    for slot in SLOT_BLOCKS {
+        blocks.insert(slot);
+    }
+    let area_start = bitmap_start + bitmap_area * bitmap_blocks;
+    for b in area_start..area_start + bitmap_blocks {
+        blocks.insert(b);
+    }
+
+    eprintln!(
+        "{} send: {} blocks (gen {cur_gen})",
+        if is_incremental {
+            "incremental"
+        } else {
+            "full"
+        },
+        blocks.len()
+    );
+
+    let mut stream = TcpStream::connect(replica_addr).map_err(|e| format!("connect: {e}"))?;
+
+    // HELLO
+    write_u32(&mut stream, MAGIC).map_err(|e| e.to_string())?;
+    write_u32(&mut stream, VERSION).map_err(|e| e.to_string())?;
+
+    // SNAPSHOT
+    stream
+        .write_all(&[MSG_SNAPSHOT])
+        .map_err(|e| e.to_string())?;
+    write_roots(&mut stream, &cur_roots, cur_gen).map_err(|e| e.to_string())?;
+    write_u64(&mut stream, fs.block_count()).map_err(|e| e.to_string())?;
+
+    // BLOCKs
+    let mut blk = [0u8; BLOCK_SIZE];
+    let mut sorted: Vec<u64> = blocks.into_iter().collect();
+    sorted.sort_unstable();
+    for id in &sorted {
+        dev.read_block(*id, &mut blk)
+            .map_err(|e| format!("read block {id}: {e}"))?;
+        stream.write_all(&[MSG_BLOCK]).map_err(|e| e.to_string())?;
+        write_u64(&mut stream, *id).map_err(|e| e.to_string())?;
+        stream.write_all(&blk).map_err(|e| e.to_string())?;
+    }
+
+    // COMMIT
+    stream.write_all(&[MSG_COMMIT]).map_err(|e| e.to_string())?;
+    write_u64(&mut stream, cur_gen).map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())?;
+
+    // ACK
+    let magic = read_u32(&mut stream).map_err(|e| e.to_string())?;
+    let _ver = read_u32(&mut stream).map_err(|e| e.to_string())?;
+    if magic != MAGIC {
+        return Err("bad magic in reply".into());
+    }
+    let mut tag = [0u8; 1];
+    stream.read_exact(&mut tag).map_err(|e| e.to_string())?;
+    match tag[0] {
+        MSG_ACK => {
+            let status = read_u32(&mut stream).map_err(|e| e.to_string())?;
+            if status != 0 {
+                return Err(format!("replica reported error status {status}"));
+            }
+        }
+        MSG_ERROR => {
+            let len = read_u32(&mut stream).map_err(|e| e.to_string())? as usize;
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf).map_err(|e| e.to_string())?;
+            return Err(format!("replica error: {}", String::from_utf8_lossy(&buf)));
+        }
+        t => return Err(format!("unexpected reply tag {t}")),
+    }
+
+    save_state(&spath, &cur_roots, cur_gen).map_err(|e| e.to_string())?;
+    eprintln!("replicated {} blocks, gen {cur_gen}", sorted.len());
+    Ok(())
+}
+
+fn verify_node_checksum(blk: &Block) -> bool {
+    // Node blocks have magic u16 at [0..2] and CRC32C u64 at [16..24].
+    // Only verify if the magic matches; data blocks are skipped.
+    let magic = u16::from_le_bytes(blk[0..2].try_into().unwrap_or([0; 2]));
+    if magic != NODE_MAGIC {
+        return true; // Not a node block — nothing to verify.
+    }
+    let stored = u64::from_le_bytes(blk[16..24].try_into().unwrap_or([0; 8]));
+    let mut tmp = *blk;
+    tmp[16..24].copy_from_slice(&[0u8; 8]);
+    cownfs_core::checksum::checksum(&tmp) == stored
+}
+
+fn do_receive(image: &Path, listen_addr: &str) -> Result<(), String> {
+    let listener = TcpListener::bind(listen_addr).map_err(|e| format!("bind: {e}"))?;
+    eprintln!("replica listening on {listen_addr} for {image:?}");
+    let (mut stream, peer) = listener.accept().map_err(|e| format!("accept: {e}"))?;
+    eprintln!("connection from {peer}");
+
+    let magic = read_u32(&mut stream).map_err(|e| e.to_string())?;
+    let version = read_u32(&mut stream).map_err(|e| e.to_string())?;
+    if magic != MAGIC || version != VERSION {
+        send_error(&mut stream, "bad hello");
+        return Err("bad hello".into());
+    }
+
+    let mut dev = FileDevice::open(image).map_err(|e| format!("open image: {e}"))?;
+    let mut blocks_received = 0u64;
+
+    loop {
+        let mut tag = [0u8; 1];
+        if stream.read_exact(&mut tag).is_err() {
+            send_error(&mut stream, "unexpected EOF");
+            return Err("unexpected EOF".into());
+        }
+        match tag[0] {
+            MSG_SNAPSHOT => {
+                let (_roots, _gen) = read_roots(&mut stream).map_err(|e| e.to_string())?;
+                let block_count = read_u64(&mut stream).map_err(|e| e.to_string())?;
+                if block_count != dev.block_count() {
+                    send_error(&mut stream, "block count mismatch");
+                    return Err(format!(
+                        "block count mismatch: replica {}, primary {block_count}",
+                        dev.block_count()
+                    ));
+                }
+            }
+            MSG_BLOCK => {
+                let id = read_u64(&mut stream).map_err(|e| e.to_string())?;
+                let mut blk = [0u8; BLOCK_SIZE];
+                stream.read_exact(&mut blk).map_err(|e| e.to_string())?;
+                if !verify_node_checksum(&blk) {
+                    send_error(&mut stream, "node checksum mismatch");
+                    return Err(format!("node checksum mismatch on block {id}"));
+                }
+                dev.write_block(id, &blk)
+                    .map_err(|e| format!("write block {id}: {e}"))?;
+                blocks_received += 1;
+            }
+            MSG_COMMIT => {
+                let gen = read_u64(&mut stream).map_err(|e| e.to_string())?;
+                dev.sync().map_err(|e| format!("sync: {e}"))?;
+                // ACK
+                write_u32(&mut stream, MAGIC).map_err(|e| e.to_string())?;
+                write_u32(&mut stream, VERSION).map_err(|e| e.to_string())?;
+                stream.write_all(&[MSG_ACK]).map_err(|e| e.to_string())?;
+                write_u32(&mut stream, 0).map_err(|e| e.to_string())?;
+                stream.flush().map_err(|e| e.to_string())?;
+                eprintln!("committed gen {gen}: {blocks_received} blocks");
+                return Ok(());
+            }
+            t => {
+                send_error(&mut stream, "unknown message");
+                return Err(format!("unknown message tag {t}"));
+            }
+        }
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let result = match args.get(1).map(|s| s.as_str()) {
+        Some("send") => {
+            let primary = args.get(2).cloned().unwrap_or_default();
+            let addr = args.get(3).cloned().unwrap_or_default();
+            let mut state: Option<String> = None;
+            let mut i = 4;
+            while i < args.len() {
+                if args[i] == "--state" && i + 1 < args.len() {
+                    state = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if primary.is_empty() || addr.is_empty() {
+                eprintln!(
+                    "usage: cownfs-replicate send <primary-image> <replica-addr> [--state <file>]"
+                );
+                std::process::exit(1);
+            }
+            do_send(Path::new(&primary), &addr, state.as_deref())
+        }
+        Some("receive") => {
+            let image = args.get(2).cloned().unwrap_or_default();
+            let addr = args
+                .get(3)
+                .cloned()
+                .unwrap_or_else(|| "127.0.0.1:2050".into());
+            if image.is_empty() {
+                eprintln!("usage: cownfs-replicate receive <replica-image> [listen-addr]");
+                std::process::exit(1);
+            }
+            do_receive(Path::new(&image), &addr)
+        }
+        _ => {
+            eprintln!("usage:");
+            eprintln!("  cownfs-replicate send <primary-image> <replica-addr> [--state <file>]");
+            eprintln!("  cownfs-replicate receive <replica-image> [listen-addr]");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = result {
+        eprintln!("replicate error: {e}");
+        std::process::exit(1);
+    }
+}
