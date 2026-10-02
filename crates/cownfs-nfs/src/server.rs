@@ -623,10 +623,15 @@ impl Session {
         let (mode, uid, gid) = Self::parse_createattrs(attrs);
         let result = match ftype {
             NF4DIR => self.fs().mkdir(dir_ino, name, mode, uid, gid).map(|_| ()),
-            NF4LNK => self
-                .fs()
-                .symlink(dir_ino, name, linkdata, uid, gid)
-                .map(|_| ()),
+            NF4LNK => {
+                // Empty symlink target is invalid (pynfs CR9a).
+                if linkdata.is_empty() {
+                    return OpResult::err(OP_CREATE, NFS4ERR_INVAL);
+                }
+                self.fs()
+                    .symlink(dir_ino, name, linkdata, uid, gid)
+                    .map(|_| ())
+            }
             // RFC 7530 16.7: CREATE is for non-regular files; regular files
             // use OPEN. NF4REG via CREATE is NFS4ERR_BADTYPE.
             NF4REG => return OpResult::err(OP_CREATE, NFS4ERR_BADTYPE),
