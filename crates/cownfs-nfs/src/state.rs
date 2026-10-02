@@ -211,7 +211,8 @@ impl StateManager {
         share_deny: u32,
     ) -> Result<OpenRecord, NfsError> {
         self.check_client(clientid)?;
-        // Check share conflicts with existing opens on the same file.
+        // Check share conflicts with existing opens on the same file
+        // (excluding our own opens from the same client).
         for (_, o) in self.opens.iter() {
             if o.file_ino != file_ino || o.clientid == clientid {
                 continue;
@@ -221,6 +222,21 @@ impl StateManager {
             let access_conflict = (share_deny & o.share_access) != 0;
             if deny_conflict || access_conflict {
                 return Err(NfsError::Status(NFS4ERR_DENIED));
+            }
+        }
+        let key = (clientid, owner.clone());
+        // If the same open_owner reopens the same file, merge share modes
+        // (upgrade) instead of creating a duplicate. Accept any seqid for
+        // the upgrade to be lenient with client seqid tracking.
+        if let Some(existing) = self.opens.get_mut(&key) {
+            if existing.file_ino == file_ino {
+                existing.share_access |= share_access;
+                existing.share_deny |= share_deny;
+                existing.seqid = seqid;
+                existing.stateid.seqid += 1;
+                let rec = existing.clone();
+                self.renew_lease(clientid);
+                return Ok(rec);
             }
         }
         let stateid = self.new_stateid();
@@ -233,7 +249,7 @@ impl StateManager {
             share_deny,
             seqid,
         };
-        self.opens.insert((clientid, owner), rec.clone());
+        self.opens.insert(key, rec.clone());
         self.renew_lease(clientid);
         Ok(rec)
     }
