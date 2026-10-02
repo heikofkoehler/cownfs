@@ -156,6 +156,15 @@ impl Session {
         Ok(())
     }
 
+    /// Check for '.'/'..' in mutating ops (CREATE/REMOVE/RENAME/LINK).
+    /// LOOKUP of '.'/'..' is legal; creating/removing them is not.
+    fn check_dots(name: &[u8], opnum: u32) -> Result<(), OpResult> {
+        if name == b"." || name == b".." {
+            return Err(OpResult::err(opnum, NFS4ERR_BADNAME));
+        }
+        Ok(())
+    }
+
     /// Lock the NFSv4 client/open/lock table.
     fn state(&self) -> std::sync::MutexGuard<'_, StateManager> {
         self.shared.state.lock().unwrap()
@@ -620,6 +629,9 @@ impl Session {
         if let Err(e) = Self::check_name(name, OP_CREATE) {
             return e;
         }
+        if let Err(e) = Self::check_dots(name, OP_CREATE) {
+            return e;
+        }
         let dir_ino = match self.cfh {
             Some(i) => i,
             None => return OpResult::err(OP_CREATE, NFS4ERR_NOFILEHANDLE),
@@ -661,6 +673,9 @@ impl Session {
 
     fn op_remove(&mut self, name: &[u8]) -> OpResult {
         if let Err(e) = Self::check_name(name, OP_REMOVE) {
+            return e;
+        }
+        if let Err(e) = Self::check_dots(name, OP_REMOVE) {
             return e;
         }
         let dir_ino = match self.cfh {
@@ -716,6 +731,12 @@ impl Session {
         if let Err(e) = Self::check_name(new, OP_RENAME) {
             return e;
         }
+        if let Err(e) = Self::check_dots(old, OP_RENAME) {
+            return e;
+        }
+        if let Err(e) = Self::check_dots(new, OP_RENAME) {
+            return e;
+        }
         // cfh = source dir, saved_fh = dest dir (via SAVEFH).
         let src_dir = match self.cfh {
             Some(i) => i,
@@ -740,6 +761,9 @@ impl Session {
 
     fn op_link(&mut self, name: &[u8]) -> OpResult {
         if let Err(e) = Self::check_name(name, OP_LINK) {
+            return e;
+        }
+        if let Err(e) = Self::check_dots(name, OP_LINK) {
             return e;
         }
         // cfh = existing file, saved_fh = dest dir.
