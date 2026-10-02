@@ -214,7 +214,8 @@ impl Session {
     }
 
     fn run(&mut self, compound: &Compound) -> Vec<OpResult> {
-        // Current and saved filehandles are per-COMPOUND (RFC 7530 §2.6).
+        // Current and saved filehandles are per-COMPOUND (RFC 7530 §2.6):
+        // each COMPOUND starts with no cfh/sfh. Clients must PUTFH first.
         self.cfh = None;
         self.saved_fh = None;
         // NFSv4.1: if the first op is SEQUENCE, run with exactly-once

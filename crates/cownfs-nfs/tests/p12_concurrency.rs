@@ -188,9 +188,11 @@ fn cross_connection_lock_conflict() {
     let res = ca.check_ok(b"open-a", ops);
     let sa = open_stateid(&res[1]);
     let mut ops = Ops::new();
+    ops.putfh(&srv.uuid, ROOT_INO);
+    ops.lookup(b"lock.dat");
     ops.lock_new(ida, WRITE_LT, 0, 100, &sa, b"la");
     let res = ca.check_ok(b"lock-a", ops);
-    let sla = lock_stateid(&res[0]);
+    let sla = lock_stateid(&res[2]);
 
     // Four other connections try an overlapping lock: all must be LOCKED.
     // A disjoint range on each must succeed.
@@ -211,12 +213,16 @@ fn cross_connection_lock_conflict() {
             let sb = open_stateid(&res[1]);
             barrier.wait();
             let mut ops = Ops::new();
+            ops.putfh(&uuid, ROOT_INO);
+            ops.lookup(b"lock.dat");
             ops.lock_new(id, WRITE_LT, 50, 100, &sb, b"lb");
             let (overall, res) = c.call(b"lock-overlap", ops);
             assert_eq!(overall, NFS4ERR_LOCKED, "thread {i}: expected LOCKED");
-            assert!(matches!(res[0], Reply::Err(NFS4ERR_LOCKED)));
+            assert!(matches!(res[2], Reply::Err(NFS4ERR_LOCKED)));
             // Disjoint range is fine even while A holds 0..100.
             let mut ops = Ops::new();
+            ops.putfh(&uuid, ROOT_INO);
+            ops.lookup(b"lock.dat");
             ops.lock_new(id, WRITE_LT, 1000 + (i as u64) * 100, 100, &sb, b"lb2");
             c.check_ok(b"lock-disjoint", ops);
         }));
@@ -238,6 +244,8 @@ fn cross_connection_lock_conflict() {
     let res = cb.check_ok(b"open-c", ops);
     let sc = open_stateid(&res[1]);
     let mut ops = Ops::new();
+    ops.putfh(&srv.uuid, ROOT_INO);
+    ops.lookup(b"lock.dat");
     ops.lock_new(idb, WRITE_LT, 0, 100, &sc, b"lc");
     cb.check_ok(b"relock", ops);
 }

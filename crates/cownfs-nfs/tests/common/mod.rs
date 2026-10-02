@@ -891,7 +891,12 @@ impl NfsClient {
     /// Like `call`, but asserts the overall status and every op is NFS4_OK.
     pub fn check_ok(&mut self, tag: &[u8], ops: Ops) -> Vec<Reply> {
         let (overall, res) = self.call(tag, ops);
-        assert_eq!(overall, nfs4::NFS4_OK, "compound failed: {res:?}");
+        assert_eq!(
+            overall,
+            nfs4::NFS4_OK,
+            "compound {} failed: {res:?}",
+            String::from_utf8_lossy(tag)
+        );
         for r in &res {
             r.expect_ok();
         }
