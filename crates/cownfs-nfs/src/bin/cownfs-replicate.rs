@@ -109,9 +109,9 @@ fn state_path(image: &Path, override_: Option<&str>) -> PathBuf {
     }
 }
 
-fn load_state(path: &Path) -> Option<(FsRoots, u64)> {
+fn load_state(path: &Path) -> Option<(FsRoots, u64, [u8; 16])> {
     let data = std::fs::read(path).ok()?;
-    if data.len() != 4 * 12 + 8 {
+    if data.len() != 4 * 12 + 8 + 16 {
         return None;
     }
     let mut off = 0;
@@ -126,6 +126,9 @@ fn load_state(path: &Path) -> Option<(FsRoots, u64)> {
     let (eb, eg) = get();
     let (sb, sg) = get();
     let generation = u64::from_be_bytes(data[off..off + 8].try_into().unwrap());
+    off += 8;
+    let mut uuid = [0u8; 16];
+    uuid.copy_from_slice(&data[off..off + 16]);
     Some((
         FsRoots {
             inode: cownfs_core::btree::NodeId { idx: ib, gen: ig },
@@ -134,11 +137,17 @@ fn load_state(path: &Path) -> Option<(FsRoots, u64)> {
             snap: cownfs_core::btree::NodeId { idx: sb, gen: sg },
         },
         generation,
+        uuid,
     ))
 }
 
-fn save_state(path: &Path, roots: &FsRoots, generation: u64) -> std::io::Result<()> {
-    let mut data = Vec::with_capacity(4 * 12 + 8);
+fn save_state(
+    path: &Path,
+    roots: &FsRoots,
+    generation: u64,
+    uuid: &[u8; 16],
+) -> std::io::Result<()> {
+    let mut data = Vec::with_capacity(4 * 12 + 8 + 16);
     for (blk, gen) in [
         (roots.inode.idx, roots.inode.gen),
         (roots.dir.idx, roots.dir.gen),
@@ -149,6 +158,7 @@ fn save_state(path: &Path, roots: &FsRoots, generation: u64) -> std::io::Result<
         data.extend_from_slice(&gen.to_be_bytes());
     }
     data.extend_from_slice(&generation.to_be_bytes());
+    data.extend_from_slice(uuid);
     std::fs::write(path, data)
 }
 
@@ -174,14 +184,23 @@ fn do_send(
     let cur_gen = fs.generation();
 
     // Determine the block set: incremental diff or full send.
+    // Validate the diff base: UUID must match (same primary) and the old
+    // generation must not be newer than current (sanity). If validation
+    // fails, fall back to a full send rather than a corrupt diff.
+    let cur_uuid = fs.uuid();
     let mut blocks: HashSet<u64> = HashSet::new();
     let is_incremental = match load_state(&spath) {
-        Some((old_roots, _)) => {
+        Some((old_roots, old_gen, old_uuid)) if old_uuid == cur_uuid && old_gen <= cur_gen => {
             let diff = fs
                 .diff_roots(&old_roots)
                 .map_err(|e| format!("diff: {e:?}"))?;
             blocks.extend(diff);
             true
+        }
+        Some(_) => {
+            eprintln!("stale or divergent state: falling back to full send");
+            blocks.extend(fs.allocated_blocks());
+            false
         }
         None => {
             blocks.extend(fs.allocated_blocks());
@@ -271,7 +290,7 @@ fn do_send(
         t => return Err(format!("unexpected reply tag {t}")),
     }
 
-    save_state(&spath, &cur_roots, cur_gen).map_err(|e| e.to_string())?;
+    save_state(&spath, &cur_roots, cur_gen, &cur_uuid).map_err(|e| e.to_string())?;
     eprintln!(
         "replicated {} blocks, gen {cur_gen}",
         data_blocks.len() + sb_slots.len()
