@@ -11,17 +11,18 @@ use cownfs_core::engine::{Fs, FsError, FTYPE_DIR, FTYPE_SYMLINK, ROOT_INO};
 use crate::nfs4::{
     encode_compound, AttrMask, AttrValues, Compound, FileAttrs, FileHandle, NfsError, Op, OpResult,
     StateId, ACCESS4_DELETE, ACCESS4_EXECUTE, ACCESS4_EXTEND, ACCESS4_LOOKUP, ACCESS4_MODIFY,
-    ACCESS4_READ, FATTR4_MODE, FATTR4_SIZE, FILE_SYNC4, GUARDED4, NF4DIR, NF4LNK, NF4REG,
-    NFS4ERR_BADNAME, NFS4ERR_BADSESSION, NFS4ERR_BADSLOT, NFS4ERR_BADTYPE, NFS4ERR_BADXDR,
-    NFS4ERR_BAD_COOKIE, NFS4ERR_EXIST, NFS4ERR_EXPIRED, NFS4ERR_INVAL, NFS4ERR_ISDIR,
-    NFS4ERR_NAMETOOLONG, NFS4ERR_NOENT, NFS4ERR_NOFILEHANDLE, NFS4ERR_NOTDIR, NFS4ERR_NOTSUPP,
-    NFS4ERR_OP_ILLEGAL, NFS4ERR_ROFS, NFS4ERR_SEQ_MISORDERED, NFS4ERR_SERVERFAULT,
+    ACCESS4_READ, FATTR4_MODE, FATTR4_SIZE, FILE_SYNC4, GUARDED4, LAYOUT4_NFSV4_1_FILES, NF4DIR,
+    NF4LNK, NF4REG, NFS4ERR_BADNAME, NFS4ERR_BADSESSION, NFS4ERR_BADSLOT, NFS4ERR_BADTYPE,
+    NFS4ERR_BADXDR, NFS4ERR_BAD_COOKIE, NFS4ERR_EXIST, NFS4ERR_EXPIRED, NFS4ERR_INVAL,
+    NFS4ERR_ISDIR, NFS4ERR_NAMETOOLONG, NFS4ERR_NOENT, NFS4ERR_NOFILEHANDLE, NFS4ERR_NOTDIR,
+    NFS4ERR_NOTSUPP, NFS4ERR_OP_ILLEGAL, NFS4ERR_ROFS, NFS4ERR_SEQ_MISORDERED, NFS4ERR_SERVERFAULT,
     NFS4ERR_STALE_CLIENTID, NFS4ERR_TOOSMALL, NFS4_OK, OPEN4_CREATE, OP_ACCESS, OP_CLOSE,
     OP_COMMIT, OP_CREATE, OP_CREATE_SESSION, OP_DESTROY_CLIENTID, OP_DESTROY_SESSION,
-    OP_EXCHANGE_ID, OP_GETATTR, OP_GETFH, OP_ILLEGAL, OP_LINK, OP_LOCK, OP_LOCKU, OP_LOOKUP,
-    OP_LOOKUPP, OP_OPEN, OP_OPEN_DOWNGRADE, OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_REMOVE,
-    OP_RENAME, OP_RENEW, OP_RESTOREFH, OP_SAVEFH, OP_SECINFO, OP_SEQUENCE, OP_SETATTR,
-    OP_SETCLIENTID, OP_SETCLIENTID_CONFIRM, OP_WRITE, UNCHECKED4,
+    OP_EXCHANGE_ID, OP_GETATTR, OP_GETFH, OP_ILLEGAL, OP_LAYOUTCOMMIT, OP_LAYOUTGET,
+    OP_LAYOUTRETURN, OP_LINK, OP_LOCK, OP_LOCKU, OP_LOOKUP, OP_LOOKUPP, OP_OPEN, OP_OPEN_DOWNGRADE,
+    OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_REMOVE, OP_RENAME, OP_RENEW, OP_RESTOREFH,
+    OP_SAVEFH, OP_SECINFO, OP_SEQUENCE, OP_SETATTR, OP_SETCLIENTID, OP_SETCLIENTID_CONFIRM,
+    OP_WRITE, UNCHECKED4,
 };
 use crate::rpc::{self, Call, RecordReader, RpcError};
 use crate::state::StateManager;
@@ -101,6 +102,11 @@ pub struct Shared {
     pub state: Arc<Mutex<StateManager>>,
     /// NFSv4.1 client/session/slot table (exactly-once semantics).
     pub sessions: Arc<Mutex<crate::sessions::SessionTable>>,
+    /// pNFS layout table (single data server in v1).
+    pub layouts: Arc<Mutex<crate::layouts::LayoutTable>>,
+    /// Data server address for LAYOUTCOMMIT verification (e.g. "127.0.0.1:2060").
+    /// None disables pNFS layouts (LAYOUTGET returns NOTSUPP).
+    pub ds_addr: Option<String>,
     /// When true, mutating ops return NFS4ERR_ROFS. Used for read replicas.
     pub read_only: bool,
 }
@@ -111,6 +117,8 @@ impl Shared {
             fs: Arc::new(Mutex::new(fs)),
             state: Arc::new(Mutex::new(StateManager::new())),
             sessions: Arc::new(Mutex::new(crate::sessions::SessionTable::new())),
+            layouts: Arc::new(Mutex::new(crate::layouts::LayoutTable::new())),
+            ds_addr: None,
             read_only: false,
         }
     }
@@ -120,8 +128,16 @@ impl Shared {
             fs: Arc::new(Mutex::new(fs)),
             state: Arc::new(Mutex::new(StateManager::new())),
             sessions: Arc::new(Mutex::new(crate::sessions::SessionTable::new())),
+            layouts: Arc::new(Mutex::new(crate::layouts::LayoutTable::new())),
+            ds_addr: None,
             read_only: true,
         }
+    }
+
+    /// Attach a data server address, enabling pNFS layouts.
+    pub fn with_ds_addr(mut self, addr: String) -> Self {
+        self.ds_addr = Some(addr);
+        self
     }
 }
 
@@ -132,6 +148,8 @@ struct Session {
     cfh: Option<u64>,
     /// Saved filehandle (SAVEFH/RESTOREFH).
     saved_fh: Option<u64>,
+    /// v4.1 session ID from the compound's SEQUENCE (None in 4.0 mode).
+    session41: Option<[u8; 16]>,
 }
 
 impl Session {
@@ -140,6 +158,7 @@ impl Session {
             shared: shared.clone(),
             cfh: None,
             saved_fh: None,
+            session41: None,
         }
     }
 
@@ -271,6 +290,8 @@ impl Session {
             w.u32(0); // status_flags
             OpResult::ok(OP_SEQUENCE, w.into_bytes())
         };
+        // The rest of the compound runs under this v4.1 session.
+        self.session41 = Some(sessionid);
         let mut out = vec![seq_res];
         for op in &compound.ops[1..] {
             let res = self.exec(op);
@@ -280,6 +301,7 @@ impl Session {
                 break;
             }
         }
+        self.session41 = None;
 
         // Advance the slot and cache the reply.
         {
@@ -482,6 +504,18 @@ impl Session {
                 OpResult::err(OP_SEQUENCE, NFS4ERR_BADSESSION)
             }
             Op::DestroyClientid { clientid } => self.op_destroy_clientid(*clientid),
+            Op::LayoutGet {
+                offset,
+                length,
+                minlength,
+            } => self.op_layoutget(*offset, *length, *minlength),
+            Op::LayoutCommit {
+                offset,
+                length,
+                blocks,
+                new_size,
+            } => self.op_layoutcommit(*offset, *length, blocks, *new_size),
+            Op::LayoutReturn { offset, length } => self.op_layoutreturn(*offset, *length),
         }
     }
 
@@ -555,6 +589,183 @@ impl Session {
         } else {
             OpResult::err(OP_DESTROY_CLIENTID, NFS4ERR_STALE_CLIENTID)
         }
+    }
+
+    /// Read one block from the data server, verifying the transport.
+    /// Returns (data, checksum).
+    fn ds_read_block(addr: &str, block_id: u64) -> Result<(Vec<u8>, u64), String> {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(addr).map_err(|e| format!("ds connect: {e}"))?;
+        s.write_all(&0x4453_3031u32.to_be_bytes())
+            .map_err(|e| e.to_string())?;
+        s.write_all(&1u32.to_be_bytes())
+            .map_err(|e| e.to_string())?;
+        s.write_all(&[1u8]).map_err(|e| e.to_string())?; // READ
+        s.write_all(&block_id.to_be_bytes())
+            .map_err(|e| e.to_string())?;
+        let mut st = [0u8; 4];
+        s.read_exact(&mut st).map_err(|e| e.to_string())?;
+        if u32::from_be_bytes(st) != 0 {
+            return Err("ds read failed".into());
+        }
+        let mut data = vec![0u8; 4096];
+        s.read_exact(&mut data).map_err(|e| e.to_string())?;
+        let mut sum = [0u8; 8];
+        s.read_exact(&mut sum).map_err(|e| e.to_string())?;
+        Ok((data, u64::from_be_bytes(sum)))
+    }
+
+    fn op_layoutget(&mut self, offset: u64, length: u64, minlength: u64) -> OpResult {
+        let sessionid = match self.session41 {
+            Some(s) => s,
+            None => return OpResult::err(OP_LAYOUTGET, NFS4ERR_BADSESSION),
+        };
+        let ds_addr = match &self.shared.ds_addr {
+            Some(a) => a.clone(),
+            None => return OpResult::err(OP_LAYOUTGET, NFS4ERR_NOTSUPP),
+        };
+        let ino = match self.cfh {
+            Some(i) => i,
+            None => return OpResult::err(OP_LAYOUTGET, NFS4ERR_NOFILEHANDLE),
+        };
+        if self.shared.read_only {
+            return OpResult::err(OP_LAYOUTGET, NFS4ERR_ROFS);
+        }
+        // Cap the layout length at 1 MiB per LAYOUTGET in v1.
+        let length = length.min(1024 * 1024).max(minlength.min(1024 * 1024));
+        let layout = self
+            .shared
+            .layouts
+            .lock()
+            .unwrap()
+            .layout_get(sessionid, ino, offset, length);
+
+        let mut w = Writer::new();
+        w.u32(1); // return_on_close = true
+                  // stateid for the layout (simplified: session-derived)
+        let mut stateid = [0u8; 16];
+        stateid[..8].copy_from_slice(&layout.first_block_id.to_be_bytes());
+        stateid[8..].copy_from_slice(&sessionid[..8]);
+        w.opaque_fixed(&stateid);
+        // layout4 array: one file-layout segment.
+        w.u32(1); // count
+        w.u32(LAYOUT4_NFSV4_1_FILES);
+        w.u64(offset);
+        w.u64(length);
+        w.u32(2); // iomode RW
+                  // nfsv4_1_file_layout4 body: deviceid + util + first_stripe_index +
+                  // pattern_offset + stripe_indices + array of (block_id, nblocks).
+                  // v1: single DS, so deviceid indexes the one configured DS.
+        let mut body = Writer::new();
+        body.opaque_fixed(&[0u8; 16]); // deviceid (index 0)
+        body.u32(0); // util
+        body.u32(0); // first_stripe_index
+        body.u64(offset); // pattern_offset
+        body.u32(0); // stripe_indices: empty (single DS)
+        body.u32(layout.nblocks as u32);
+        for i in 0..layout.nblocks {
+            body.u64(layout.first_block_id + i);
+        }
+        // DS address as a counted string after the opaque body.
+        let body_bytes = body.into_bytes();
+        w.opaque(&body_bytes);
+        w.string(ds_addr.as_bytes());
+        OpResult::ok(OP_LAYOUTGET, w.into_bytes())
+    }
+
+    fn op_layoutcommit(
+        &mut self,
+        offset: u64,
+        length: u64,
+        blocks: &[(u64, u64)],
+        new_size: Option<u64>,
+    ) -> OpResult {
+        let sessionid = match self.session41 {
+            Some(s) => s,
+            None => return OpResult::err(OP_LAYOUTCOMMIT, NFS4ERR_BADSESSION),
+        };
+        let ds_addr = match &self.shared.ds_addr {
+            Some(a) => a.clone(),
+            None => return OpResult::err(OP_LAYOUTCOMMIT, NFS4ERR_NOTSUPP),
+        };
+        let ino = match self.cfh {
+            Some(i) => i,
+            None => return OpResult::err(OP_LAYOUTCOMMIT, NFS4ERR_NOFILEHANDLE),
+        };
+        if self.shared.read_only {
+            return OpResult::err(OP_LAYOUTCOMMIT, NFS4ERR_ROFS);
+        }
+        // The commit must fall inside an outstanding layout.
+        {
+            let layouts = self.shared.layouts.lock().unwrap();
+            if layouts.find(&sessionid, ino, offset, length).is_none() {
+                return OpResult::err(OP_LAYOUTCOMMIT, NFS4ERR_BADSESSION);
+            }
+        }
+        // Verify each block from the DS and write it into the CoW file.
+        // Blocks are in offset order, 4KiB each.
+        let mut fs = self.shared.fs.lock().unwrap();
+        for (i, (block_id, expect_sum)) in blocks.iter().enumerate() {
+            let (data, ds_sum) = match Self::ds_read_block(&ds_addr, *block_id) {
+                Ok(x) => x,
+                Err(e) => return OpResult::err(OP_LAYOUTCOMMIT, NFS4ERR_SERVERFAULT),
+            };
+            if ds_sum != *expect_sum {
+                // Client lied or DS corrupted: refuse the commit.
+                return OpResult::err(OP_LAYOUTCOMMIT, NFS4ERR_BADSESSION);
+            }
+            // Only write the in-range tail of the last block.
+            let off = offset + (i as u64) * 4096;
+            let mut chunk = &data[..];
+            if off + 4096 > offset + length {
+                chunk = &chunk[..(offset + length - off) as usize];
+            }
+            if let Err(_) = fs.write(ino, off, chunk) {
+                return OpResult::err(OP_LAYOUTCOMMIT, NFS4ERR_SERVERFAULT);
+            }
+        }
+        if let Some(sz) = new_size {
+            use cownfs_core::engine::SetAttrs;
+            if fs
+                .setattr(
+                    ino,
+                    &SetAttrs {
+                        size: Some(sz),
+                        ..Default::default()
+                    },
+                )
+                .is_err()
+            {
+                return OpResult::err(OP_LAYOUTCOMMIT, NFS4ERR_SERVERFAULT);
+            }
+        }
+        // Atomic CoW commit: the pointer swing.
+        if let Err(_) = fs.commit() {
+            return OpResult::err(OP_LAYOUTCOMMIT, NFS4ERR_SERVERFAULT);
+        }
+        let mut w = Writer::new();
+        w.bool(false); // no new size info to return
+        OpResult::ok(OP_LAYOUTCOMMIT, w.into_bytes())
+    }
+
+    fn op_layoutreturn(&mut self, offset: u64, length: u64) -> OpResult {
+        let sessionid = match self.session41 {
+            Some(s) => s,
+            None => return OpResult::err(OP_LAYOUTRETURN, NFS4ERR_BADSESSION),
+        };
+        let ino = match self.cfh {
+            Some(i) => i,
+            None => return OpResult::err(OP_LAYOUTRETURN, NFS4ERR_NOFILEHANDLE),
+        };
+        let n = self
+            .shared
+            .layouts
+            .lock()
+            .unwrap()
+            .layout_return(&sessionid, ino, offset, length);
+        let mut w = Writer::new();
+        w.u32(if n > 0 { 0 } else { 1 }); // status: 0 = returned
+        OpResult::ok(OP_LAYOUTRETURN, w.into_bytes())
     }
 
     fn current(&self, opnum: u32) -> Result<u64, OpResult> {
@@ -1383,6 +1594,9 @@ fn op_name(op: u32) -> &'static str {
         OP_DESTROY_SESSION => "DESTROY_SESSION",
         OP_SEQUENCE => "SEQUENCE",
         OP_DESTROY_CLIENTID => "DESTROY_CLIENTID",
+        OP_LAYOUTGET => "LAYOUTGET",
+        OP_LAYOUTCOMMIT => "LAYOUTCOMMIT",
+        OP_LAYOUTRETURN => "LAYOUTRETURN",
         OP_WRITE => "WRITE",
         _ => "UNKNOWN",
     }

@@ -72,6 +72,12 @@ pub const OP_CREATE_SESSION: u32 = 43;
 pub const OP_DESTROY_SESSION: u32 = 47;
 pub const OP_SEQUENCE: u32 = 44;
 pub const OP_DESTROY_CLIENTID: u32 = 57;
+// pNFS file layout ops (RFC 5661 §12). Single data server in v1.
+pub const OP_LAYOUTGET: u32 = 50;
+pub const OP_LAYOUTCOMMIT: u32 = 51;
+pub const OP_LAYOUTRETURN: u32 = 52;
+/// Layout type for NFSv4.1 files (RFC 5661 §12.2).
+pub const LAYOUT4_NFSV4_1_FILES: u32 = 1;
 
 // Attribute numbers (RFC 7530 §5).
 // --- REQUIRED (MUST be returned when requested) ---
@@ -361,6 +367,25 @@ pub enum Op {
     },
     DestroyClientid {
         clientid: u64,
+    },
+    // pNFS file layouts (RFC 5661 §12). Single data server in v1:
+    // the DS is a staging area; LAYOUTCOMMIT copies verified blocks
+    // into the CoW filesystem.
+    LayoutGet {
+        offset: u64,
+        length: u64,
+        minlength: u64,
+    },
+    LayoutCommit {
+        offset: u64,
+        length: u64,
+        /// (block_id, checksum) per 4KiB block, in offset order.
+        blocks: Vec<(u64, u64)>,
+        new_size: Option<u64>,
+    },
+    LayoutReturn {
+        offset: u64,
+        length: u64,
     },
 }
 
@@ -811,6 +836,66 @@ impl Op {
                 let clientid = r.u64()?;
                 Op::DestroyClientid { clientid }
             }
+            OP_LAYOUTGET => {
+                let layouttype = r.u32()?;
+                if layouttype != LAYOUT4_NFSV4_1_FILES {
+                    return Err(NfsError::BadOp(OP_LAYOUTGET));
+                }
+                let _iomode = r.u32()?;
+                let offset = r.u64()?;
+                let length = r.u64()?;
+                let minlength = r.u64()?;
+                let _stateid = r.opaque_fixed(16)?;
+                let _maxcount = r.u32()?;
+                Op::LayoutGet {
+                    offset,
+                    length,
+                    minlength,
+                }
+            }
+            OP_LAYOUTCOMMIT => {
+                let offset = r.u64()?;
+                let length = r.u64()?;
+                let _reclaim = r.bool()?;
+                let _stateid = r.opaque_fixed(16)?;
+                let has_new_size = r.bool()?;
+                let new_size = if has_new_size { Some(r.u64()?) } else { None };
+                // layoutupdate: layouttype + opaque body.
+                let layouttype = r.u32()?;
+                if layouttype != LAYOUT4_NFSV4_1_FILES {
+                    return Err(NfsError::BadOp(OP_LAYOUTCOMMIT));
+                }
+                let body = r.opaque()?;
+                let mut br = crate::xdr::Reader::new(body);
+                let nblocks = br.u32()? as usize;
+                if nblocks > 1024 {
+                    return Err(NfsError::Xdr(crate::xdr::XdrError::Invalid(
+                        "too many blocks",
+                    )));
+                }
+                let mut blocks = Vec::with_capacity(nblocks);
+                for _ in 0..nblocks {
+                    blocks.push((br.u64()?, br.u64()?));
+                }
+                Op::LayoutCommit {
+                    offset,
+                    length,
+                    blocks,
+                    new_size,
+                }
+            }
+            OP_LAYOUTRETURN => {
+                let _reclaim = r.bool()?;
+                let layouttype = r.u32()?;
+                if layouttype != LAYOUT4_NFSV4_1_FILES {
+                    return Err(NfsError::BadOp(OP_LAYOUTRETURN));
+                }
+                let _iomode = r.u32()?;
+                // Simplified: always an explicit range.
+                let offset = r.u64()?;
+                let length = r.u64()?;
+                Op::LayoutReturn { offset, length }
+            }
             OP_ILLEGAL => Op::Illegal,
             n => return Err(NfsError::BadOp(n)),
         };
@@ -852,6 +937,9 @@ impl Op {
             Op::DestroySession { .. } => OP_DESTROY_SESSION,
             Op::Sequence { .. } => OP_SEQUENCE,
             Op::DestroyClientid { .. } => OP_DESTROY_CLIENTID,
+            Op::LayoutGet { .. } => OP_LAYOUTGET,
+            Op::LayoutCommit { .. } => OP_LAYOUTCOMMIT,
+            Op::LayoutReturn { .. } => OP_LAYOUTRETURN,
         }
     }
 }

@@ -142,6 +142,33 @@ pub fn spawn_read_only_server_on(img: &std::path::Path) -> TestServer {
     }
 }
 
+/// Spawn a server with pNFS layouts enabled (ds_addr configured).
+/// Returns the server and the DS address it was given.
+pub fn spawn_layout_server(blocks: u64, ds_addr: &str) -> TestServer {
+    let n = IMG_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let img = std::env::temp_dir().join(format!("cownfs-it-{}-{n}.img", std::process::id()));
+    let _ = std::fs::remove_file(&img);
+    let mut fs = Fs::format(&img, blocks).expect("format test image");
+    fs.commit().expect("commit fresh image");
+    let uuid = fs.uuid();
+    drop(fs);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+    let addr = listener.local_addr().expect("listener local addr");
+    let img2 = img.clone();
+    let ds = ds_addr.to_string();
+    std::thread::spawn(move || {
+        let fs = Fs::open(&img2).expect("open test image");
+        let shared = cownfs_nfs::server::Shared::new(fs).with_ds_addr(ds);
+        let _ = cownfs_nfs::server::serve_concurrent(listener, shared);
+    });
+    TestServer {
+        addr,
+        uuid,
+        img: Some(img),
+    }
+}
+
 // -- replies ---------------------------------------------------------------
 
 /// One directory entry from READDIR.
@@ -178,6 +205,11 @@ pub enum Reply {
     },
     ClientId(u64),
     Session([u8; 16]),
+    Layout {
+        first_block_id: u64,
+        nblocks: u64,
+        ds_addr: String,
+    },
     Access {
         supported: u32,
         granted: u32,
@@ -576,6 +608,61 @@ impl Ops {
         self.op();
     }
 
+    /// pNFS LAYOUTGET for [offset, offset+length).
+    pub fn layoutget(&mut self, offset: u64, length: u64) {
+        self.w.u32(nfs4::OP_LAYOUTGET);
+        self.w.u32(nfs4::LAYOUT4_NFSV4_1_FILES);
+        self.w.u32(2); // iomode RW
+        self.w.u64(offset);
+        self.w.u64(length);
+        self.w.u64(length); // minlength
+        self.w.opaque_fixed(&[0u8; 16]); // stateid (unused in v1)
+        self.w.u32(65536); // maxcount
+        self.op();
+    }
+
+    /// pNFS LAYOUTCOMMIT with (block_id, checksum) pairs in offset order.
+    pub fn layoutcommit(
+        &mut self,
+        offset: u64,
+        length: u64,
+        blocks: &[(u64, u64)],
+        new_size: Option<u64>,
+    ) {
+        self.w.u32(nfs4::OP_LAYOUTCOMMIT);
+        self.w.u64(offset);
+        self.w.u64(length);
+        self.w.u32(0); // reclaim = false
+        self.w.opaque_fixed(&[0u8; 16]); // stateid
+        match new_size {
+            Some(sz) => {
+                self.w.u32(1);
+                self.w.u64(sz);
+            }
+            None => self.w.u32(0),
+        }
+        // layoutupdate: layouttype + opaque body.
+        self.w.u32(nfs4::LAYOUT4_NFSV4_1_FILES);
+        let mut body = cownfs_nfs::xdr::Writer::new();
+        body.u32(blocks.len() as u32);
+        for (bid, sum) in blocks {
+            body.u64(*bid);
+            body.u64(*sum);
+        }
+        self.w.opaque(&body.into_bytes());
+        self.op();
+    }
+
+    pub fn layoutreturn(&mut self, offset: u64, length: u64) {
+        self.w.u32(nfs4::OP_LAYOUTRETURN);
+        self.w.u32(0); // reclaim = false
+        self.w.u32(nfs4::LAYOUT4_NFSV4_1_FILES);
+        self.w.u32(2); // iomode RW
+        self.w.u64(offset);
+        self.w.u64(length);
+        self.op();
+    }
+
     pub fn rename(&mut self, old: &[u8], new: &[u8]) {
         self.w.u32(nfs4::OP_RENAME);
         self.w.string(old);
@@ -945,7 +1032,44 @@ impl NfsClient {
                     sessionid.copy_from_slice(sid);
                     Reply::Session(sessionid)
                 }
-                nfs4::OP_SEQUENCE => Reply::Ok,
+                nfs4::OP_SEQUENCE => {
+                    let _ = r.opaque_fixed(16).expect("sessionid");
+                    let _ = r.u32().expect("sequenceid");
+                    let _ = r.u32().expect("slotid");
+                    let _ = r.u32().expect("highest");
+                    let _ = r.u32().expect("target highest");
+                    let _ = r.u32().expect("flags");
+                    Reply::Ok
+                }
+                nfs4::OP_LAYOUTGET => {
+                    let _roc = r.u32().expect("return_on_close");
+                    let _ = r.opaque_fixed(16).expect("stateid");
+                    let n = r.u32().expect("layout count");
+                    assert_eq!(n, 1, "v1 returns one layout");
+                    let lt = r.u32().expect("layouttype");
+                    assert_eq!(lt, nfs4::LAYOUT4_NFSV4_1_FILES);
+                    let _ = r.u64().expect("offset");
+                    let _ = r.u64().expect("length");
+                    let _ = r.u32().expect("iomode");
+                    let body = r.opaque().expect("body").to_vec();
+                    let mut br = Reader::new(&body);
+                    let _ = br.opaque_fixed(16).expect("deviceid");
+                    let _ = br.u32().expect("util");
+                    let _ = br.u32().expect("stripe index");
+                    let _ = br.u64().expect("pattern offset");
+                    let _ = br.u32().expect("stripe indices");
+                    let nblocks = br.u32().expect("nblocks") as u64;
+                    let first = br.u64().expect("first block id");
+                    let ds_bytes = r.opaque().expect("ds_addr");
+                    let ds_addr = String::from_utf8_lossy(ds_bytes).into_owned();
+                    Reply::Layout {
+                        first_block_id: first,
+                        nblocks,
+                        ds_addr,
+                    }
+                }
+                nfs4::OP_LAYOUTCOMMIT => Reply::Ok,
+                nfs4::OP_LAYOUTRETURN => Reply::Ok,
                 nfs4::OP_CREATE => {
                     // change_info4: atomic + before + after + attrset.
                     let _ = r.bool().expect("atomic");

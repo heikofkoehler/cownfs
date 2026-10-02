@@ -3,6 +3,7 @@
 //! No external crates: the wire format is implemented from scratch so the
 //! protocol surface stays minimal and auditable.
 
+pub mod layouts;
 pub mod nfs4;
 pub mod rpc;
 pub mod server;
