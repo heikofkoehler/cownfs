@@ -391,7 +391,7 @@ impl StateManager {
         seqid: u32,
         offset: u64,
         length: u64,
-    ) -> Result<(), NfsError> {
+    ) -> Result<StateId, NfsError> {
         let key = self
             .locks
             .iter()
@@ -399,20 +399,24 @@ impl StateManager {
             .map(|(k, _)| k.clone());
         match key {
             Some(k) => {
-                let l = self.locks.get(&k).unwrap();
-                if seqid != l.seqid + 1 {
-                    if seqid == l.seqid {
-                        return Ok(()); // Replay.
+                let (sid, clientid) = {
+                    let l = self.locks.get(&k).unwrap();
+                    if seqid != l.seqid + 1 {
+                        if seqid == l.seqid {
+                            return Ok(l.stateid.clone()); // Replay.
+                        }
+                        return Err(NfsError::Status(NFS4ERR_BAD_SEQID));
                     }
-                    return Err(NfsError::Status(NFS4ERR_BAD_SEQID));
-                }
-                // For simplicity, remove the whole lock (not partial).
-                // P6: full unlock only; partial unlock is an edge case.
-                let _ = (offset, length);
-                let clientid = l.clientid;
+                    // For simplicity, remove the whole lock (not partial).
+                    // P6: full unlock only; partial unlock is an edge case.
+                    let _ = (offset, length);
+                    let mut sid = l.stateid.clone();
+                    sid.seqid += 1;
+                    (sid, l.clientid)
+                };
                 self.locks.remove(&k);
                 self.renew_lease(clientid);
-                Ok(())
+                Ok(sid)
             }
             None => Err(NfsError::Status(NFS4ERR_EXPIRED)),
         }

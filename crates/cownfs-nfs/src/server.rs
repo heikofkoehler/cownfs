@@ -1029,7 +1029,11 @@ impl Session {
         length: u64,
     ) -> OpResult {
         match self.state().unlock(stateid, seqid, offset, length) {
-            Ok(()) => OpResult::ok(OP_LOCKU, Vec::new()),
+            Ok(sid) => {
+                let mut w = Writer::new();
+                sid.encode(&mut w);
+                OpResult::ok(OP_LOCKU, w.into_bytes())
+            }
             Err(NfsError::Status(s)) => OpResult::err(OP_LOCKU, s),
             Err(_) => OpResult::err(OP_LOCKU, NFS4ERR_SERVERFAULT),
         }

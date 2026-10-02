@@ -80,19 +80,19 @@ fn close_replay_and_bad_seqid() {
     common::create_file(&mut c, &srv.uuid, id, ROOT_INO, b"f", 0o644);
     let s = open_stateid(&open_file(&mut c, &srv.uuid, id, b"o", 3, b"f"));
 
-    // CLOSE with the current seqid (0) is a replay: success, state kept.
-    let mut ops = Ops::new();
-    ops.close(0, &s);
-    c.check_ok(b"close-replay", ops);
-
-    // The real CLOSE.
+    // CLOSE with the current seqid (1) is a replay: success, state kept.
     let mut ops = Ops::new();
     ops.close(1, &s);
+    c.check_ok(b"close-replay", ops);
+
+    // The real CLOSE (seqid 2).
+    let mut ops = Ops::new();
+    ops.close(2, &s);
     c.check_ok(b"close", ops);
 
     // The stateid is gone now: closing again is EXPIRED, not a replay.
     let mut ops = Ops::new();
-    ops.close(1, &s);
+    ops.close(2, &s);
     let (overall, res) = c.call(b"close-after", ops);
     assert_eq!(overall, NFS4ERR_EXPIRED);
     assert!(matches!(res[0], Reply::Err(NFS4ERR_EXPIRED)));
