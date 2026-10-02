@@ -496,7 +496,7 @@ impl Session {
     /// Extract mode/uid/gid from createattrs (fattr4). OWNER/OWNER_GROUP
     /// values arrive as XDR strings (length prefix + padding); decode the
     /// framing before parsing the "uid"/"gid" text.
-    fn parse_createattrs(attrs: &[(u32, Vec<u8>)]) -> (u32, u32, u32) {
+    fn parse_createattrs(attrs: &[(u32, Vec<u8>)]) -> Result<(u32, u32, u32), u32> {
         let mut mode = 0o644u32;
         let mut uid = 0u32;
         let mut gid = 0u32;
@@ -519,10 +519,11 @@ impl Session {
                         gid = s.parse().unwrap_or(0);
                     }
                 }
-                _ => {}
+                // Read-only or unsupported attrs in CREATE -> INVAL (pynfs CR11).
+                _ => return Err(NFS4ERR_INVAL),
             }
         }
-        (mode, uid, gid)
+        Ok((mode, uid, gid))
     }
 
     fn op_open(
@@ -571,7 +572,10 @@ impl Session {
                 if createmode != UNCHECKED4 && createmode != GUARDED4 {
                     return OpResult::err(OP_OPEN, NFS4ERR_NOTSUPP);
                 }
-                let (mode, uid, gid) = Self::parse_createattrs(createattrs);
+                let (mode, uid, gid) = match Self::parse_createattrs(createattrs) {
+                    Ok(v) => v,
+                    Err(s) => return OpResult::err(OP_OPEN, s),
+                };
                 match self.fs().create(dir_ino, filename, mode, uid, gid) {
                     Ok(ino) => ino,
                     Err(e) => return OpResult::err(OP_OPEN, fs_to_nfs(e)),
@@ -620,7 +624,10 @@ impl Session {
             Some(i) => i,
             None => return OpResult::err(OP_CREATE, NFS4ERR_NOFILEHANDLE),
         };
-        let (mode, uid, gid) = Self::parse_createattrs(attrs);
+        let (mode, uid, gid) = match Self::parse_createattrs(attrs) {
+            Ok(v) => v,
+            Err(s) => return OpResult::err(OP_CREATE, s),
+        };
         let result = match ftype {
             NF4DIR => self.fs().mkdir(dir_ino, name, mode, uid, gid).map(|_| ()),
             NF4LNK => {
