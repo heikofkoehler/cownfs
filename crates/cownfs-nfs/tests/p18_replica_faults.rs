@@ -59,6 +59,7 @@ fn partial_send(replica_img: &PathBuf, port: u16, blocks_to_send: usize) -> std:
         s.write_all(&1u32.to_be_bytes()).unwrap();
     }
     s.write_all(&999u64.to_be_bytes()).unwrap(); // generation
+    s.write_all(&[0u8; 16]).unwrap(); // uuid
     s.write_all(&512u64.to_be_bytes()).unwrap(); // block_count (must match)
                                                  // A few BLOCKs (tag 2) — garbage data blocks, NOT the superblock.
     for i in 0..blocks_to_send {

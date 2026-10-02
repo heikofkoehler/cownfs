@@ -54,7 +54,7 @@ fn write_u64(w: &mut TcpStream, v: u64) -> std::io::Result<()> {
     w.write_all(&v.to_be_bytes())
 }
 
-fn read_roots(r: &mut TcpStream) -> std::io::Result<(FsRoots, u64)> {
+fn read_roots(r: &mut TcpStream) -> std::io::Result<(FsRoots, u64, [u8; 16])> {
     let mut get = || -> std::io::Result<(u64, u32)> {
         let blk = read_u64(r)?;
         let gen = read_u32(r)?;
@@ -65,6 +65,8 @@ fn read_roots(r: &mut TcpStream) -> std::io::Result<(FsRoots, u64)> {
     let (eb, eg) = get()?;
     let (sb, sg) = get()?;
     let generation = read_u64(r)?;
+    let mut uuid = [0u8; 16];
+    r.read_exact(&mut uuid)?;
     Ok((
         FsRoots {
             inode: cownfs_core::btree::NodeId { idx: ib, gen: ig },
@@ -73,10 +75,16 @@ fn read_roots(r: &mut TcpStream) -> std::io::Result<(FsRoots, u64)> {
             snap: cownfs_core::btree::NodeId { idx: sb, gen: sg },
         },
         generation,
+        uuid,
     ))
 }
 
-fn write_roots(w: &mut TcpStream, roots: &FsRoots, generation: u64) -> std::io::Result<()> {
+fn write_roots(
+    w: &mut TcpStream,
+    roots: &FsRoots,
+    generation: u64,
+    uuid: &[u8; 16],
+) -> std::io::Result<()> {
     for (blk, gen) in [
         (roots.inode.idx, roots.inode.gen),
         (roots.dir.idx, roots.dir.gen),
@@ -86,7 +94,8 @@ fn write_roots(w: &mut TcpStream, roots: &FsRoots, generation: u64) -> std::io::
         write_u64(w, blk)?;
         write_u32(w, gen)?;
     }
-    write_u64(w, generation)
+    write_u64(w, generation)?;
+    w.write_all(uuid)
 }
 
 fn state_path(image: &Path, override_: Option<&str>) -> PathBuf {
@@ -214,14 +223,18 @@ fn do_send(
     stream
         .write_all(&[MSG_SNAPSHOT])
         .map_err(|e| e.to_string())?;
-    write_roots(&mut stream, &cur_roots, cur_gen).map_err(|e| e.to_string())?;
+    write_roots(&mut stream, &cur_roots, cur_gen, &fs.uuid()).map_err(|e| e.to_string())?;
     write_u64(&mut stream, fs.block_count()).map_err(|e| e.to_string())?;
 
-    // BLOCKs
+    // BLOCKs: data and bitmap blocks first, superblock slots (0, 1) LAST.
+    // Crash safety: the receiver fsyncs data before publishing the new
+    // superblock, so a crash never exposes a generation whose blocks
+    // aren't durable.
     let mut blk = [0u8; BLOCK_SIZE];
     let mut sorted: Vec<u64> = blocks.into_iter().collect();
     sorted.sort_unstable();
-    for id in &sorted {
+    let (sb_slots, data_blocks): (Vec<u64>, Vec<u64>) = sorted.into_iter().partition(|id| *id < 2);
+    for id in data_blocks.iter().chain(sb_slots.iter()) {
         dev.read_block(*id, &mut blk)
             .map_err(|e| format!("read block {id}: {e}"))?;
         stream.write_all(&[MSG_BLOCK]).map_err(|e| e.to_string())?;
@@ -259,8 +272,11 @@ fn do_send(
     }
 
     save_state(&spath, &cur_roots, cur_gen).map_err(|e| e.to_string())?;
-    eprintln!("replicated {} blocks, gen {cur_gen}", sorted.len());
-    Ok((sorted.len(), cur_gen))
+    eprintln!(
+        "replicated {} blocks, gen {cur_gen}",
+        data_blocks.len() + sb_slots.len()
+    );
+    Ok((data_blocks.len() + sb_slots.len(), cur_gen))
 }
 
 fn verify_node_checksum(blk: &Block) -> bool {
@@ -291,6 +307,11 @@ fn do_receive(image: &Path, listen_addr: &str) -> Result<(), String> {
 
     let mut dev = FileDevice::open(image).map_err(|e| format!("open image: {e}"))?;
     let mut blocks_received = 0u64;
+    // Superblock slots are buffered, not written immediately. On COMMIT
+    // we fsync data blocks first, then publish the superblock, then fsync
+    // again. A crash before the second fsync leaves the old superblock
+    // intact (ping-pong slots + CRC detect torn writes).
+    let mut pending_sb: Vec<(u64, [u8; BLOCK_SIZE])> = Vec::new();
 
     loop {
         let mut tag = [0u8; 1];
@@ -300,7 +321,7 @@ fn do_receive(image: &Path, listen_addr: &str) -> Result<(), String> {
         }
         match tag[0] {
             MSG_SNAPSHOT => {
-                let (_roots, _gen) = read_roots(&mut stream).map_err(|e| e.to_string())?;
+                let (_roots, _gen, _uuid) = read_roots(&mut stream).map_err(|e| e.to_string())?;
                 let block_count = read_u64(&mut stream).map_err(|e| e.to_string())?;
                 if block_count != dev.block_count() {
                     send_error(&mut stream, "block count mismatch");
@@ -309,6 +330,9 @@ fn do_receive(image: &Path, listen_addr: &str) -> Result<(), String> {
                         dev.block_count()
                     ));
                 }
+                // TODO: validate _uuid against the replica's superblock UUID
+                // to reject divergent primaries. Needs a light superblock
+                // UUID read (Fs::open is too heavy here).
             }
             MSG_BLOCK => {
                 let id = read_u64(&mut stream).map_err(|e| e.to_string())?;
@@ -318,13 +342,26 @@ fn do_receive(image: &Path, listen_addr: &str) -> Result<(), String> {
                     send_error(&mut stream, "node checksum mismatch");
                     return Err(format!("node checksum mismatch on block {id}"));
                 }
-                dev.write_block(id, &blk)
-                    .map_err(|e| format!("write block {id}: {e}"))?;
+                if id < 2 {
+                    // Superblock slot: defer until COMMIT.
+                    pending_sb.push((id, blk));
+                } else {
+                    dev.write_block(id, &blk)
+                        .map_err(|e| format!("write block {id}: {e}"))?;
+                }
                 blocks_received += 1;
             }
             MSG_COMMIT => {
                 let gen = read_u64(&mut stream).map_err(|e| e.to_string())?;
+                // 1. Data blocks durable.
                 dev.sync().map_err(|e| format!("sync: {e}"))?;
+                // 2. Publish the new superblock.
+                for (id, blk) in &pending_sb {
+                    dev.write_block(*id, blk)
+                        .map_err(|e| format!("write superblock {id}: {e}"))?;
+                }
+                // 3. Superblock durable.
+                dev.sync().map_err(|e| format!("sync superblock: {e}"))?;
                 // ACK
                 write_u32(&mut stream, MAGIC).map_err(|e| e.to_string())?;
                 write_u32(&mut stream, VERSION).map_err(|e| e.to_string())?;
