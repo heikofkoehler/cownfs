@@ -145,11 +145,19 @@ instances by directory subtree.
 **Value:** Write throughput scaling. Clients write data blocks directly
 to data servers; MDS handles metadata only.
 
-**Prerequisites (all large):**
+**Delivered (Phase 3a):** `cownfs-ds` — the thin data-server daemon.
+Dumb 4 KiB block store over TCP (`read_block`/`write_block`/status),
+CRC32C checksums computed on write and returned on read (matching
+`cownfs_core::checksum`), sparse-file backed. The MDS validates these
+checksums at LAYOUTCOMMIT time. Tested: unit (checksum match, store
+roundtrip) + TCP integration (write/read/checksum/status).
 
-1. **NFSv4.1 sessions.** pNFS requires 4.1. We are on 4.0 with no session
-   machinery. Needed: session establishment, per-session sequence
-   handling, backchannel for layout recalls and device notifications.
+**Remaining (all large):** Full pNFS requires NFSv4.1 sessions. We are
+on 4.0 with no session machinery.
+
+1. **NFSv4.1 sessions.** Needed: session establishment, per-session
+   sequence handling, backchannel for layout recalls and device
+   notifications.
 2. **Layout issuance (file layouts, RFC 5661 §12).** MDS maps file offset
    ranges to `(data_server, block_id)` extents. Client I/O goes direct
    to DS.
@@ -159,9 +167,7 @@ to data servers; MDS handles metadata only.
    orphans — GC reclaims them.
 4. **Layout recall.** When GC, snapshot deletion, or defrag moves blocks,
    MDS recalls outstanding layouts via the 4.1 backchannel. Recall races
-   are the #1 pNFS bug source — this needs dedicated testing (p17?).
-5. **Data server daemon.** Thin block store: `read_block`, `write_block`,
-   checksum verify. No filesystem logic.
+   are the #1 pNFS bug source — this needs dedicated testing.
 
 **Why CoW still helps here:** the MDS commit is a single atomic
 pointer-swing. There is no distributed transaction — the DS writes are
