@@ -172,3 +172,75 @@ fn replicate_empty_diff_is_noop() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn replicate_drive_writes_status() {
+    let dir = test_dir("drive");
+    let primary = dir.join("primary.img");
+    let replica = dir.join("replica.img");
+    let state = dir.join("repl.state");
+
+    let mut fs = Fs::format(&primary, 256).unwrap();
+    fs.commit().unwrap();
+    drop(fs);
+    std::fs::copy(&primary, &replica).unwrap();
+
+    // Receiver only accepts one connection; drive with interval 1 and let
+    // it fail after the first successful replication.
+    let port = free_port();
+    let rx = start_receiver(&replica, port);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut drive = Command::new(bin())
+        .args([
+            "drive",
+            primary.to_str().unwrap(),
+            &format!("127.0.0.1:{port}"),
+            "--state",
+            state.to_str().unwrap(),
+            "--interval",
+            "1",
+        ])
+        .spawn()
+        .expect("spawn drive");
+    // First replication succeeds, receiver exits; subsequent attempts fail.
+    wait_for_exit(rx);
+    std::thread::sleep(Duration::from_secs(3));
+    drive.kill().ok();
+    drive.wait().ok();
+
+    // Status file must exist with valid JSON showing the failure.
+    let status_path = {
+        let mut p = state.clone();
+        p.set_extension("status");
+        p
+    };
+    let data = std::fs::read_to_string(&status_path).expect("status file exists");
+    assert!(
+        data.contains("\"consecutive_failures\""),
+        "has failure count"
+    );
+    assert!(data.contains("\"lag_seconds\""), "has lag metric");
+    assert!(data.contains("\"generations_behind\""), "has behind metric");
+    // At least one success happened before the receiver went away.
+    assert!(
+        data.contains("\"last_success_unix\": 0") == false,
+        "should have one success: {data}"
+    );
+
+    // The `status` subcommand reads it back.
+    let out = Command::new(bin())
+        .args([
+            "status",
+            primary.to_str().unwrap(),
+            "--state",
+            state.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run status");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("consecutive_failures"));
+
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -152,7 +152,11 @@ fn send_error(s: &mut TcpStream, msg: &str) {
     let _ = s.write_all(b);
 }
 
-fn do_send(primary: &Path, replica_addr: &str, state_file: Option<&str>) -> Result<(), String> {
+fn do_send(
+    primary: &Path,
+    replica_addr: &str,
+    state_file: Option<&str>,
+) -> Result<(usize, u64), String> {
     let spath = state_path(primary, state_file);
     let mut fs = Fs::open(primary).map_err(|e| format!("open primary: {e:?}"))?;
     let dev = FileDevice::open(primary).map_err(|e| format!("open device: {e}"))?;
@@ -256,7 +260,7 @@ fn do_send(primary: &Path, replica_addr: &str, state_file: Option<&str>) -> Resu
 
     save_state(&spath, &cur_roots, cur_gen).map_err(|e| e.to_string())?;
     eprintln!("replicated {} blocks, gen {cur_gen}", sorted.len());
-    Ok(())
+    Ok((sorted.len(), cur_gen))
 }
 
 fn verify_node_checksum(blk: &Block) -> bool {
@@ -338,6 +342,139 @@ fn do_receive(image: &Path, listen_addr: &str) -> Result<(), String> {
     }
 }
 
+/// Replication lag metrics, persisted as JSON for monitoring.
+#[derive(Debug, Clone)]
+struct ReplStatus {
+    last_attempt_unix: u64,
+    last_success_unix: u64,
+    last_gen_replicated: u64,
+    primary_gen: u64,
+    blocks_sent_last: u64,
+    total_blocks_sent: u64,
+    consecutive_failures: u32,
+    last_error: String,
+}
+
+impl ReplStatus {
+    fn new() -> Self {
+        Self {
+            last_attempt_unix: 0,
+            last_success_unix: 0,
+            last_gen_replicated: 0,
+            primary_gen: 0,
+            blocks_sent_last: 0,
+            total_blocks_sent: 0,
+            consecutive_failures: 0,
+            last_error: String::new(),
+        }
+    }
+
+    fn lag_seconds(&self, now: u64) -> u64 {
+        if self.last_success_unix == 0 {
+            return u64::MAX;
+        }
+        now.saturating_sub(self.last_success_unix)
+    }
+
+    fn generations_behind(&self) -> u64 {
+        self.primary_gen.saturating_sub(self.last_gen_replicated)
+    }
+
+    fn to_json(&self) -> String {
+        let esc = self.last_error.replace('\\', "\\\\").replace('"', "\\\"");
+        format!(
+            "{{\n  \"last_attempt_unix\": {},\n  \"last_success_unix\": {},\n  \"lag_seconds\": {},\n  \"primary_gen\": {},\n  \"last_gen_replicated\": {},\n  \"generations_behind\": {},\n  \"blocks_sent_last\": {},\n  \"total_blocks_sent\": {},\n  \"consecutive_failures\": {},\n  \"last_error\": \"{}\"\n}}\n",
+            self.last_attempt_unix,
+            self.last_success_unix,
+            if self.last_success_unix == 0 {
+                "null".to_string()
+            } else {
+                self.lag_seconds(now_unix()).to_string()
+            },
+            self.primary_gen,
+            self.last_gen_replicated,
+            self.generations_behind(),
+            self.blocks_sent_last,
+            self.total_blocks_sent,
+            self.consecutive_failures,
+            esc,
+        )
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn status_path(state_file: Option<&str>, primary: &Path) -> PathBuf {
+    match state_file {
+        Some(s) => {
+            let mut p = PathBuf::from(s);
+            p.set_extension("status");
+            p
+        }
+        None => {
+            let mut p = primary.as_os_str().to_owned();
+            p.push(".repl.status");
+            PathBuf::from(p)
+        }
+    }
+}
+
+fn do_drive(
+    primary: &Path,
+    replica_addr: &str,
+    state_file: Option<&str>,
+    interval_secs: u64,
+) -> Result<(), String> {
+    let spath = status_path(state_file, primary);
+    let mut status = ReplStatus::new();
+    eprintln!("replication driver: {primary:?} -> {replica_addr} every {interval_secs}s");
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(interval_secs));
+        let now = now_unix();
+        status.last_attempt_unix = now;
+        // Peek at the primary generation for the behind-metric even on failure.
+        if let Ok(fs) = Fs::open(primary) {
+            status.primary_gen = fs.generation();
+        }
+        match do_send(primary, replica_addr, state_file) {
+            Ok((blocks, gen)) => {
+                status.last_success_unix = now;
+                status.last_gen_replicated = gen;
+                status.primary_gen = gen;
+                status.blocks_sent_last = blocks as u64;
+                status.total_blocks_sent += blocks as u64;
+                status.consecutive_failures = 0;
+                status.last_error.clear();
+                eprintln!("replicated gen {gen} ({blocks} blocks), lag 0s");
+            }
+            Err(e) => {
+                status.consecutive_failures += 1;
+                status.last_error = e.clone();
+                eprintln!(
+                    "replication failed ({} in a row): {e}; {} generations behind",
+                    status.consecutive_failures,
+                    status.generations_behind(),
+                );
+            }
+        }
+        if let Err(e) = std::fs::write(&spath, status.to_json()) {
+            eprintln!("warning: cannot write status file: {e}");
+        }
+    }
+}
+
+fn do_status(state_file: Option<&str>, primary: &Path) -> Result<(), String> {
+    let spath = status_path(state_file, primary);
+    let data = std::fs::read_to_string(&spath).map_err(|e| format!("read status: {e}"))?;
+    println!("{data}");
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let result = match args.get(1).map(|s| s.as_str()) {
@@ -360,7 +497,7 @@ fn main() {
                 );
                 std::process::exit(1);
             }
-            do_send(Path::new(&primary), &addr, state.as_deref())
+            do_send(Path::new(&primary), &addr, state.as_deref()).map(|_| ())
         }
         Some("receive") => {
             let image = args.get(2).cloned().unwrap_or_default();
@@ -374,10 +511,55 @@ fn main() {
             }
             do_receive(Path::new(&image), &addr)
         }
+        Some("drive") => {
+            let primary = args.get(2).cloned().unwrap_or_default();
+            let addr = args.get(3).cloned().unwrap_or_default();
+            let mut state: Option<String> = None;
+            let mut interval: u64 = 60;
+            let mut i = 4;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--state" if i + 1 < args.len() => {
+                        state = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "--interval" if i + 1 < args.len() => {
+                        interval = args[i + 1].parse().unwrap_or(60);
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+            if primary.is_empty() || addr.is_empty() {
+                eprintln!("usage: cownfs-replicate drive <primary-image> <replica-addr> [--state <file>] [--interval <secs>]");
+                std::process::exit(1);
+            }
+            do_drive(Path::new(&primary), &addr, state.as_deref(), interval)
+        }
+        Some("status") => {
+            let primary = args.get(2).cloned().unwrap_or_default();
+            let mut state: Option<String> = None;
+            let mut i = 3;
+            while i < args.len() {
+                if args[i] == "--state" && i + 1 < args.len() {
+                    state = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if primary.is_empty() {
+                eprintln!("usage: cownfs-replicate status <primary-image> [--state <file>]");
+                std::process::exit(1);
+            }
+            do_status(state.as_deref(), Path::new(&primary))
+        }
         _ => {
             eprintln!("usage:");
             eprintln!("  cownfs-replicate send <primary-image> <replica-addr> [--state <file>]");
             eprintln!("  cownfs-replicate receive <replica-image> [listen-addr]");
+            eprintln!("  cownfs-replicate drive <primary-image> <replica-addr> [--state <file>] [--interval <secs>]");
+            eprintln!("  cownfs-replicate status <primary-image> [--state <file>]");
             std::process::exit(1);
         }
     };
