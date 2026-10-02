@@ -15,14 +15,14 @@ use crate::nfs4::{
     NF4LNK, NF4REG, NFS4ERR_BADNAME, NFS4ERR_BADSESSION, NFS4ERR_BADSLOT, NFS4ERR_BADTYPE,
     NFS4ERR_BADXDR, NFS4ERR_BAD_COOKIE, NFS4ERR_EXIST, NFS4ERR_EXPIRED, NFS4ERR_INVAL,
     NFS4ERR_ISDIR, NFS4ERR_NAMETOOLONG, NFS4ERR_NOENT, NFS4ERR_NOFILEHANDLE, NFS4ERR_NOTDIR,
-    NFS4ERR_NOTSUPP, NFS4ERR_OP_ILLEGAL, NFS4ERR_ROFS, NFS4ERR_SEQ_MISORDERED, NFS4ERR_SERVERFAULT,
-    NFS4ERR_STALE_CLIENTID, NFS4ERR_TOOSMALL, NFS4_OK, OPEN4_CREATE, OP_ACCESS, OP_CLOSE,
-    OP_COMMIT, OP_CREATE, OP_CREATE_SESSION, OP_DESTROY_CLIENTID, OP_DESTROY_SESSION,
-    OP_EXCHANGE_ID, OP_GETATTR, OP_GETFH, OP_ILLEGAL, OP_LAYOUTCOMMIT, OP_LAYOUTGET,
-    OP_LAYOUTRETURN, OP_LINK, OP_LOCK, OP_LOCKU, OP_LOOKUP, OP_LOOKUPP, OP_OPEN, OP_OPEN_DOWNGRADE,
-    OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_REMOVE, OP_RENAME, OP_RENEW, OP_RESTOREFH,
-    OP_SAVEFH, OP_SECINFO, OP_SEQUENCE, OP_SETATTR, OP_SETCLIENTID, OP_SETCLIENTID_CONFIRM,
-    OP_WRITE, UNCHECKED4,
+    NFS4ERR_NOTSUPP, NFS4ERR_OP_ILLEGAL, NFS4ERR_RECALLCONFLICT, NFS4ERR_ROFS,
+    NFS4ERR_SEQ_MISORDERED, NFS4ERR_SERVERFAULT, NFS4ERR_STALE_CLIENTID, NFS4ERR_TOOSMALL, NFS4_OK,
+    OPEN4_CREATE, OP_ACCESS, OP_CLOSE, OP_COMMIT, OP_CREATE, OP_CREATE_SESSION,
+    OP_DESTROY_CLIENTID, OP_DESTROY_SESSION, OP_EXCHANGE_ID, OP_GETATTR, OP_GETFH, OP_ILLEGAL,
+    OP_LAYOUTCOMMIT, OP_LAYOUTGET, OP_LAYOUTRETURN, OP_LINK, OP_LOCK, OP_LOCKU, OP_LOOKUP,
+    OP_LOOKUPP, OP_OPEN, OP_OPEN_DOWNGRADE, OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_REMOVE,
+    OP_RENAME, OP_RENEW, OP_RESTOREFH, OP_SAVEFH, OP_SECINFO, OP_SEQUENCE, OP_SETATTR,
+    OP_SETCLIENTID, OP_SETCLIENTID_CONFIRM, OP_WRITE, UNCHECKED4,
 };
 use crate::rpc::{self, Call, RecordReader, RpcError};
 use crate::state::StateManager;
@@ -698,11 +698,15 @@ impl Session {
         if self.shared.read_only {
             return OpResult::err(OP_LAYOUTCOMMIT, NFS4ERR_ROFS);
         }
-        // The commit must fall inside an outstanding layout.
+        // The commit must fall inside an outstanding, non-recalled layout.
         {
             let layouts = self.shared.layouts.lock().unwrap();
-            if layouts.find(&sessionid, ino, offset, length).is_none() {
-                return OpResult::err(OP_LAYOUTCOMMIT, NFS4ERR_BADSESSION);
+            match layouts.find(&sessionid, ino, offset, length) {
+                None => return OpResult::err(OP_LAYOUTCOMMIT, NFS4ERR_BADSESSION),
+                Some(l) if l.recalled => {
+                    return OpResult::err(OP_LAYOUTCOMMIT, NFS4ERR_RECALLCONFLICT)
+                }
+                Some(_) => {}
             }
         }
         // Verify each block from the DS and write it into the CoW file.
@@ -1145,11 +1149,18 @@ impl Session {
             None => return OpResult::err(OP_REMOVE, NFS4ERR_NOFILEHANDLE),
         };
         // Try unlink first; if it's a dir, use rmdir.
-        let ent = match self.fs().lookup(dir_ino, name) {
-            Ok(Some((_, typ))) => typ,
+        let (ino, ent) = match self.fs().lookup(dir_ino, name) {
+            Ok(Some((i, typ))) => (i, typ),
             Ok(None) => return OpResult::err(OP_REMOVE, NFS4ERR_NOENT),
             Err(e) => return OpResult::err(OP_REMOVE, fs_to_nfs(e)),
         };
+        // Recall any outstanding pNFS layouts before freeing the blocks.
+        // (Backchannel CB_LAYOUTRECALL delivery is future work; the recall
+        // marks the layouts so commits are rejected with RECALLCONFLICT.)
+        let recalled = self.shared.layouts.lock().unwrap().recall(ino);
+        if recalled > 0 {
+            eprintln!("recalled {recalled} layouts for ino {ino} (REMOVE)");
+        }
         let result = if ent == FTYPE_DIR {
             self.fs().rmdir(dir_ino, name)
         } else {

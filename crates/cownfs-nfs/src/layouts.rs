@@ -14,6 +14,9 @@ pub struct Layout {
     pub length: u64,
     pub first_block_id: u64,
     pub nblocks: u64,
+    /// Set when the MDS recalls this layout (e.g., file deleted).
+    /// A commit against a recalled layout is rejected.
+    pub recalled: bool,
 }
 
 pub struct LayoutTable {
@@ -49,6 +52,7 @@ impl LayoutTable {
             length,
             first_block_id: first,
             nblocks,
+            recalled: false,
         };
         self.layouts.push(l.clone());
         l
@@ -90,6 +94,20 @@ impl LayoutTable {
         before - self.layouts.len()
     }
 
+    /// Recall all layouts for a file (e.g., before deletion/truncation).
+    /// Returns the number recalled. The backchannel CB_LAYOUTRECALL
+    /// delivery is future work; recalled layouts reject commits.
+    pub fn recall(&mut self, file_ino: u64) -> usize {
+        let mut n = 0;
+        for l in &mut self.layouts {
+            if l.file_ino == file_ino && !l.recalled {
+                l.recalled = true;
+                n += 1;
+            }
+        }
+        n
+    }
+
     pub fn outstanding(&self) -> usize {
         self.layouts.len()
     }
@@ -118,5 +136,18 @@ mod tests {
         let a = t.layout_get(sid, 100, 0, 4096);
         let b = t.layout_get(sid, 101, 0, 4096);
         assert_ne!(a.first_block_id, b.first_block_id);
+    }
+
+    #[test]
+    fn recall_marks_layouts() {
+        let mut t = LayoutTable::new();
+        let sid = [7u8; 16];
+        t.layout_get(sid, 100, 0, 4096);
+        t.layout_get(sid, 101, 0, 4096);
+        assert_eq!(t.recall(100), 1);
+        let l = t.find(&sid, 100, 0, 4096).unwrap();
+        assert!(l.recalled);
+        let l2 = t.find(&sid, 101, 0, 4096).unwrap();
+        assert!(!l2.recalled);
     }
 }

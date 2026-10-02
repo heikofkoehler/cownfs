@@ -36,6 +36,7 @@ pub const NFS4ERR_OP_ILLEGAL: u32 = 10044;
 pub const NFS4ERR_BADSESSION: u32 = 10064;
 pub const NFS4ERR_BADSLOT: u32 = 10065;
 pub const NFS4ERR_SEQ_MISORDERED: u32 = 10066;
+pub const NFS4ERR_RECALLCONFLICT: u32 = 10067;
 
 // Operation numbers.
 pub const OP_ACCESS: u32 = 3;

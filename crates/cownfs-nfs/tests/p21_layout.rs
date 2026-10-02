@@ -220,3 +220,83 @@ fn layoutcommit_bad_checksum_rejected() {
     ds.wait().ok();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn layout_recall_on_remove_rejects_commit() {
+    let dir = std::env::temp_dir().join(format!("cownfs-layout3-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ds_port = free_port();
+    let ds_addr = format!("127.0.0.1:{ds_port}");
+    let mut ds = Command::new(PathBuf::from(env!("CARGO_BIN_EXE_cownfs-ds")))
+        .args([dir.join("ds.bin").to_str().unwrap(), &ds_addr])
+        .spawn()
+        .expect("spawn ds");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let srv = spawn_layout_server(4096, &ds_addr);
+    let mut c = NfsClient::connect(&srv.addr);
+    let id = establish_client(&mut c, b"layout-recall");
+
+    // Create a file.
+    let mut ops = Ops::new();
+    ops.putrootfh();
+    ops.open(id, b"o", 3, OPEN4_CREATE, UNCHECKED4, &[], 0, b"rfile");
+    let (st, _) = c.call(b"create", ops);
+    assert_eq!(st, NFS4_OK);
+
+    let sid = establish_session(&mut c);
+
+    // Look it up.
+    let mut ops = Ops::new();
+    ops.sequence(&sid, 1, 0, true);
+    ops.putrootfh();
+    ops.lookup(b"rfile");
+    ops.getfh();
+    let (st, res) = c.call(b"lookup", ops);
+    assert_eq!(st, NFS4_OK);
+    let fh = match &res[3] {
+        Reply::Fh(fh) => fh.clone(),
+        r => panic!("expected Fh, got {r:?}"),
+    };
+
+    // LAYOUTGET.
+    let mut ops = Ops::new();
+    ops.sequence(&sid, 2, 0, true);
+    ops.putfh(&srv.uuid, fh.inode);
+    ops.layoutget(0, 4096);
+    let (st, res) = c.call(b"layoutget", ops);
+    assert_eq!(st, NFS4_OK);
+    let first_bid = match &res[2] {
+        Reply::Layout { first_block_id, .. } => *first_block_id,
+        r => panic!("{r:?}"),
+    };
+
+    // REMOVE the file (via session). This recalls the layout.
+    let mut ops = Ops::new();
+    ops.sequence(&sid, 3, 0, true);
+    ops.putrootfh();
+    ops.remove(b"rfile");
+    let (st, _) = c.call(b"remove", ops);
+    assert_eq!(st, NFS4_OK);
+
+    // Write to DS and try to commit: must be rejected.
+    // (PUTFH may fail with STALE since the inode is gone; either way,
+    // the commit must not succeed.)
+    let b0 = [0xDDu8; 4096];
+    let sum = ds_write(&ds_addr, first_bid, &b0);
+    let mut ops = Ops::new();
+    ops.sequence(&sid, 4, 0, true);
+    ops.putfh(&srv.uuid, fh.inode);
+    ops.layoutcommit(0, 4096, &[(first_bid, sum)], Some(4096));
+    let (st, _) = c.call(b"commit-recalled", ops);
+    // STALE (70, fh gone) or RECALLCONFLICT (layout recalled) are both
+    // correct; OK is not.
+    assert_ne!(st, NFS4_OK, "commit after REMOVE must not succeed");
+    if st != 70 {
+        assert_eq!(st, NFS4ERR_RECALLCONFLICT);
+    }
+
+    ds.kill().ok();
+    ds.wait().ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
