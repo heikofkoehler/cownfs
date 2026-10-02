@@ -12,7 +12,7 @@ use crate::nfs4::{
     encode_compound, AttrMask, AttrValues, Compound, FileAttrs, FileHandle, NfsError, Op, OpResult,
     StateId, ACCESS4_DELETE, ACCESS4_EXECUTE, ACCESS4_EXTEND, ACCESS4_LOOKUP, ACCESS4_MODIFY,
     ACCESS4_READ, FATTR4_MODE, FATTR4_SIZE, FILE_SYNC4, GUARDED4, NF4DIR, NF4LNK, NF4REG,
-    NFS4ERR_EXIST, NFS4ERR_EXPIRED, NFS4ERR_INVAL, NFS4ERR_ISDIR, NFS4ERR_NOENT,
+    NFS4ERR_BADXDR, NFS4ERR_EXIST, NFS4ERR_EXPIRED, NFS4ERR_INVAL, NFS4ERR_ISDIR, NFS4ERR_NOENT,
     NFS4ERR_NOFILEHANDLE, NFS4ERR_NOTDIR, NFS4ERR_NOTSUPP, NFS4ERR_OP_ILLEGAL, NFS4ERR_SERVERFAULT,
     NFS4ERR_STALE_CLIENTID, NFS4_OK, OPEN4_CREATE, OP_ACCESS, OP_CLOSE, OP_COMMIT, OP_CREATE,
     OP_GETATTR, OP_GETFH, OP_ILLEGAL, OP_LINK, OP_LOCK, OP_LOCKU, OP_LOOKUP, OP_LOOKUPP, OP_OPEN,
@@ -1108,6 +1108,12 @@ fn handle_record(record: &[u8], session: &mut Session, debug_rpc: bool) -> Vec<u
                         eprintln!("OPS [?] decode error: BadOp({n})");
                     }
                     (NFS4ERR_NOTSUPP, encode_compound(b"", NFS4ERR_NOTSUPP, &[]))
+                }
+                Err(NfsError::Xdr(e)) => {
+                    if debug_rpc {
+                        eprintln!("OPS [?] decode error: Xdr({e:?})");
+                    }
+                    (NFS4ERR_BADXDR, encode_compound(b"", NFS4ERR_BADXDR, &[]))
                 }
                 Err(e) => {
                     if debug_rpc {
