@@ -15,6 +15,7 @@ pub const NFS4ERR_NOFILEHANDLE: u32 = 20; // same code as NOTDIR per RFC 7530
 pub const NFS4ERR_BADXDR: u32 = 10036;
 pub const NFS4ERR_NAMETOOLONG: u32 = 63;
 pub const NFS4ERR_BADNAME: u32 = 10028;
+pub const NFS4ERR_BADTYPE: u32 = 10007;
 pub const NFS4ERR_ISDIR: u32 = 21;
 pub const NFS4ERR_INVAL: u32 = 22;
 pub const NFS4ERR_NOSPC: u32 = 28;
