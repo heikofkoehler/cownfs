@@ -114,6 +114,8 @@ pub struct Shared {
     /// NFSv4.0 referral table: directory inode -> list of targets.
     /// Empty disables referrals.
     pub referrals: Arc<crate::referrals::ReferralTable>,
+    /// Metrics registry.
+    pub metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl Shared {
@@ -126,6 +128,7 @@ impl Shared {
             ds_addr: None,
             read_only: false,
             referrals: Arc::new(crate::referrals::ReferralTable::new()),
+            metrics: crate::metrics::Metrics::new(),
         }
     }
 
@@ -138,6 +141,7 @@ impl Shared {
             ds_addr: None,
             read_only: true,
             referrals: Arc::new(crate::referrals::ReferralTable::new()),
+            metrics: crate::metrics::Metrics::new(),
         }
     }
 
@@ -163,6 +167,8 @@ struct Session {
     saved_fh: Option<u64>,
     /// v4.1 session ID from the compound's SEQUENCE (None in 4.0 mode).
     session41: Option<[u8; 16]>,
+    /// Client address for audit logging.
+    client_addr: String,
 }
 
 impl Session {
@@ -172,6 +178,17 @@ impl Session {
             cfh: None,
             saved_fh: None,
             session41: None,
+            client_addr: "unknown".to_string(),
+        }
+    }
+
+    fn with_client_addr(shared: &Shared, addr: String) -> Self {
+        Session {
+            shared: shared.clone(),
+            cfh: None,
+            saved_fh: None,
+            session41: None,
+            client_addr: addr,
         }
     }
 
@@ -257,8 +274,12 @@ impl Session {
         }
         let mut out = Vec::new();
         for op in &compound.ops {
+            let start = std::time::Instant::now();
             let res = self.exec(op);
             let failed = res.status != NFS4_OK;
+            self.shared
+                .metrics
+                .record(op_name(res.opnum), start.elapsed(), failed);
             out.push(res);
             if failed {
                 break;
@@ -324,8 +345,12 @@ impl Session {
         self.session41 = Some(sessionid);
         let mut out = vec![seq_res];
         for op in &compound.ops[1..] {
+            let start = std::time::Instant::now();
             let res = self.exec(op);
             let failed = res.status != NFS4_OK;
+            self.shared
+                .metrics
+                .record(op_name(res.opnum), start.elapsed(), failed);
             out.push(res);
             if failed {
                 break;
@@ -423,13 +448,31 @@ impl Session {
                 if self.shared.read_only {
                     return OpResult::err(OP_CREATE, NFS4ERR_ROFS);
                 }
-                self.op_create(*ftype, linkdata, name, attrs)
+                let res = self.op_create(*ftype, linkdata, name, attrs);
+                if res.status == NFS4_OK {
+                    crate::log::audit(
+                        "CREATE",
+                        &self.client_addr,
+                        0, // TODO: extract UID from RPC credentials
+                        &String::from_utf8_lossy(name),
+                    );
+                }
+                res
             }
             Op::Remove(name) => {
                 if self.shared.read_only {
                     return OpResult::err(OP_REMOVE, NFS4ERR_ROFS);
                 }
-                self.op_remove(name)
+                let res = self.op_remove(name);
+                if res.status == NFS4_OK {
+                    crate::log::audit(
+                        "REMOVE",
+                        &self.client_addr,
+                        0,
+                        &String::from_utf8_lossy(name),
+                    );
+                }
+                res
             }
             Op::Secinfo(name) => self.op_secinfo(name),
             Op::Illegal => OpResult::err(OP_ILLEGAL, NFS4ERR_OP_ILLEGAL),
@@ -1607,8 +1650,12 @@ impl Session {
 /// Serve one TCP connection to completion (client close or fatal error).
 fn serve_connection(stream: TcpStream, shared: &Shared) -> Result<(), ServerError> {
     let mut stream = stream;
+    let client_addr = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
     let mut rr = RecordReader::new();
-    let mut session = Session::new(shared);
+    let mut session = Session::with_client_addr(shared, client_addr);
     let mut buf = [0u8; 64 * 1024];
     let debug_rpc = std::env::var("COWNFS_DEBUG_RPC").is_ok();
     loop {

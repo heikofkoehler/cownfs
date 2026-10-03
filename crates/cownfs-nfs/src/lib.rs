@@ -4,6 +4,8 @@
 //! protocol surface stays minimal and auditable.
 
 pub mod layouts;
+pub mod log;
+pub mod metrics;
 pub mod nfs4;
 pub mod referrals;
 pub mod rpc;

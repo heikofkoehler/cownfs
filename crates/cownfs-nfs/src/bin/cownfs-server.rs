@@ -136,6 +136,42 @@ fn main() {
         }
         None => shared,
     };
+
+    // Metrics/health HTTP endpoint (on addr port + 1000).
+    let metrics_shared = shared.clone();
+    let metrics_addr = {
+        let mut parts = addr.rsplitn(2, ':');
+        let port: u16 = parts.next().unwrap().parse().unwrap_or(2049);
+        let host = parts.next().unwrap_or("127.0.0.1");
+        format!("{host}:{}", port + 1000)
+    };
+    std::thread::spawn(move || {
+        let listener = std::net::TcpListener::bind(&metrics_addr).unwrap();
+        eprintln!("metrics on http://{metrics_addr}/metrics");
+        for stream in listener.incoming() {
+            if let Ok(mut s) = stream {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let req = String::from_utf8_lossy(&buf);
+                let (status, ctype, body) = if req.starts_with("GET /metrics") {
+                    ("200 OK", "text/plain", metrics_shared.metrics.render())
+                } else if req.starts_with("GET /healthz") {
+                    ("200 OK", "text/plain", "ok\n".to_string())
+                } else {
+                    ("404 Not Found", "text/plain", "not found\n".to_string())
+                };
+                let _ = s.write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+    });
+
     if let Err(e) = server::serve(&addr, shared) {
         eprintln!("server error: {e:?}");
         std::process::exit(1);
