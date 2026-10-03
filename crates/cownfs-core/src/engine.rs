@@ -394,7 +394,7 @@ fn read_from(
     // Group contiguous physical blocks (skip holes).
     let mut i = 0;
     while i < mappings.len() {
-        let (fblk, pblk, cksum) = mappings[i];
+        let (fblk, pblk, _cksum) = mappings[i];
         if pblk == u64::MAX {
             // Hole: emit zeros.
             let in_blk = if fblk == start_blk {
@@ -531,6 +531,7 @@ impl TxgCoord {
     }
 
     /// Clear a previous error (on successful sync).
+    #[allow(dead_code)]
     fn clear_error(&self) {
         let mut s = self.state.lock().unwrap();
         s.error = None;

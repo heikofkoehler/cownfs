@@ -1337,7 +1337,6 @@ impl Session {
         // Get directory entries based on filehandle type.
         // Returns (name, child_fh, ftype) for each entry.
         enum EntryFh {
-            Live(u64),
             Snap(u32, u64),
         }
         // For live directories, page through readdir_paged to avoid
@@ -1387,13 +1386,6 @@ impl Session {
         let mut eof = true;
         for (idx, (name, child_fh, _typ)) in entries.iter().enumerate().skip(start) {
             let (attr_ino, inode, fh_for_attr) = match child_fh {
-                EntryFh::Live(child_ino) => {
-                    let inode = match self.fs().getattr(*child_ino) {
-                        Ok(i) => i,
-                        Err(_) => continue,
-                    };
-                    (*child_ino, inode, Fh::Live(*child_ino))
-                }
                 EntryFh::Snap(snap_id, child_ino) => {
                     let inode = match self.fs().snapshot_getattr(*snap_id as u64, *child_ino) {
                         Ok(i) => i,

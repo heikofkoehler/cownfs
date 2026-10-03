@@ -12,7 +12,20 @@ fn backup_bin() -> String {
     env!("CARGO_BIN_EXE_cownfs-backup").to_string()
 }
 fn fsck_bin() -> String {
-    env!("CARGO_BIN_EXE_cownfs-fsck").to_string()
+    // cownfs-fsck lives in a separate package; locate it via the target dir.
+    let test_exe = std::env::current_exe().expect("current test exe");
+    // test_exe is target/debug/deps/p54_backup_e2e-<hash>; binary is at target/debug/cownfs-fsck
+    let target_debug = test_exe
+        .parent() // deps/
+        .and_then(|p| p.parent()) // debug/
+        .expect("target dir");
+    let fsck = target_debug.join("cownfs-fsck");
+    assert!(
+        fsck.exists(),
+        "cownfs-fsck binary not found at {}; run `cargo build -p cownfs-fsck` first",
+        fsck.display()
+    );
+    fsck.to_string_lossy().to_string()
 }
 
 fn run_backup(args: &[&str]) {
