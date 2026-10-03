@@ -32,14 +32,17 @@ fn torn_write_detected_by_checksum() {
     fs.commit().unwrap();
     drop(fs);
 
-    // Reopen and read: checksum should fail (torn block detected).
+    // Reopen and read: checksum MUST fail (torn block detected).
+    // The torn write persists only 100 of 4096 bytes; the checksum was
+    // computed over the full in-memory buffer, so verification fails
+    // deterministically.
     let fs = Fs::open(&img).unwrap();
-    let result = fs.read(ino, 0, 8192);
-    // Either the read fails with Corrupt, or it succeeds if the torn
-    // write happened to not affect the checksum (unlikely).
-    // We mainly verify no panic and the fs is still openable.
-    let _ = result;
-    // check() should still pass (metadata is intact).
+    match fs.read(ino, 0, 8192) {
+        Err(cownfs_core::engine::FsError::Corrupt(_)) => {}
+        Err(e) => panic!("expected Corrupt from torn write, got {e}"),
+        Ok(_) => panic!("expected Corrupt from torn write, read succeeded"),
+    }
+    // The filesystem itself must still be consistent.
     fs.check().unwrap();
     let _ = std::fs::remove_file(&img);
 }
@@ -52,17 +55,25 @@ fn bit_flip_detected() {
     fs.write(ino, 0, &vec![0xabu8; 8192]).unwrap();
     fs.commit().unwrap();
 
-    // Enable bit flips with high probability.
-    fs.set_device_faults(FaultInjector::new().with_bit_flips(0.5));
+    // Enable bit flips with probability 1.0: every written block gets a
+    // deterministic single-bit flip (seeded by block number), while the
+    // extent checksum is computed from the pre-flip buffer. Corruption is
+    // guaranteed, not probabilistic.
+    fs.set_device_faults(FaultInjector::new().with_bit_flips(1.0));
     fs.write(ino, 0, &vec![0xcdu8; 8192]).unwrap();
     fs.clear_device_faults();
     fs.commit().unwrap();
     drop(fs);
 
-    // Reopen: should not panic. Checksum may or may not catch it
-    // depending on which bit flipped.
+    // Reopen and read: checksum MUST fail deterministically.
     let fs = Fs::open(&img).unwrap();
-    let _ = fs.read(ino, 0, 8192);
+    match fs.read(ino, 0, 8192) {
+        Err(cownfs_core::engine::FsError::Corrupt(_)) => {}
+        Err(e) => panic!("expected Corrupt from bit flip, got {e}"),
+        Ok(_) => panic!("expected Corrupt from bit flip, read succeeded"),
+    }
+    // Metadata is intact; only the data block checksum fails.
+    fs.check().unwrap();
     let _ = std::fs::remove_file(&img);
 }
 
