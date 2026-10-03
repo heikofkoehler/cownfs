@@ -18,6 +18,9 @@ pub struct Bitmap {
     /// load). Used for delta-bitmap persists: only dirty words are written
     /// per txg instead of the full bitmap.
     dirty: std::collections::HashSet<u64>,
+    /// Allocation cursor: word index where the last alloc succeeded.
+    /// Next alloc starts here (wraps around) instead of scanning from 0.
+    cursor: u64,
 }
 
 impl Bitmap {
@@ -26,6 +29,7 @@ impl Bitmap {
             words: vec![0; nbits.div_ceil(64) as usize],
             nbits,
             dirty: std::collections::HashSet::new(),
+            cursor: 0,
         }
     }
 
@@ -52,20 +56,47 @@ impl Bitmap {
         self.words[(i / 64) as usize] & (1u64 << (i % 64)) != 0
     }
 
-    /// First-fit allocation: returns a free block number and marks it used.
+    /// First-fit allocation starting from the cursor (wraps around).
+    /// Returns a free block number and marks it used.
     pub fn alloc(&mut self) -> Option<u64> {
-        for (wi, w) in self.words.iter_mut().enumerate() {
+        let nwords = self.words.len() as u64;
+        if nwords == 0 {
+            return None;
+        }
+        let start = (self.cursor % nwords) as usize;
+        for offset in 0..nwords {
+            let wi = (start + offset as usize) % nwords as usize;
+            let w = &mut self.words[wi];
             if *w != u64::MAX {
                 let bit = w.trailing_ones();
                 let idx = wi as u64 * 64 + bit as u64;
                 if idx < self.nbits {
                     *w |= 1u64 << bit;
                     self.dirty.insert(wi as u64);
+                    self.cursor = wi as u64;
                     return Some(idx);
                 }
             }
         }
         None
+    }
+
+    /// Try to allocate a specific block (for contiguous runs). Returns true
+    /// if the block was free and is now allocated.
+    pub fn alloc_at(&mut self, block: u64) -> bool {
+        if block >= self.nbits {
+            return false;
+        }
+        let wi = (block / 64) as usize;
+        let bit = block % 64;
+        if self.words[wi] & (1u64 << bit) == 0 {
+            self.words[wi] |= 1u64 << bit;
+            self.dirty.insert(wi as u64);
+            self.cursor = wi as u64;
+            true
+        } else {
+            false
+        }
     }
 
     /// Word indices changed since the last [`Self::clear_dirty`].

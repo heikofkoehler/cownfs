@@ -1424,6 +1424,16 @@ impl Fs {
             .ok_or(FsError::NoSpace)
     }
 
+    /// Allocate a block, preferring `hint` (for contiguous runs). Falls back
+    /// to the cursor-based alloc if the hinted block is taken.
+    fn alloc_block_hint(&mut self, hint: u64) -> Result<u64, FsError> {
+        let mut sh = self.shared.lock().unwrap();
+        if sh.bitmap.alloc_at(hint) {
+            return Ok(hint);
+        }
+        sh.bitmap.alloc().ok_or(FsError::NoSpace)
+    }
+
     /// Free a data block. Deferred like metadata frees: the bitmap bit is
     /// cleared at commit, so the block cannot be reallocated while the
     /// committed generation still references it. Blocks pinned by a
@@ -1803,6 +1813,20 @@ impl Fs {
         read_from(&self.extents, &self.shared, &inode, ino, offset, len)
     }
 
+    /// Get the physical block numbers for a file's extents, in file order.
+    /// For testing fragmentation.
+    pub fn debug_extent_blocks(&self, ino: u64) -> Result<Vec<u64>, FsError> {
+        let inode = self.getattr(ino)?;
+        let nblocks = inode.size.div_ceil(BLOCK_SIZE as u64);
+        let mut out = Vec::new();
+        for off in 0..nblocks {
+            if let Some(ext) = self.extents.get(&ExtentKey { ino, off })? {
+                out.push(ext.blk);
+            }
+        }
+        Ok(out)
+    }
+
     /// Copy-on-write write: touched blocks are always freshly allocated;
     /// old blocks are freed (P3: unless a snapshot still references them).
     pub fn write(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<(), FsError> {
@@ -1821,6 +1845,7 @@ impl Fs {
             self.check_quota(inode.uid, new_blocks - old_blocks)?;
         }
         let mut pos = 0usize;
+        let mut last_blk: Option<u64> = None;
         while pos < data.len() {
             let foff = offset + pos as u64;
             let blk_off = foff / BLOCK_SIZE as u64;
@@ -1828,7 +1853,12 @@ impl Fs {
             let n = (BLOCK_SIZE - in_blk).min(data.len() - pos);
             let key = ExtentKey { ino, off: blk_off };
             let old = self.extents.get(&key)?;
-            let new_blk = self.alloc_block()?;
+            // Prefer contiguous allocation for sequential writes.
+            let new_blk = match last_blk {
+                Some(lb) => self.alloc_block_hint(lb + 1)?,
+                None => self.alloc_block()?,
+            };
+            last_blk = Some(new_blk);
             let mut buf = [0u8; BLOCK_SIZE];
             if let Some(ext) = old {
                 self.read_block(ext.blk, &mut buf)?;
