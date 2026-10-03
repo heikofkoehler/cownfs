@@ -531,7 +531,6 @@ impl TxgCoord {
     }
 
     /// Clear a previous error (on successful sync).
-    #[allow(dead_code)]
     fn clear_error(&self) {
         let mut s = self.state.lock().unwrap();
         s.error = None;
@@ -1586,7 +1585,18 @@ impl Fs {
     /// superblock slot. Called by the background sync thread; returns true
     /// if a txg was synced. Wakes all [`TxgCoord::wait`] waiters.
     pub fn sync_txg(&mut self) -> Result<bool, FsError> {
+        // Clear any previous error even if there's nothing to sync —
+        // a successful sync_txg() call resets the error state.
+        self.txg.clear_error();
         if !self.txg.state.lock().unwrap().dirty {
+            // Nothing to persist, but still advance the txg numbers so
+            // waiters on commit_async() IDs don't hang. No superblock
+            // flip (avoids spurious generation advances).
+            let mut t = self.txg.state.lock().unwrap();
+            t.synced = t.current;
+            t.current += 1;
+            drop(t);
+            self.txg.cv.notify_all();
             return Ok(false);
         }
         // The new generation's blocks must be on stable storage *before*
