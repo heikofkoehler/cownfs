@@ -1900,6 +1900,9 @@ pub fn serve_concurrent(listener: TcpListener, shared: Shared) -> Result<(), Ser
         }
         match listener.accept() {
             Ok((s, _)) => {
+                // Accepted sockets inherit non-blocking from the listener;
+                // set back to blocking for serve_connection.
+                let _ = s.set_nonblocking(false);
                 let shared = shared.clone();
                 let active = active.clone();
                 // Connection limit: refuse if too many active.
