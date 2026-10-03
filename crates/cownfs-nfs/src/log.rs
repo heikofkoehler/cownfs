@@ -47,11 +47,16 @@ pub fn debug(msg: &str, fields: &[(&str, &str)]) {
 /// Audit log: mutating operations with client identity.
 /// Always logged at info level, separate from debug logs.
 pub fn audit(op: &str, client: &str, uid: u32, details: &str) {
+    eprintln!("{}", format_audit(op, client, uid, details));
+}
+
+/// Format an audit log entry as JSON (testable).
+pub fn format_audit(op: &str, client: &str, uid: u32, details: &str) -> String {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    eprintln!(
+    format!(
         "{{\"ts\":{ts},\"level\":\"audit\",\"op\":\"{op}\",\"client\":\"{client}\",\"uid\":{uid},\"details\":\"{details}\"}}"
-    );
+    )
 }

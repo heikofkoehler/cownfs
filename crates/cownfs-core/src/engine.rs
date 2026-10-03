@@ -1679,6 +1679,11 @@ impl Fs {
         self.dirs.remove(&key)?;
         // Directory nlink drops by 2 (".." of the child pointed here, plus
         // the named link); v1 keeps it simple: remove the inode directly.
+        // Release quota for the directory inode.
+        if let Ok(inode) = self.getattr(ent.ino) {
+            let blocks = Self::blocks_for_size(inode.size);
+            self.sub_usage(inode.uid, blocks);
+        }
         self.inodes.remove(&ent.ino)?;
         let now = now_secs();
         let mut p = self.getattr(parent)?;
@@ -1824,7 +1829,15 @@ impl Fs {
             inode.mode = m & 0o7777;
         }
         if let Some(u) = attrs.uid {
-            inode.uid = u;
+            if u != inode.uid {
+                // Transfer quota usage to the new owner.
+                let blocks = Self::blocks_for_size(inode.size);
+                self.sub_usage(inode.uid, blocks);
+                // Check new owner's quota before transferring.
+                self.check_quota(u, blocks)?;
+                self.add_usage(u, blocks);
+                inode.uid = u;
+            }
         }
         if let Some(g) = attrs.gid {
             inode.gid = g;
