@@ -575,6 +575,11 @@ pub struct Fs {
     /// True if the image has bitmap CRC sidecar areas (magic present).
     /// v3 images lack them → CRC verification skipped.
     has_bitmap_crcs: bool,
+    /// Sequential readahead state: ino -> (last_offset_end, readahead_size).
+    /// Tracks the end offset of the last read per inode; if the next read
+    /// starts where the last one ended, it's sequential and we prefetch.
+    /// Guarded by Mutex for interior mutability (Fs::read takes &self).
+    readahead: std::sync::Mutex<std::collections::HashMap<u64, (u64, u64)>>,
 }
 
 /// Name of the hidden file backing extended attributes.
@@ -770,6 +775,7 @@ impl Fs {
             last_bitmap_write_bytes: 0,
             txg_allocated: std::collections::HashSet::new(),
             has_bitmap_crcs: true, // fresh format always has CRC sidecars
+            readahead: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
 
         let now = now_secs();
@@ -967,6 +973,7 @@ impl Fs {
             last_bitmap_write_bytes: 0,
             txg_allocated: std::collections::HashSet::new(),
             has_bitmap_crcs,
+            readahead: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         fs.rebuild_pinned()?;
         fs.rebuild_quota_usage()?;
@@ -2424,7 +2431,45 @@ impl Fs {
 
     pub fn read(&self, ino: u64, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
         let inode = self.getattr(ino)?;
-        read_from(&self.extents, &self.shared, &inode, ino, offset, len)
+
+        // A4: Sequential readahead. If this read starts where the last one
+        // for this inode ended, it's a sequential scan: prefetch ahead.
+        // Start at 64KB, double on each sequential read, cap at 1MB.
+        // Random reads reset the readahead to 0.
+        const RA_INITIAL: u64 = 64 * 1024;
+        const RA_MAX: u64 = 1024 * 1024;
+
+        let fetch_len = {
+            let mut ra = self.readahead.lock().unwrap();
+            let (last_end, last_ra) = ra.get(&ino).copied().unwrap_or((u64::MAX, 0));
+            let new_ra = if offset == last_end {
+                // Sequential: double (or start at initial).
+                if last_ra == 0 {
+                    RA_INITIAL
+                } else {
+                    (last_ra * 2).min(RA_MAX)
+                }
+            } else {
+                // Random access: no readahead.
+                0
+            };
+            // Record the end of the *requested* range (not including
+            // readahead) so the next sequential check is accurate.
+            ra.insert(ino, (offset.saturating_add(len as u64), new_ra));
+            // Extend the fetch to cover readahead, clamped to file size.
+            // read_from() also clamps to inode.size, so this is safe.
+            let max_end = offset
+                .saturating_add(len as u64)
+                .saturating_add(new_ra)
+                .min(inode.size);
+            max_end.saturating_sub(offset) as usize
+        };
+
+        let mut data = read_from(&self.extents, &self.shared, &inode, ino, offset, fetch_len)?;
+        // Truncate to the requested length; the extra data was only for
+        // warming the page cache.
+        data.truncate(len);
+        Ok(data)
     }
 
     /// Get the physical block numbers for a file's extents, in file order.
