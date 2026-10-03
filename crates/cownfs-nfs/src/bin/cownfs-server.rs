@@ -26,6 +26,13 @@ fn main() {
         .position(|a| a == "--node-id")
         .and_then(|i| args.get(i + 1))
         .cloned();
+    let log_level = args
+        .iter()
+        .position(|a| a == "--log-level")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.as_str())
+        .unwrap_or("info");
+    cownfs_nfs::log::set_level(log_level);
     let lease_ttl: u64 = args
         .iter()
         .position(|a| a == "--lease-ttl")
@@ -40,6 +47,7 @@ fn main() {
                 && *a != "--referrals"
                 && *a != "--node-id"
                 && *a != "--lease-ttl"
+                && *a != "--log-level"
         })
         .collect();
     // Remove the option values from positionals.
