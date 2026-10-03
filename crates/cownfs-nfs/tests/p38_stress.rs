@@ -157,3 +157,11 @@ fn run_stress(it: usize) {
     fs.check().unwrap();
     let _ = std::fs::remove_file(&img);
 }
+
+/// Odd iteration count: exercises the case where the last iteration (i=50,
+/// even) does an unlink. Without the post-unlink COMMIT, the unlink may not
+/// be durable when the test reopens the image directly.
+#[test]
+fn stress_odd_iterations() {
+    run_stress(51);
+}
