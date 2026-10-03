@@ -7,7 +7,7 @@ use cownfs_nfs::server;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: cownfs-server [--read-only] [--ds-addr <addr>] [--referrals <file>] [--node-id <id>] [--lease-ttl <secs>] <image> [addr]");
+        eprintln!("usage: cownfs-server [--read-only] [--ds-addr <addr>] [--referrals <file>] [--node-id <id>] [--lease-ttl <secs>] [--snapshot-policy <spec>] <image> [addr]");
         std::process::exit(1);
     }
     let read_only = args.iter().any(|a| a == "--read-only");
@@ -39,6 +39,11 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse().ok())
         .unwrap_or(30);
+    let snapshot_policy = args
+        .iter()
+        .position(|a| a == "--snapshot-policy")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
     let positional: Vec<&String> = args[1..]
         .iter()
         .filter(|a| {
@@ -48,6 +53,7 @@ fn main() {
                 && *a != "--node-id"
                 && *a != "--lease-ttl"
                 && *a != "--log-level"
+                && *a != "--snapshot-policy"
         })
         .collect();
     // Remove the option values from positionals.
@@ -62,6 +68,7 @@ fn main() {
                         .iter()
                         .position(|a| a == "--lease-ttl")
                         .and_then(|i| args.get(i + 1))
+                && Some(*a) != snapshot_policy.as_ref()
         })
         .collect();
     let addr = positional
@@ -157,6 +164,76 @@ fn main() {
     std::thread::spawn(move || {
         let _ = server::serve_metrics(&metrics_addr, &metrics_shared);
     });
+
+    // Telescoping snapshot scheduler (NetApp-style). Ticks once a minute;
+    // creates timestamped snapshots per tier and prunes beyond keep counts.
+    if let Some(spec) = snapshot_policy {
+        if read_only {
+            eprintln!("warning: --snapshot-policy ignored in read-only mode");
+        } else {
+            match cownfs_nfs::snapshot_sched::SnapshotPolicy::parse(&spec) {
+                Ok(policy) => {
+                    eprintln!("snapshot scheduler: {spec}");
+                    let sched_shared = shared.clone();
+                    std::thread::spawn(move || {
+                        let tick = std::time::Duration::from_secs(60);
+                        loop {
+                            std::thread::sleep(tick);
+                            let now = std::time::SystemTime::now();
+                            // Hold the fs lock across schedule + commit so no
+                            // NFS op interleaves between them.
+                            let mut fs = sched_shared.fs.lock().unwrap();
+                            let events = match policy.run_once(&mut fs, now) {
+                                Ok(ev) => ev,
+                                Err(e) => {
+                                    eprintln!("snapshot scheduler: error: {e:?}");
+                                    continue;
+                                }
+                            };
+                            if events.is_empty() {
+                                continue;
+                            }
+                            if let Err(e) = fs.commit() {
+                                eprintln!("snapshot scheduler: commit failed: {e:?}");
+                                continue;
+                            }
+                            drop(fs);
+                            for ev in &events {
+                                match ev {
+                                    cownfs_nfs::snapshot_sched::SchedEvent::Created {
+                                        name,
+                                        id,
+                                        ..
+                                    } => {
+                                        eprintln!("snapshot scheduler: created {name} (id {id})")
+                                    }
+                                    cownfs_nfs::snapshot_sched::SchedEvent::Pruned {
+                                        name,
+                                        id,
+                                        ..
+                                    } => {
+                                        eprintln!("snapshot scheduler: pruned {name} (id {id})")
+                                    }
+                                    cownfs_nfs::snapshot_sched::SchedEvent::SkippedCollision {
+                                        name,
+                                        ..
+                                    } => {
+                                        eprintln!(
+                                            "snapshot scheduler: name collision, skipped {name}"
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("error: bad --snapshot-policy: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
 
     if let Err(e) = server::serve(&addr, shared) {
         eprintln!("server error: {e:?}");

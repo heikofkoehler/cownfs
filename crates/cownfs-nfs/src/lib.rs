@@ -11,6 +11,7 @@ pub mod referrals;
 pub mod rpc;
 pub mod server;
 pub mod sessions;
+pub mod snapshot_sched;
 pub mod state;
 pub mod throttle;
 pub mod xdr;

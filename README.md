@@ -249,6 +249,14 @@ curl http://localhost:3049/healthz
 
 # Perform offline full backup
 ./target/release/cownfs-backup create /data/cow.img /backups/cow-$(date +%F).bak
+
+# Enable NetApp-style telescoping snapshots: 24 hourly, 7 daily, 4 weekly.
+# The server creates timestamped snapshots (hourly-YYYYMMDD-HHMMSS) on a
+# 60s tick and prunes each tier beyond its keep count. Browse them at
+# .snapshots/ over NFS; manage manually with cownfs-snapshot.
+./target/release/cownfs-server \
+    --snapshot-policy hourly:24,daily:7,weekly:4 \
+    /data/cow.img 0.0.0.0:2049 &
 ```
 
 See [docs/production-readiness.md](docs/production-readiness.md) for complete operational guides, monitoring alerts, and failover runbooks.
@@ -262,6 +270,7 @@ See [docs/production-readiness.md](docs/production-readiness.md) for complete op
   - `cownfs-server` — Main NFSv4.0 server daemon
   - `cownfs-backup` — Offline streaming backup/restore utility
   - `cownfs-replicate` — Incremental snapshot-diff replication tool
+  - `cownfs-snapshot` — Offline snapshot create/list/info/delete CLI
   - `cownfs-shard` & `cownfs-cluster` — Sharding orchestration utilities
   - `cownfs-ds` — Experimental pNFS data server
 - [`crates/cownfs-mkfs/`](crates/cownfs-mkfs/) — Filesystem formatter (`cownfs-mkfs`).
