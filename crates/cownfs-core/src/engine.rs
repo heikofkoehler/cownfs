@@ -1564,8 +1564,14 @@ impl Fs {
     pub fn commit_async(&mut self) -> Result<u64, FsError> {
         let flushed = self.flush_all()?;
         self.check_fault(FaultPoint::AfterFlush)?;
-        self.persist_bitmap(0)?; // area_start unused (delta bitmap)
-        self.check_fault(FaultPoint::AfterBitmap)?;
+        // Only persist the bitmap if something was actually flushed.
+        // Persisting an unchanged bitmap writes a spurious delta with a
+        // future generation number that is never committed to the
+        // superblock, leaving the image in a state that fails fsck.
+        if flushed {
+            self.persist_bitmap(0)?; // area_start unused (delta bitmap)
+            self.check_fault(FaultPoint::AfterBitmap)?;
+        }
         // Blocks are now durable (will be after sync_txg); clear the set.
         // Actually, clear after sync_txg to be safe. For now, clear here
         // since commit_async is the persist point.

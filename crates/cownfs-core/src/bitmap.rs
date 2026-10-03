@@ -244,7 +244,8 @@ impl PagedBitmap {
         if words[wi] & (1u64 << bit) == 0 {
             words[wi] |= 1u64 << bit;
             self.dirty_pages.insert(page);
-            self.dirty_words.insert(page * WORDS_PER_PAGE as u64 + wi as u64);
+            self.dirty_words
+                .insert(page * WORDS_PER_PAGE as u64 + wi as u64);
             if self.free_counts[page as usize] > 0 {
                 self.free_counts[page as usize] -= 1;
             }
@@ -262,7 +263,8 @@ impl PagedBitmap {
         if words[wi] & (1u64 << bit) != 0 {
             words[wi] &= !(1u64 << bit);
             self.dirty_pages.insert(page);
-            self.dirty_words.insert(page * WORDS_PER_PAGE as u64 + wi as u64);
+            self.dirty_words
+                .insert(page * WORDS_PER_PAGE as u64 + wi as u64);
             self.free_counts[page as usize] += 1;
             self.touch(page);
         }
@@ -334,7 +336,8 @@ impl PagedBitmap {
                 if idx < self.nbits {
                     *w |= 1u64 << bit;
                     self.dirty_pages.insert(page_idx);
-                    self.dirty_words.insert(page_idx * WORDS_PER_PAGE as u64 + wi as u64);
+                    self.dirty_words
+                        .insert(page_idx * WORDS_PER_PAGE as u64 + wi as u64);
                     if self.free_counts[page_idx as usize] > 0 {
                         self.free_counts[page_idx as usize] -= 1;
                     }
@@ -359,7 +362,8 @@ impl PagedBitmap {
         if words[wi] & (1u64 << bit) == 0 {
             words[wi] |= 1u64 << bit;
             self.dirty_pages.insert(page);
-            self.dirty_words.insert(page * WORDS_PER_PAGE as u64 + wi as u64);
+            self.dirty_words
+                .insert(page * WORDS_PER_PAGE as u64 + wi as u64);
             if self.free_counts[page as usize] > 0 {
                 self.free_counts[page as usize] -= 1;
             }
