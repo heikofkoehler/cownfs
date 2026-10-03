@@ -37,21 +37,33 @@ fn backup_restore_roundtrip() {
         .args(["create", img.to_str().unwrap(), bak.to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(out.status.success(), "create: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "create: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Verify.
     let out = Command::new(&bin)
         .args(["verify", bak.to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(out.status.success(), "verify: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "verify: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Restore.
     let out = Command::new(&bin)
         .args(["restore", bak.to_str().unwrap(), rst.to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(out.status.success(), "restore: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "restore: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Read back from restored image.
     let fs = Fs::open(&rst).unwrap();

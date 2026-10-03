@@ -110,7 +110,7 @@ fn read_header(f: &mut File) -> Result<([u8; 16], u64, u64), String> {
 
 fn do_verify(backup: &Path) -> Result<(), String> {
     let mut f = File::open(backup).map_err(|e| format!("open: {e}"))?;
-    let (uuid, gen, ts) = read_header(&mut f)?;
+    let (_uuid, gen, ts) = read_header(&mut f)?;
     let nblocks = read_u64(&mut f).map_err(|e| format!("read count: {e}"))?;
 
     let mut buf = [0u8; BLOCK_SIZE];
@@ -141,7 +141,7 @@ fn do_list(backup: &Path) -> Result<(), String> {
 
 fn do_restore(backup: &Path, image: &Path) -> Result<(), String> {
     let mut f = File::open(backup).map_err(|e| format!("open backup: {e}"))?;
-    let (uuid, gen, _) = read_header(&mut f)?;
+    let (uuid, _gen, _) = read_header(&mut f)?;
     let nblocks = read_u64(&mut f).map_err(|e| format!("read count: {e}"))?;
 
     // Determine image size from max block.
@@ -169,7 +169,7 @@ fn do_restore(backup: &Path, image: &Path) -> Result<(), String> {
     if image.exists() {
         return Err("target image exists (refusing to overwrite)".into());
     }
-    let mut fs = Fs::format(image, nblocks_img).map_err(|e| format!("format: {e:?}"))?;
+    let fs = Fs::format(image, nblocks_img).map_err(|e| format!("format: {e:?}"))?;
     // The format created a fresh FS; we need to overwrite with backup blocks.
     // Instead, write blocks directly via the device, then verify superblock.
     drop(fs);

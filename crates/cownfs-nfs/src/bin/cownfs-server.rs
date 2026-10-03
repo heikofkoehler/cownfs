@@ -57,10 +57,11 @@ fn main() {
             Some(*a) != ds_addr.as_ref()
                 && Some(*a) != referrals_file.as_ref()
                 && Some(*a) != node_id.as_ref()
-                && Some(*a) != args
-                    .iter()
-                    .position(|a| a == "--lease-ttl")
-                    .and_then(|i| args.get(i + 1))
+                && Some(*a)
+                    != args
+                        .iter()
+                        .position(|a| a == "--lease-ttl")
+                        .and_then(|i| args.get(i + 1))
         })
         .collect();
     let addr = positional

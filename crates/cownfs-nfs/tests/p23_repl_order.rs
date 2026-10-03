@@ -1,7 +1,7 @@
 //! Replication crash-safety: superblock slots must be transmitted last,
 //! so a crash before COMMIT never exposes a torn generation.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::Command;

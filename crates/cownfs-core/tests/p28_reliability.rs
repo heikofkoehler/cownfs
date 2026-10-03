@@ -103,8 +103,14 @@ fn backup_verify_detects_corruption() {
     std::fs::write(&bak, &bak_data).unwrap();
 
     // Verify should fail.
-    let out = Command::new(&bin).args(["verify", bak.to_str().unwrap()]).output().unwrap();
-    assert!(!out.status.success(), "verify should fail on corrupted backup");
+    let out = Command::new(&bin)
+        .args(["verify", bak.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "verify should fail on corrupted backup"
+    );
 
     for p in [&img, &bak] {
         let _ = std::fs::remove_file(p);

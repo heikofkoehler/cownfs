@@ -4,7 +4,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{NfsClient, Ops, Reply};
+use common::{NfsClient, Ops};
 use cownfs_nfs::nfs4::*;
 use std::io::Write;
 use std::net::TcpListener;

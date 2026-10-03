@@ -64,7 +64,7 @@ impl Default for ThrottleConfig {
         ThrottleConfig {
             client_ops_per_sec: 1000.0,
             client_bytes_per_sec: 100.0 * 1024.0 * 1024.0, // 100 MiB/s
-            file_bytes_per_sec: 50.0 * 1024.0 * 1024.0,   // 50 MiB/s
+            file_bytes_per_sec: 50.0 * 1024.0 * 1024.0,    // 50 MiB/s
             file_max_writers: 10,
         }
     }
@@ -168,14 +168,17 @@ impl Throttle {
         let now = Instant::now();
         // Note: Bucket doesn't track last use separately from refill,
         // so we use a simple heuristic: clear if tokens are full (unused).
-        self.client_ops.lock().unwrap().retain(|_, b| {
-            now.duration_since(b.last) < cutoff || b.tokens < b.max_tokens
-        });
-        self.client_bytes.lock().unwrap().retain(|_, b| {
-            now.duration_since(b.last) < cutoff || b.tokens < b.max_tokens
-        });
-        self.file_bytes.lock().unwrap().retain(|_, b| {
-            now.duration_since(b.last) < cutoff || b.tokens < b.max_tokens
-        });
+        self.client_ops
+            .lock()
+            .unwrap()
+            .retain(|_, b| now.duration_since(b.last) < cutoff || b.tokens < b.max_tokens);
+        self.client_bytes
+            .lock()
+            .unwrap()
+            .retain(|_, b| now.duration_since(b.last) < cutoff || b.tokens < b.max_tokens);
+        self.file_bytes
+            .lock()
+            .unwrap()
+            .retain(|_, b| now.duration_since(b.last) < cutoff || b.tokens < b.max_tokens);
     }
 }

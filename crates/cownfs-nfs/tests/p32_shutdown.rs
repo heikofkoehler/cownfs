@@ -69,15 +69,19 @@ impl TestServer {
             std::thread::sleep(Duration::from_millis(100));
         }
 
-        TestServer { child, addr, img, keep_img: false }
+        TestServer {
+            child,
+            addr,
+            img,
+            keep_img: false,
+        }
     }
 
     fn stop_gracefully(mut self) -> (bool, String) {
         self.keep_img = true; // Don't delete on drop; caller will fsck then delete.
-        // Send SIGTERM.
+                              // Send SIGTERM.
         #[cfg(unix)]
         {
-            use std::os::unix::process::CommandExt;
             // Use kill command since we don't have the PID directly.
             let pid = self.child.id();
             let _ = Command::new("kill")

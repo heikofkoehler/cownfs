@@ -91,10 +91,6 @@ impl Store {
         }
         Ok(sum)
     }
-
-    fn sync(&mut self) -> std::io::Result<()> {
-        self.file.sync_all()
-    }
 }
 
 fn read_u32(s: &mut TcpStream) -> std::io::Result<u32> {
