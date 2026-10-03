@@ -369,6 +369,9 @@ fn read_from(
     }
     let mut out = Vec::with_capacity((end - offset) as usize);
     let mut buf = [0u8; BLOCK_SIZE];
+
+    // Hold the lock across the entire read to avoid per-block mutex overhead.
+    let mut sh = shared.lock().unwrap();
     let mut foff = offset;
     while foff < end {
         let blk_off = foff / BLOCK_SIZE as u64;
@@ -376,12 +379,7 @@ fn read_from(
         let n = ((BLOCK_SIZE - in_blk) as u64).min(end - foff) as usize;
         match extents.get(&ExtentKey { ino, off: blk_off })? {
             Some(ext) => {
-                shared
-                    .lock()
-                    .unwrap()
-                    .dev
-                    .read_block(ext.blk, &mut buf)
-                    .map_err(StoreError::Io)?;
+                sh.dev.read_block(ext.blk, &mut buf).map_err(StoreError::Io)?;
                 // Verify parent-stored checksum (if present).
                 if ext.cksum != 0 {
                     let actual = checksum32(&buf);
@@ -400,7 +398,6 @@ fn read_from(
     }
     Ok(out)
 }
-
 // ---------------------------------------------------------------------------
 // Fs
 // ---------------------------------------------------------------------------
