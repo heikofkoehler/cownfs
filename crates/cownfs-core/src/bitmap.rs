@@ -2,7 +2,7 @@
 //!
 //! The bitmap itself is CoW-updated per transaction (see the architecture
 //! plan); this type is the in-memory representation plus serialization.
-
+//!
 use crate::BLOCK_SIZE;
 
 /// Number of bitmap blocks needed to track `nbits` blocks.

@@ -877,7 +877,7 @@ impl Fs {
         let cvt = |e: std::io::Error| FsError::Store(crate::store::StoreError::Io(e));
         let mut hdr = [0u8; BLOCK_SIZE];
         dev.read_block(delta_start, &mut hdr).map_err(cvt)?;
-        // Header: magic u64, full_gen u64, delta_gen u64, count u64.
+        // Header: magic u64, full_gen u64, delta_gen u64, count u64, crc32c u64.
         let magic = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
         if magic != 0x61746c65646d6263 {
             // "cbmdelta" in le — invalid delta, ignore (crash mid-write).
@@ -890,27 +890,37 @@ impl Fs {
             return Ok(());
         }
         let count = u64::from_le_bytes(hdr[24..32].try_into().unwrap()) as usize;
-        let mut entries_read = 0;
+        let expected_crc = u64::from_le_bytes(hdr[32..40].try_into().unwrap());
+        // Read all entry bytes for CRC verification.
+        let entry_bytes = count * 16;
+        let mut raw = Vec::with_capacity(entry_bytes);
         let mut blk_idx = 1u64;
         let mut blk = [0u8; BLOCK_SIZE];
-        let mut pos = BLOCK_SIZE; // force first read
-        while entries_read < count {
-            if pos + 16 > BLOCK_SIZE {
-                if blk_idx >= sb.bitmap_blocks {
-                    break; // truncated delta, ignore rest
-                }
-                dev.read_block(delta_start + blk_idx, &mut blk)
-                    .map_err(cvt)?;
-                blk_idx += 1;
-                pos = 0;
+        while raw.len() < entry_bytes {
+            if blk_idx >= sb.bitmap_blocks {
+                break; // truncated
             }
-            let wi = u64::from_le_bytes(blk[pos..pos + 8].try_into().unwrap());
-            let val = u64::from_le_bytes(blk[pos + 8..pos + 16].try_into().unwrap());
-            pos += 16;
+            dev.read_block(delta_start + blk_idx, &mut blk)
+                .map_err(cvt)?;
+            blk_idx += 1;
+            let take = (entry_bytes - raw.len()).min(BLOCK_SIZE);
+            raw.extend_from_slice(&blk[..take]);
+        }
+        if raw.len() < entry_bytes {
+            return Ok(()); // truncated delta, ignore
+        }
+        let actual_crc = crate::checksum::checksum32(&raw) as u64;
+        if actual_crc != expected_crc {
+            // Corrupt delta, ignore (use base).
+            return Ok(());
+        }
+        // Apply.
+        for chunk in raw.chunks_exact(16) {
+            let wi = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+            let val = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
             if wi < bitmap.word_count() {
                 bitmap.set_word(wi, val);
             }
-            entries_read += 1;
         }
         Ok(())
     }
@@ -982,33 +992,32 @@ impl Fs {
         // Delta goes to the non-base area.
         let delta_start =
             self.sb.bitmap_start + (1 - self.sb.bitmap_base_area) * self.sb.bitmap_blocks;
+        // Buffer entries first so we can CRC them.
+        let mut entries = Vec::with_capacity(dirty_words.len() * 16);
+        {
+            let sh = self.shared.lock().unwrap();
+            for &wi in dirty_words {
+                let val = sh.bitmap.word(wi);
+                entries.extend_from_slice(&wi.to_le_bytes());
+                entries.extend_from_slice(&val.to_le_bytes());
+            }
+        }
+        let crc = crate::checksum::checksum32(&entries) as u64;
         let mut sh = self.shared.lock().unwrap();
-        // Header block.
+        // Header block: magic, full_gen, delta_gen, count, crc32c.
         let mut hdr = [0u8; BLOCK_SIZE];
         hdr[0..8].copy_from_slice(&0x61746c65646d6263u64.to_le_bytes()); // "cbmdelta"
         hdr[8..16].copy_from_slice(&self.sb.bitmap_full_gen.to_le_bytes());
         let gen = self.sb.generation + 1;
         hdr[16..24].copy_from_slice(&gen.to_le_bytes());
         hdr[24..32].copy_from_slice(&(dirty_words.len() as u64).to_le_bytes());
+        hdr[32..40].copy_from_slice(&crc.to_le_bytes());
         sh.dev.write_block(delta_start, &hdr)?;
-        // Entry blocks: 16 bytes per (word_idx, value).
-        let mut blk = [0u8; BLOCK_SIZE];
-        let mut pos = 0;
-        let mut blk_idx = 1u64;
-        for &wi in dirty_words {
-            if pos + 16 > BLOCK_SIZE {
-                sh.dev.write_block(delta_start + blk_idx, &blk)?;
-                blk_idx += 1;
-                blk.fill(0);
-                pos = 0;
-            }
-            let val = sh.bitmap.word(wi);
-            blk[pos..pos + 8].copy_from_slice(&wi.to_le_bytes());
-            blk[pos + 8..pos + 16].copy_from_slice(&val.to_le_bytes());
-            pos += 16;
-        }
-        if pos > 0 {
-            sh.dev.write_block(delta_start + blk_idx, &blk)?;
+        // Entry blocks.
+        for (i, chunk) in entries.chunks(BLOCK_SIZE).enumerate() {
+            let mut blk = [0u8; BLOCK_SIZE];
+            blk[..chunk.len()].copy_from_slice(chunk);
+            sh.dev.write_block(delta_start + 1 + i as u64, &blk)?;
         }
         self.sb.bitmap_delta_gen = gen;
         // Don't clear dirty: words stay dirty until the next full checkpoint,
