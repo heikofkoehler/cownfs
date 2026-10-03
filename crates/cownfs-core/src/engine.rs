@@ -1907,6 +1907,59 @@ impl Fs {
         Ok(out)
     }
 
+    /// Paged readdir for C2: returns up to `limit` entries after `start_after`
+    /// (exclusive). If `start_after` is None, starts from the beginning.
+    /// Returns (entries, has_more).
+    pub fn readdir_paged(
+        &self,
+        ino: u64,
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<(Vec<(Vec<u8>, u64, u8)>, bool), FsError> {
+        let inode = self.getattr(ino)?;
+        if inode.ftype != FTYPE_DIR {
+            return Err(FsError::NotDir);
+        }
+        let (mut lo, hi) = DirKey::range_for(ino);
+        if let Some(name) = start_after {
+            lo = DirKey::new(ino, name)?;
+            // We want entries AFTER lo, so we'll skip the first if it matches.
+        }
+        // Fetch limit+1 to detect has_more. Filter . and .. and .xattrs.
+        // We may need to fetch more if many are filtered; for simplicity,
+        // fetch limit*2+10 and trim.
+        let fetch_limit = limit * 2 + 10;
+        let raw = self.dirs.range_limit(&lo, &hi, fetch_limit)?;
+        let mut out = Vec::new();
+        let mut skipped_first = start_after.is_none();
+        for (k, e) in raw {
+            let name = k.name_bytes();
+            if !skipped_first {
+                // Skip the start_after entry itself.
+                if name == start_after.unwrap() {
+                    skipped_first = true;
+                    continue;
+                }
+                // If we haven't found start_after yet, skip.
+                continue;
+            }
+            if name == b"." || name == b".." {
+                continue;
+            }
+            if ino == ROOT_INO && name == XATTR_FILE {
+                continue;
+            }
+            out.push((name.to_vec(), e.ino, e.typ));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        // has_more: if we hit the limit, there might be more.
+        // This is approximate; the caller uses cookies to page.
+        let has_more = out.len() >= limit;
+        Ok((out, has_more))
+    }
+
     pub fn setattr(&mut self, ino: u64, attrs: &SetAttrs) -> Result<(), FsError> {
         if let Some(size) = attrs.size {
             self.truncate(ino, size)?;

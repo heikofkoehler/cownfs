@@ -553,7 +553,21 @@ impl<K: Ord + Clone, V: Clone, S: NodeStore<K, V>, const T: usize> BTree<K, V, S
     pub fn range(&self, lo: &K, hi: &K) -> Result<Vec<(K, V)>, StoreError> {
         let mut a = self.store.lock().unwrap();
         let mut out = Vec::new();
-        collect_range(&mut *a, self.root, lo, hi, &mut out)?;
+        collect_range(&mut *a, self.root, lo, hi, &mut out, usize::MAX)?;
+        Ok(out)
+    }
+
+    /// Range with a limit on the number of entries returned.
+    /// For C2: cursor-based readdir without materializing huge dirs.
+    pub fn range_limit(
+        &self,
+        lo: &K,
+        hi: &K,
+        limit: usize,
+    ) -> Result<Vec<(K, V)>, StoreError> {
+        let mut a = self.store.lock().unwrap();
+        let mut out = Vec::new();
+        collect_range(&mut *a, self.root, lo, hi, &mut out, limit)?;
         Ok(out)
     }
 
@@ -616,7 +630,11 @@ fn collect_range<K: Ord + Clone, V: Clone, S: NodeStore<K, V>>(
     lo: &K,
     hi: &K,
     out: &mut Vec<(K, V)>,
+    limit: usize,
 ) -> Result<(), StoreError> {
+    if out.len() >= limit {
+        return Ok(());
+    }
     let n = a.get(id)?;
     let keys = n.keys.clone();
     let vals = n.vals.clone();
@@ -625,12 +643,15 @@ fn collect_range<K: Ord + Clone, V: Clone, S: NodeStore<K, V>>(
     let start = keys.partition_point(|k| k < lo);
     let end = keys.partition_point(|k| k <= hi);
     if !leaf {
-        collect_range(a, children[start], lo, hi, out)?;
+        collect_range(a, children[start], lo, hi, out, limit)?;
     }
     for i in start..end {
+        if out.len() >= limit {
+            break;
+        }
         out.push((keys[i].clone(), vals[i].clone()));
         if !leaf {
-            collect_range(a, children[i + 1], lo, hi, out)?;
+            collect_range(a, children[i + 1], lo, hi, out, limit)?;
         }
     }
     Ok(())
