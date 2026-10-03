@@ -442,6 +442,9 @@ struct TxgInner {
     synced: u64,
     /// The open txg has staged changes not yet synced.
     dirty: bool,
+    /// If sync failed, the error. Waiters wake with this error.
+    /// Cleared on the next successful sync.
+    error: Option<String>,
 }
 
 impl TxgCoord {
@@ -451,17 +454,35 @@ impl TxgCoord {
                 current: 1,
                 synced: 0,
                 dirty: false,
+                error: None,
             }),
             cv: Condvar::new(),
         }
     }
 
-    /// Block until txg `id` is durable.
-    pub fn wait(&self, id: u64) {
+    /// Block until txg `id` is durable. Returns Err if sync failed.
+    pub fn wait(&self, id: u64) -> Result<(), String> {
         let mut s = self.state.lock().unwrap();
         while s.synced < id {
+            if let Some(e) = s.error.clone() {
+                return Err(e);
+            }
             s = self.cv.wait(s).unwrap();
         }
+        Ok(())
+    }
+
+    /// Record a sync error and wake all waiters.
+    pub fn set_error(&self, e: String) {
+        let mut s = self.state.lock().unwrap();
+        s.error = Some(e);
+        self.cv.notify_all();
+    }
+
+    /// Clear a previous error (on successful sync).
+    fn clear_error(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.error = None;
     }
 }
 
@@ -1080,6 +1101,7 @@ impl Fs {
         t.synced = t.current;
         t.current += 1;
         t.dirty = false;
+        t.error = None;
         drop(t);
         self.txg.cv.notify_all();
         Ok(true)
@@ -2316,7 +2338,7 @@ mod tests {
 
         // Wait in another thread; sync from here.
         let h = std::thread::spawn(move || {
-            coord.wait(txg);
+            coord.wait(txg).unwrap();
         });
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(!h.is_finished(), "wait returned before sync");
@@ -2324,7 +2346,7 @@ mod tests {
         h.join().unwrap();
 
         // Waiting on an already-synced txg returns immediately.
-        fs.txg().wait(txg);
+        fs.txg().wait(txg).unwrap();
         std::fs::remove_file(&path).unwrap();
     }
 

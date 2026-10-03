@@ -144,7 +144,23 @@ impl Shared {
             match weak_fs.upgrade() {
                 Some(fs) => {
                     if let Ok(mut f) = fs.write() {
-                        let _ = f.sync_txg();
+                        // Retry sync up to 3 times before reporting failure.
+                        // On persistent failure, wake FILE_SYNC4 waiters with
+                        // the error (they'd block forever otherwise).
+                        let mut last_err = None;
+                        for _ in 0..3 {
+                            match f.sync_txg() {
+                                Ok(_) => {
+                                    last_err = None;
+                                    break;
+                                }
+                                Err(e) => last_err = Some(format!("{e:?}")),
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        if let Some(e) = last_err {
+                            f.txg().set_error(e);
+                        }
                     }
                 }
                 None => break,
@@ -1900,7 +1916,11 @@ impl Session {
                 Ok(t) => t,
                 Err(e) => return OpResult::err(OP_WRITE, fs_to_nfs(e)),
             };
-            self.shared.txg.wait(txg);
+            // Wait can fail if the background sync thread hit a persistent
+            // error (disk failure). Map to NFS4ERR_IO, don't hang.
+            if let Err(_) = self.shared.txg.wait(txg) {
+                return OpResult::err(OP_WRITE, NFS4ERR_IO);
+            }
             FILE_SYNC4
         } else {
             match self.fs_mut().commit_async() {
