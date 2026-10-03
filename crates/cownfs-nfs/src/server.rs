@@ -9,21 +9,22 @@ use std::sync::{Arc, Mutex};
 use cownfs_core::engine::{Fs, FsError, FTYPE_DIR, FTYPE_SYMLINK, ROOT_INO};
 
 use crate::nfs4::{
-    encode_compound, AttrMask, AttrValues, Compound, FileAttrs, FileHandle, NfsError, Op, OpResult,
-    StateId, ACCESS4_DELETE, ACCESS4_EXECUTE, ACCESS4_EXTEND, ACCESS4_LOOKUP, ACCESS4_MODIFY,
-    ACCESS4_READ, FATTR4_MODE, FATTR4_SIZE, FILE_SYNC4, GUARDED4, LAYOUT4_NFSV4_1_FILES, NF4DIR,
-    NF4LNK, NF4REG, NFS4ERR_BADNAME, NFS4ERR_BADSESSION, NFS4ERR_BADSLOT, NFS4ERR_BADTYPE,
-    NFS4ERR_BADXDR, NFS4ERR_BAD_COOKIE, NFS4ERR_DELAY, NFS4ERR_EXIST, NFS4ERR_EXPIRED, NFS4ERR_INVAL,
-    NFS4ERR_IO, NFS4ERR_ISDIR, NFS4ERR_MOVED, NFS4ERR_NAMETOOLONG, NFS4ERR_NOENT, NFS4ERR_NOFILEHANDLE,
-    NFS4ERR_NOSPC, NFS4ERR_NOTDIR, NFS4ERR_NOTSUPP, NFS4ERR_OP_ILLEGAL, NFS4ERR_RECALLCONFLICT,
-    NFS4ERR_RESOURCE, NFS4ERR_ROFS,
-    NFS4ERR_SEQ_MISORDERED, NFS4ERR_SERVERFAULT, NFS4ERR_STALE, NFS4ERR_STALE_CLIENTID,
-    NFS4ERR_TOOSMALL, NFS4_OK, OPEN4_CREATE, OP_ACCESS, OP_CLOSE, OP_COMMIT, OP_CREATE,
-    OP_CREATE_SESSION, OP_DESTROY_CLIENTID, OP_DESTROY_SESSION, OP_EXCHANGE_ID, OP_GETATTR,
-    OP_GETFH, OP_ILLEGAL, OP_LAYOUTCOMMIT, OP_LAYOUTGET, OP_LAYOUTRETURN, OP_LINK, OP_LOCK,
-    OP_LOCKU, OP_LOOKUP, OP_LOOKUPP, OP_OPEN, OP_OPEN_DOWNGRADE, OP_PUTFH, OP_PUTROOTFH, OP_READ,
-    OP_READDIR, OP_REMOVE, OP_RENAME, OP_RENEW, OP_RESTOREFH, OP_SAVEFH, OP_SECINFO, OP_SEQUENCE,
-    OP_SETATTR, OP_SETCLIENTID, OP_SETCLIENTID_CONFIRM, OP_WRITE, UNCHECKED4,
+    encode_compound, AnyFileHandle, AttrMask, AttrValues, Compound, FileAttrs, FileHandle,
+    NfsError, Op, OpResult, SnapFileHandle, StateId, ACCESS4_DELETE, ACCESS4_EXECUTE,
+    ACCESS4_EXTEND, ACCESS4_LOOKUP, ACCESS4_MODIFY, ACCESS4_READ, FATTR4_MODE, FATTR4_SIZE,
+    FILE_SYNC4, GUARDED4, LAYOUT4_NFSV4_1_FILES, NF4DIR, NF4LNK, NF4REG, NFS4ERR_BADNAME,
+    NFS4ERR_BADSESSION, NFS4ERR_BADSLOT, NFS4ERR_BADTYPE, NFS4ERR_BADXDR, NFS4ERR_BAD_COOKIE,
+    NFS4ERR_DELAY, NFS4ERR_EXIST, NFS4ERR_EXPIRED, NFS4ERR_INVAL, NFS4ERR_IO, NFS4ERR_ISDIR,
+    NFS4ERR_MOVED, NFS4ERR_NAMETOOLONG, NFS4ERR_NOENT, NFS4ERR_NOFILEHANDLE, NFS4ERR_NOSPC,
+    NFS4ERR_NOTDIR, NFS4ERR_NOTSUPP, NFS4ERR_OP_ILLEGAL, NFS4ERR_RECALLCONFLICT, NFS4ERR_RESOURCE,
+    NFS4ERR_ROFS, NFS4ERR_SEQ_MISORDERED, NFS4ERR_SERVERFAULT, NFS4ERR_STALE,
+    NFS4ERR_STALE_CLIENTID, NFS4ERR_TOOSMALL, NFS4_OK, OPEN4_CREATE, OP_ACCESS, OP_CLOSE,
+    OP_COMMIT, OP_CREATE, OP_CREATE_SESSION, OP_DESTROY_CLIENTID, OP_DESTROY_SESSION,
+    OP_EXCHANGE_ID, OP_GETATTR, OP_GETFH, OP_ILLEGAL, OP_LAYOUTCOMMIT, OP_LAYOUTGET,
+    OP_LAYOUTRETURN, OP_LINK, OP_LOCK, OP_LOCKU, OP_LOOKUP, OP_LOOKUPP, OP_OPEN, OP_OPEN_DOWNGRADE,
+    OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_REMOVE, OP_RENAME, OP_RENEW, OP_RESTOREFH,
+    OP_SAVEFH, OP_SECINFO, OP_SEQUENCE, OP_SETATTR, OP_SETCLIENTID, OP_SETCLIENTID_CONFIRM,
+    OP_WRITE, UNCHECKED4,
 };
 use crate::rpc::{self, Call, RecordReader, RpcError};
 use crate::state::StateManager;
@@ -170,27 +171,28 @@ impl Shared {
 /// Per-connection COMPOUND execution state.
 struct Session {
     shared: Shared,
-    /// Current filehandle's inode (None = none selected).
-    cfh: Option<u64>,
+    /// Current filehandle (None = none selected).
+    cfh: Option<Fh>,
     /// Saved filehandle (SAVEFH/RESTOREFH).
-    saved_fh: Option<u64>,
+    saved_fh: Option<Fh>,
     /// v4.1 session ID from the compound's SEQUENCE (None in 4.0 mode).
     session41: Option<[u8; 16]>,
     /// Client address for audit logging.
     client_addr: String,
 }
 
-impl Session {
-    fn new(shared: &Shared) -> Self {
-        Session {
-            shared: shared.clone(),
-            cfh: None,
-            saved_fh: None,
-            session41: None,
-            client_addr: "unknown".to_string(),
-        }
-    }
+/// A filehandle: either a live filesystem inode, or a snapshot view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fh {
+    /// Live filesystem inode.
+    Live(u64),
+    /// The virtual `.snapshots` directory.
+    SnapshotsDir,
+    /// An inode as of a snapshot (read-only).
+    Snapshot { snap_id: u32, ino: u64 },
+}
 
+impl Session {
     fn with_client_addr(shared: &Shared, addr: String) -> Self {
         Session {
             shared: shared.clone(),
@@ -245,24 +247,46 @@ impl Session {
         self.shared.state.lock().unwrap()
     }
 
-    fn check_fh(&self, fh: &FileHandle) -> Result<u64, u32> {
-        if fh.fs_uuid != self.fs().uuid() {
-            return Err(NFS4ERR_INVAL);
-        }
-        // Validate inode generation: reject stale filehandles for
-        // deleted/reused inodes. gen=0 skips validation (old format).
-        if fh.gen != 0 {
-            match self.fs().getattr(fh.inode) {
-                Ok(attr) => {
-                    let ino_gen = attr.gen as u32;
-                    if ino_gen != fh.gen {
-                        return Err(NFS4ERR_STALE);
+    fn check_fh(&self, fh: &AnyFileHandle) -> Result<Fh, u32> {
+        match fh {
+            AnyFileHandle::Live(fh) => {
+                if fh.fs_uuid != self.fs().uuid() {
+                    return Err(NFS4ERR_INVAL);
+                }
+                // Validate inode generation: reject stale filehandles for
+                // deleted/reused inodes. gen=0 skips validation (old format).
+                if fh.gen != 0 {
+                    match self.fs().getattr(fh.inode) {
+                        Ok(attr) => {
+                            let ino_gen = attr.gen as u32;
+                            if ino_gen != fh.gen {
+                                return Err(NFS4ERR_STALE);
+                            }
+                        }
+                        Err(_) => return Err(NFS4ERR_STALE),
                     }
                 }
-                Err(_) => return Err(NFS4ERR_STALE),
+                Ok(Fh::Live(fh.inode))
+            }
+            AnyFileHandle::Snap(snap) => {
+                if snap.fs_uuid != self.fs().uuid() {
+                    return Err(NFS4ERR_INVAL);
+                }
+                if snap.snap_id == 0 {
+                    Ok(Fh::SnapshotsDir)
+                } else {
+                    // Verify the snapshot exists.
+                    let snaps = self.fs().snapshot_list().map_err(|_| NFS4ERR_IO)?;
+                    if !snaps.iter().any(|(id, _)| *id as u32 == snap.snap_id) {
+                        return Err(NFS4ERR_STALE);
+                    }
+                    Ok(Fh::Snapshot {
+                        snap_id: snap.snap_id,
+                        ino: snap.inode,
+                    })
+                }
             }
         }
-        Ok(fh.inode)
     }
 
     fn run(&mut self, compound: &Compound) -> Vec<OpResult> {
@@ -407,24 +431,44 @@ impl Session {
         }
         match op {
             Op::PutFh(fh) => match self.check_fh(fh) {
-                Ok(ino) => {
-                    self.cfh = Some(ino);
+                Ok(fh) => {
+                    self.cfh = Some(fh);
                     OpResult::ok(OP_PUTFH, Vec::new())
                 }
                 Err(st) => OpResult::err(OP_PUTFH, st),
             },
             Op::PutRootFh => {
-                self.cfh = Some(ROOT_INO);
+                self.cfh = Some(Fh::Live(ROOT_INO));
                 OpResult::ok(OP_PUTROOTFH, Vec::new())
             }
             Op::GetFh => match self.cfh {
-                Some(ino) => {
+                Some(Fh::Live(ino)) => {
                     let mut w = Writer::new();
                     let gen = self.fs().getattr(ino).map(|a| a.gen as u32).unwrap_or(0);
                     FileHandle {
                         fs_uuid: self.fs().uuid(),
                         inode: ino,
                         gen,
+                    }
+                    .encode(&mut w);
+                    OpResult::ok(OP_GETFH, w.into_bytes())
+                }
+                Some(Fh::SnapshotsDir) => {
+                    let mut w = Writer::new();
+                    SnapFileHandle {
+                        fs_uuid: self.fs().uuid(),
+                        snap_id: 0,
+                        inode: 0,
+                    }
+                    .encode(&mut w);
+                    OpResult::ok(OP_GETFH, w.into_bytes())
+                }
+                Some(Fh::Snapshot { snap_id, ino }) => {
+                    let mut w = Writer::new();
+                    SnapFileHandle {
+                        fs_uuid: self.fs().uuid(),
+                        snap_id,
+                        inode: ino,
                     }
                     .encode(&mut w);
                     OpResult::ok(OP_GETFH, w.into_bytes())
@@ -547,9 +591,9 @@ impl Session {
                     return OpResult::err(OP_WRITE, NFS4ERR_ROFS);
                 }
                 // Per-file throttling: limit bytes/sec and concurrent writers.
-                let ino = match self.cfh {
-                    Some(i) => i,
-                    None => return OpResult::err(OP_WRITE, NFS4ERR_NOFILEHANDLE),
+                let ino = match self.current_live(OP_WRITE) {
+                    Ok(i) => i,
+                    Err(r) => return r,
                 };
                 if !self
                     .shared
@@ -558,7 +602,11 @@ impl Session {
                 {
                     return OpResult::err(OP_WRITE, NFS4ERR_DELAY);
                 }
-                if !self.shared.throttle.check_file_bytes(ino, data.len() as u64) {
+                if !self
+                    .shared
+                    .throttle
+                    .check_file_bytes(ino, data.len() as u64)
+                {
                     return OpResult::err(OP_WRITE, NFS4ERR_DELAY);
                 }
                 if !self.shared.throttle.acquire_writer(ino) {
@@ -752,9 +800,9 @@ impl Session {
             Some(a) => a.clone(),
             None => return OpResult::err(OP_LAYOUTGET, NFS4ERR_NOTSUPP),
         };
-        let ino = match self.cfh {
-            Some(i) => i,
-            None => return OpResult::err(OP_LAYOUTGET, NFS4ERR_NOFILEHANDLE),
+        let ino = match self.current_live(OP_LAYOUTGET) {
+            Ok(i) => i,
+            Err(r) => return r,
         };
         if self.shared.read_only {
             return OpResult::err(OP_LAYOUTGET, NFS4ERR_ROFS);
@@ -816,9 +864,9 @@ impl Session {
             Some(a) => a.clone(),
             None => return OpResult::err(OP_LAYOUTCOMMIT, NFS4ERR_NOTSUPP),
         };
-        let ino = match self.cfh {
-            Some(i) => i,
-            None => return OpResult::err(OP_LAYOUTCOMMIT, NFS4ERR_NOFILEHANDLE),
+        let ino = match self.current_live(OP_LAYOUTCOMMIT) {
+            Ok(i) => i,
+            Err(r) => return r,
         };
         if self.shared.read_only {
             return OpResult::err(OP_LAYOUTCOMMIT, NFS4ERR_ROFS);
@@ -840,7 +888,7 @@ impl Session {
         for (i, (block_id, expect_sum)) in blocks.iter().enumerate() {
             let (data, ds_sum) = match Self::ds_read_block(&ds_addr, *block_id) {
                 Ok(x) => x,
-                Err(e) => return OpResult::err(OP_LAYOUTCOMMIT, NFS4ERR_SERVERFAULT),
+                Err(_e) => return OpResult::err(OP_LAYOUTCOMMIT, NFS4ERR_SERVERFAULT),
             };
             if ds_sum != *expect_sum {
                 // Client lied or DS corrupted: refuse the commit.
@@ -885,9 +933,9 @@ impl Session {
             Some(s) => s,
             None => return OpResult::err(OP_LAYOUTRETURN, NFS4ERR_BADSESSION),
         };
-        let ino = match self.cfh {
-            Some(i) => i,
-            None => return OpResult::err(OP_LAYOUTRETURN, NFS4ERR_NOFILEHANDLE),
+        let ino = match self.current_live(OP_LAYOUTRETURN) {
+            Ok(i) => i,
+            Err(r) => return r,
         };
         let n = self
             .shared
@@ -900,41 +948,121 @@ impl Session {
         OpResult::ok(OP_LAYOUTRETURN, w.into_bytes())
     }
 
-    fn current(&self, opnum: u32) -> Result<u64, OpResult> {
+    fn current(&self, opnum: u32) -> Result<Fh, OpResult> {
         self.cfh.ok_or(OpResult::err(opnum, NFS4ERR_NOFILEHANDLE))
+    }
+
+    /// Get the live inode, rejecting snapshot filehandles (read-only).
+    fn current_live(&self, opnum: u32) -> Result<u64, OpResult> {
+        match self.cfh {
+            Some(Fh::Live(ino)) => Ok(ino),
+            Some(_) => Err(OpResult::err(opnum, NFS4ERR_ROFS)),
+            None => Err(OpResult::err(opnum, NFS4ERR_NOFILEHANDLE)),
+        }
     }
 
     fn op_lookup(&mut self, name: &[u8], opnum: u32) -> OpResult {
         if let Err(e) = Self::check_name(name, opnum) {
             return e;
         }
-        let ino = match self.cfh {
-            Some(i) => i,
+        let cfh = match self.cfh {
+            Some(fh) => fh,
             None => return OpResult::err(opnum, NFS4ERR_NOFILEHANDLE),
         };
         // "." and ".." are handled by LOOKUPP; treat "." as self.
-        let result = if name == b"." {
-            Ok(Some((ino, 0)))
-        } else if name == b".." {
-            return self.op_lookupp_inner(opnum);
-        } else {
-            self.fs().lookup(ino, name)
+        // Handle snapshot filehandles.
+        let result: Result<Option<(Fh, u8)>, u32> = match cfh {
+            Fh::Live(ino) => {
+                // Special: ".snapshots" in any directory → virtual dir.
+                if name == b".snapshots" {
+                    // Verify it's a directory.
+                    match self.fs().getattr(ino) {
+                        Ok(attr) if attr.ftype == FTYPE_DIR => {}
+                        _ => return OpResult::err(opnum, NFS4ERR_NOTDIR),
+                    }
+                    self.cfh = Some(Fh::SnapshotsDir);
+                    return OpResult::ok(opnum, Vec::new());
+                }
+                if name == b"." {
+                    Ok(Some((Fh::Live(ino), 0)))
+                } else if name == b".." {
+                    return self.op_lookupp_inner(opnum);
+                } else {
+                    match self.fs().lookup(ino, name) {
+                        Ok(Some((child, typ))) => Ok(Some((Fh::Live(child), typ))),
+                        Ok(None) => Ok(None),
+                        Err(e) => Err(fs_to_nfs(e)),
+                    }
+                }
+            }
+            Fh::SnapshotsDir => {
+                if name == b"." {
+                    Ok(Some((Fh::SnapshotsDir, 2)))
+                } else if name == b".." {
+                    // Parent is the live root (simplification).
+                    self.cfh = Some(Fh::Live(ROOT_INO));
+                    return OpResult::ok(opnum, Vec::new());
+                } else {
+                    // Look up snapshot by name.
+                    let snaps = match self.fs().snapshot_list() {
+                        Ok(s) => s,
+                        Err(_) => return OpResult::err(opnum, NFS4ERR_IO),
+                    };
+                    for (id, snap_name) in snaps {
+                        if snap_name == name {
+                            let fh = Fh::Snapshot {
+                                snap_id: id as u32,
+                                ino: ROOT_INO,
+                            };
+                            self.cfh = Some(fh);
+                            return OpResult::ok(opnum, Vec::new());
+                        }
+                    }
+                    Ok(None)
+                }
+            }
+            Fh::Snapshot { snap_id, ino } => {
+                if name == b"." {
+                    Ok(Some((Fh::Snapshot { snap_id, ino }, 0)))
+                } else if name == b".." {
+                    // TODO: handle parent within snapshot.
+                    // For now, go to snapshot root.
+                    Ok(Some((
+                        Fh::Snapshot {
+                            snap_id,
+                            ino: ROOT_INO,
+                        },
+                        2,
+                    )))
+                } else {
+                    match self.fs().snapshot_lookup(snap_id as u64, ino, name) {
+                        Ok(Some((child, typ))) => Ok(Some((
+                            Fh::Snapshot {
+                                snap_id,
+                                ino: child,
+                            },
+                            typ,
+                        ))),
+                        Ok(None) => Ok(None),
+                        Err(e) => Err(fs_to_nfs(e)),
+                    }
+                }
+            }
         };
         match result {
-            Ok(Some((child, _))) => {
-                // Referral: if the child is a referral directory, return
-                // MOVED. The client will fetch fs_locations via GETATTR
-                // and transparently follow to the target server.
-                if self.shared.referrals.lookup(child).is_some() {
-                    // Set cfh to the referral dir so GETATTR works.
-                    self.cfh = Some(child);
-                    return OpResult::err(opnum, NFS4ERR_MOVED);
+            Ok(Some((child_fh, _))) => {
+                // Referral: only for live files.
+                if let Fh::Live(child_ino) = child_fh {
+                    if self.shared.referrals.lookup(child_ino).is_some() {
+                        self.cfh = Some(child_fh);
+                        return OpResult::err(opnum, NFS4ERR_MOVED);
+                    }
                 }
-                self.cfh = Some(child);
+                self.cfh = Some(child_fh);
                 OpResult::ok(opnum, Vec::new())
             }
             Ok(None) => OpResult::err(opnum, NFS4ERR_NOENT),
-            Err(e) => OpResult::err(opnum, fs_to_nfs(e)),
+            Err(st) => OpResult::err(opnum, st),
         }
     }
 
@@ -943,23 +1071,47 @@ impl Session {
     }
 
     fn op_lookupp_inner(&mut self, opnum: u32) -> OpResult {
-        let ino = match self.cfh {
-            Some(i) => i,
+        let fh = match self.cfh {
+            Some(fh) => fh,
             None => return OpResult::err(opnum, NFS4ERR_NOFILEHANDLE),
         };
-        if ino == ROOT_INO {
-            // Root's parent is itself.
-            self.cfh = Some(ROOT_INO);
-            return OpResult::ok(opnum, Vec::new());
-        }
-        let parent = self.fs().lookup(ino, b"..");
-        match parent {
-            Ok(Some((parent, _))) => {
-                self.cfh = Some(parent);
+        match fh {
+            Fh::Live(ino) => {
+                if ino == ROOT_INO {
+                    // Root's parent is itself.
+                    self.cfh = Some(Fh::Live(ROOT_INO));
+                    return OpResult::ok(opnum, Vec::new());
+                }
+                let parent = self.fs().lookup(ino, b"..");
+                match parent {
+                    Ok(Some((parent, _))) => {
+                        self.cfh = Some(Fh::Live(parent));
+                        OpResult::ok(opnum, Vec::new())
+                    }
+                    Ok(None) => OpResult::err(opnum, NFS4ERR_NOENT),
+                    Err(e) => OpResult::err(opnum, fs_to_nfs(e)),
+                }
+            }
+            Fh::SnapshotsDir => {
+                // Parent of .snapshots is the live root (simplification).
+                self.cfh = Some(Fh::Live(ROOT_INO));
                 OpResult::ok(opnum, Vec::new())
             }
-            Ok(None) => OpResult::err(opnum, NFS4ERR_NOENT),
-            Err(e) => OpResult::err(opnum, fs_to_nfs(e)),
+            Fh::Snapshot { snap_id, ino } => {
+                if ino == ROOT_INO {
+                    // Snapshot root's parent is .snapshots dir.
+                    self.cfh = Some(Fh::SnapshotsDir);
+                    OpResult::ok(opnum, Vec::new())
+                } else {
+                    // TODO: proper parent lookup within snapshot.
+                    // For now, go to snapshot root.
+                    self.cfh = Some(Fh::Snapshot {
+                        snap_id,
+                        ino: ROOT_INO,
+                    });
+                    OpResult::ok(opnum, Vec::new())
+                }
+            }
         }
     }
 
@@ -1021,16 +1173,45 @@ impl Session {
     }
 
     fn op_getattr(&self, mask: &AttrMask) -> OpResult {
-        let ino = match self.current(OP_GETATTR) {
-            Ok(i) => i,
+        let fh = match self.current(OP_GETATTR) {
+            Ok(fh) => fh,
             Err(r) => return r,
         };
-        // Bind before matching: a guard in a match scrutinee stays live
-        // for the whole match, which would deadlock a later self.fs().
-        let inode_res = self.fs().getattr(ino);
-        let inode = match inode_res {
-            Ok(i) => i,
-            Err(e) => return OpResult::err(OP_GETATTR, fs_to_nfs(e)),
+        // Get inode attributes based on filehandle type.
+        let (ino, inode) = match fh {
+            Fh::Live(ino) => {
+                let inode_res = self.fs().getattr(ino);
+                let inode = match inode_res {
+                    Ok(i) => i,
+                    Err(e) => return OpResult::err(OP_GETATTR, fs_to_nfs(e)),
+                };
+                (ino, inode)
+            }
+            Fh::SnapshotsDir => {
+                // Synthetic directory attributes for .snapshots.
+                let inode = cownfs_core::engine::Inode {
+                    ftype: FTYPE_DIR,
+                    mode: 0o555,
+                    nlink: 2,
+                    uid: 0,
+                    gid: 0,
+                    size: 0,
+                    atime: 0,
+                    mtime: 0,
+                    ctime: 0,
+                    gen: 0,
+                    parent: ROOT_INO,
+                };
+                (u64::MAX, inode)
+            }
+            Fh::Snapshot { snap_id, ino } => {
+                let inode_res = self.fs().snapshot_getattr(snap_id as u64, ino);
+                let inode = match inode_res {
+                    Ok(i) => i,
+                    Err(e) => return OpResult::err(OP_GETATTR, fs_to_nfs(e)),
+                };
+                (ino, inode)
+            }
         };
         let fa = self.make_file_attrs(ino, &inode);
         let vals = AttrValues::encode(mask, &fa);
@@ -1040,8 +1221,8 @@ impl Session {
     }
 
     fn op_readdir(&self, cookie: u64, _dircount: u32, maxcount: u32, mask: &AttrMask) -> OpResult {
-        let ino = match self.current(OP_READDIR) {
-            Ok(i) => i,
+        let fh = match self.current(OP_READDIR) {
+            Ok(fh) => fh,
             Err(r) => return r,
         };
         // Cookies 1 and 2 are reserved (pynfs RDDR10).
@@ -1052,9 +1233,43 @@ impl Session {
         if maxcount == 0 {
             return OpResult::err(OP_READDIR, NFS4ERR_TOOSMALL);
         }
-        let entries = match self.fs().readdir(ino) {
-            Ok(e) => e,
-            Err(e) => return OpResult::err(OP_READDIR, fs_to_nfs(e)),
+        // Get directory entries based on filehandle type.
+        // Returns (name, child_fh, ftype) for each entry.
+        enum EntryFh {
+            Live(u64),
+            Snap(u32, u64),
+        }
+        let entries: Vec<(Vec<u8>, EntryFh, u8)> = match fh {
+            Fh::Live(ino) => {
+                let live_entries = match self.fs().readdir(ino) {
+                    Ok(e) => e,
+                    Err(e) => return OpResult::err(OP_READDIR, fs_to_nfs(e)),
+                };
+                live_entries
+                    .into_iter()
+                    .map(|(name, child_ino, typ)| (name, EntryFh::Live(child_ino), typ))
+                    .collect()
+            }
+            Fh::SnapshotsDir => {
+                let snaps = match self.fs().snapshot_list() {
+                    Ok(s) => s,
+                    Err(_) => return OpResult::err(OP_READDIR, NFS4ERR_IO),
+                };
+                snaps
+                    .into_iter()
+                    .map(|(id, name)| (name, EntryFh::Snap(id as u32, ROOT_INO), 2))
+                    .collect()
+            }
+            Fh::Snapshot { snap_id, ino } => {
+                let snap_entries = match self.fs().snapshot_readdir(snap_id as u64, ino) {
+                    Ok(e) => e,
+                    Err(e) => return OpResult::err(OP_READDIR, fs_to_nfs(e)),
+                };
+                snap_entries
+                    .into_iter()
+                    .map(|(name, child_ino, typ)| (name, EntryFh::Snap(snap_id, child_ino), typ))
+                    .collect()
+            }
         };
         // cookie 0 starts at the beginning; otherwise resume after the
         // entry whose cookie matches. Cookies are 3-based (1 and 2 are
@@ -1069,12 +1284,25 @@ impl Session {
         let mut bytes_used: u32 = 16; // cookieverf + eof flag estimate
         let max = maxcount.min(1024 * 1024);
         let mut emitted = 0usize;
-        for (idx, (name, child_ino, _typ)) in entries.iter().enumerate().skip(start) {
-            let inode = match self.fs().getattr(*child_ino) {
-                Ok(i) => i,
-                Err(_) => continue,
+        for (idx, (name, child_fh, _typ)) in entries.iter().enumerate().skip(start) {
+            let (attr_ino, inode) = match child_fh {
+                EntryFh::Live(child_ino) => {
+                    let inode = match self.fs().getattr(*child_ino) {
+                        Ok(i) => i,
+                        Err(_) => continue,
+                    };
+                    (*child_ino, inode)
+                }
+                EntryFh::Snap(snap_id, child_ino) => {
+                    let inode = match self.fs().snapshot_getattr(*snap_id as u64, *child_ino) {
+                        Ok(i) => i,
+                        Err(_) => continue,
+                    };
+                    // Use a synthetic ino for attrs (snap_id in high bits).
+                    ((*snap_id as u64) << 32 | *child_ino, inode)
+                }
             };
-            let fa = self.make_file_attrs(*child_ino, &inode);
+            let fa = self.make_file_attrs(attr_ino, &inode);
             let vals = AttrValues::encode(mask, &fa);
             // entry: cookie, name, attrs, next-entry flag
             let mut ew = Writer::new();
@@ -1095,21 +1323,45 @@ impl Session {
         OpResult::ok(OP_READDIR, w.into_bytes())
     }
     fn op_read(&self, offset: u64, count: u32) -> OpResult {
-        let ino = match self.current(OP_READ) {
-            Ok(i) => i,
+        let fh = match self.current(OP_READ) {
+            Ok(fh) => fh,
             Err(r) => return r,
         };
         // READ on a directory or symlink target: symlinks are read via
         // READ in v4.0 (no READLINK needed for the P4 gate, but support it).
-        let data = match self.fs().read(ino, offset, count.min(1024 * 1024) as usize) {
-            Ok(d) => d,
-            Err(e) => return OpResult::err(OP_READ, fs_to_nfs(e)),
+        let (data, size) = match fh {
+            Fh::Live(ino) => {
+                let data = match self.fs().read(ino, offset, count.min(1024 * 1024) as usize) {
+                    Ok(d) => d,
+                    Err(e) => return OpResult::err(OP_READ, fs_to_nfs(e)),
+                };
+                let inode = match self.fs().getattr(ino) {
+                    Ok(i) => i,
+                    Err(e) => return OpResult::err(OP_READ, fs_to_nfs(e)),
+                };
+                (data, inode.size)
+            }
+            Fh::Snapshot { snap_id, ino } => {
+                let data = match self.fs().snapshot_read(
+                    snap_id as u64,
+                    ino,
+                    offset,
+                    count.min(1024 * 1024) as usize,
+                ) {
+                    Ok(d) => d,
+                    Err(e) => return OpResult::err(OP_READ, fs_to_nfs(e)),
+                };
+                let inode = match self.fs().snapshot_getattr(snap_id as u64, ino) {
+                    Ok(i) => i,
+                    Err(e) => return OpResult::err(OP_READ, fs_to_nfs(e)),
+                };
+                (data, inode.size)
+            }
+            Fh::SnapshotsDir => {
+                return OpResult::err(OP_READ, NFS4ERR_ISDIR);
+            }
         };
-        let inode = match self.fs().getattr(ino) {
-            Ok(i) => i,
-            Err(e) => return OpResult::err(OP_READ, fs_to_nfs(e)),
-        };
-        let eof = offset + data.len() as u64 >= inode.size;
+        let eof = offset + data.len() as u64 >= size;
         let mut w = Writer::new();
         w.bool(eof);
         w.opaque(&data);
@@ -1170,9 +1422,9 @@ impl Session {
         if let Err(e) = Self::check_name(filename, OP_OPEN) {
             return e;
         }
-        let dir_ino = match self.cfh {
-            Some(i) => i,
-            None => return OpResult::err(OP_OPEN, NFS4ERR_NOFILEHANDLE),
+        let dir_ino = match self.current_live(OP_OPEN) {
+            Ok(i) => i,
+            Err(r) => return r,
         };
         // Check the cfh is a directory.
         match self.fs().getattr(dir_ino) {
@@ -1208,7 +1460,7 @@ impl Session {
             (None, false) => return OpResult::err(OP_OPEN, NFS4ERR_NOENT),
         };
 
-        self.cfh = Some(file_ino);
+        self.cfh = Some(Fh::Live(file_ino));
         // P6: create real open state with share reservation checking.
         let open_rec = match self.state().open(
             seqid,
@@ -1250,9 +1502,9 @@ impl Session {
         if let Err(e) = Self::check_dots(name, OP_CREATE) {
             return e;
         }
-        let dir_ino = match self.cfh {
-            Some(i) => i,
-            None => return OpResult::err(OP_CREATE, NFS4ERR_NOFILEHANDLE),
+        let dir_ino = match self.current_live(OP_CREATE) {
+            Ok(i) => i,
+            Err(r) => return r,
         };
         let (mode, uid, gid) = match Self::parse_createattrs(attrs) {
             Ok(v) => v,
@@ -1296,9 +1548,9 @@ impl Session {
         if let Err(e) = Self::check_dots(name, OP_REMOVE) {
             return e;
         }
-        let dir_ino = match self.cfh {
-            Some(i) => i,
-            None => return OpResult::err(OP_REMOVE, NFS4ERR_NOFILEHANDLE),
+        let dir_ino = match self.current_live(OP_REMOVE) {
+            Ok(i) => i,
+            Err(r) => return r,
         };
         // Try unlink first; if it's a dir, use rmdir.
         let (ino, ent) = match self.fs().lookup(dir_ino, name) {
@@ -1363,11 +1615,15 @@ impl Session {
             return e;
         }
         // cfh = source dir, saved_fh = dest dir (via SAVEFH).
-        let src_dir = match self.cfh {
-            Some(i) => i,
-            None => return OpResult::err(OP_RENAME, NFS4ERR_NOFILEHANDLE),
+        let src_dir = match self.current_live(OP_RENAME) {
+            Ok(i) => i,
+            Err(r) => return r,
         };
-        let dst_dir = self.saved_fh.unwrap_or(src_dir);
+        let dst_dir = match self.saved_fh {
+            Some(Fh::Live(ino)) => ino,
+            Some(_) => return OpResult::err(OP_RENAME, NFS4ERR_ROFS),
+            None => src_dir,
+        };
         match self.fs().rename(src_dir, old, dst_dir, new) {
             Ok(()) => {
                 let mut w = Writer::new();
@@ -1392,12 +1648,13 @@ impl Session {
             return e;
         }
         // cfh = existing file, saved_fh = dest dir.
-        let file_ino = match self.cfh {
-            Some(i) => i,
-            None => return OpResult::err(OP_LINK, NFS4ERR_NOFILEHANDLE),
+        let file_ino = match self.current_live(OP_LINK) {
+            Ok(i) => i,
+            Err(r) => return r,
         };
         let dir_ino = match self.saved_fh {
-            Some(i) => i,
+            Some(Fh::Live(ino)) => ino,
+            Some(_) => return OpResult::err(OP_LINK, NFS4ERR_ROFS),
             None => return OpResult::err(OP_LINK, NFS4ERR_NOFILEHANDLE),
         };
         match self.fs().link(file_ino, dir_ino, name) {
@@ -1414,9 +1671,9 @@ impl Session {
     }
 
     fn op_setattr(&mut self, attrs: &[(u32, Vec<u8>)]) -> OpResult {
-        let ino = match self.cfh {
-            Some(i) => i,
-            None => {
+        let ino = match self.current_live(OP_SETATTR) {
+            Ok(i) => i,
+            Err(_) => {
                 // RFC 7530 §16.34: SETATTR4res always includes attrsset,
                 // even on error.
                 let mut w = Writer::new();
@@ -1495,9 +1752,9 @@ impl Session {
     }
 
     fn op_write(&mut self, offset: u64, stable: u32, data: &[u8]) -> OpResult {
-        let ino = match self.cfh {
-            Some(i) => i,
-            None => return OpResult::err(OP_WRITE, NFS4ERR_NOFILEHANDLE),
+        let ino = match self.current_live(OP_WRITE) {
+            Ok(i) => i,
+            Err(r) => return r,
         };
         if let Err(e) = self.fs().write(ino, offset, data) {
             return OpResult::err(OP_WRITE, fs_to_nfs(e));
@@ -1596,9 +1853,9 @@ impl Session {
         _lock_stateid: &StateId,
         lock_owner: &[u8],
     ) -> OpResult {
-        let file_ino = match self.cfh {
-            Some(i) => i,
-            None => return OpResult::err(OP_LOCK, NFS4ERR_INVAL),
+        let file_ino = match self.current_live(OP_LOCK) {
+            Ok(i) => i,
+            Err(r) => return r,
         };
         // For P6, we need the clientid. In a real server, the clientid comes
         // from the RPC credentials or the open_stateid. For simplicity, we
@@ -1664,14 +1921,28 @@ impl Session {
     }
 
     fn op_access(&self, access: u32) -> OpResult {
-        let ino = match self.current(OP_ACCESS) {
-            Ok(i) => i,
+        let fh = match self.current(OP_ACCESS) {
+            Ok(fh) => fh,
             Err(r) => return r,
         };
-        let _inode = match self.fs().getattr(ino) {
-            Ok(i) => i,
-            Err(e) => return OpResult::err(OP_ACCESS, fs_to_nfs(e)),
-        };
+        // Verify the file exists (and get attrs for snapshot case).
+        match fh {
+            Fh::Live(ino) => {
+                if let Err(e) = self.fs().getattr(ino) {
+                    return OpResult::err(OP_ACCESS, fs_to_nfs(e));
+                }
+            }
+            Fh::SnapshotsDir => {
+                // Always exists.
+            }
+            Fh::Snapshot { snap_id, ino } => {
+                if let Err(e) = self.fs().snapshot_getattr(snap_id as u64, ino) {
+                    return OpResult::err(OP_ACCESS, fs_to_nfs(e));
+                }
+            }
+        }
+        // For snapshots: read-only (grant READ/LOOKUP/EXECUTE only).
+        let is_snapshot = !matches!(fh, Fh::Live(_));
         // Read-write server: support and grant all standard access bits.
         // The filesystem enforces permissions; ACCESS is advisory.
         let supported: u32 = ACCESS4_READ
@@ -1681,6 +1952,12 @@ impl Session {
             | ACCESS4_DELETE
             | ACCESS4_EXECUTE;
         let mut granted: u32 = 0;
+        // Snapshot: only grant read bits.
+        let allowed_bits = if is_snapshot {
+            ACCESS4_READ | ACCESS4_LOOKUP | ACCESS4_EXECUTE
+        } else {
+            supported
+        };
         for bit in [
             ACCESS4_READ,
             ACCESS4_LOOKUP,
@@ -1689,7 +1966,7 @@ impl Session {
             ACCESS4_DELETE,
             ACCESS4_EXECUTE,
         ] {
-            if access & bit != 0 && supported & bit != 0 {
+            if access & bit != 0 && allowed_bits & bit != 0 {
                 granted |= bit;
             }
         }

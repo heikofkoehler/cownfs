@@ -371,7 +371,7 @@ fn read_from(
     let mut buf = [0u8; BLOCK_SIZE];
 
     // Hold the lock across the entire read to avoid per-block mutex overhead.
-    let mut sh = shared.lock().unwrap();
+    let sh = shared.lock().unwrap();
     let mut foff = offset;
     while foff < end {
         let blk_off = foff / BLOCK_SIZE as u64;
@@ -379,7 +379,9 @@ fn read_from(
         let n = ((BLOCK_SIZE - in_blk) as u64).min(end - foff) as usize;
         match extents.get(&ExtentKey { ino, off: blk_off })? {
             Some(ext) => {
-                sh.dev.read_block(ext.blk, &mut buf).map_err(StoreError::Io)?;
+                sh.dev
+                    .read_block(ext.blk, &mut buf)
+                    .map_err(StoreError::Io)?;
                 // Verify parent-stored checksum (if present).
                 if ext.cksum != 0 {
                     let actual = checksum32(&buf);
@@ -1603,6 +1605,35 @@ impl Fs {
         Ok(dirs.get(&key)?.map(|e| (e.ino, e.typ)))
     }
 
+    /// Get attributes as of a snapshot.
+    pub fn snapshot_getattr(&self, snap_id: u64, ino: u64) -> Result<Inode, FsError> {
+        let (inodes, _, _) = self.snap_trees(snap_id)?;
+        inodes.get(&ino)?.ok_or(FsError::NotFound)
+    }
+
+    /// List directory entries as of a snapshot.
+    pub fn snapshot_readdir(
+        &self,
+        snap_id: u64,
+        dir_ino: u64,
+    ) -> Result<Vec<(Vec<u8>, u64, u8)>, FsError> {
+        let (inodes, dirs, _) = self.snap_trees(snap_id)?;
+        let inode = inodes.get(&dir_ino)?.ok_or(FsError::NotFound)?;
+        if inode.ftype != FTYPE_DIR {
+            return Err(FsError::NotDir);
+        }
+        let (lo, hi) = DirKey::range_for(dir_ino);
+        let mut out = Vec::new();
+        for (k, e) in dirs.range(&lo, &hi)? {
+            let name = k.name_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            out.push((name.to_vec(), e.ino, e.typ));
+        }
+        Ok(out)
+    }
+
     // ---- Leader lease (P0: fencing) ----
     //
     // Only one node may hold the write lease at a time. The lease is
@@ -1658,7 +1689,8 @@ impl Fs {
             let mut sb = sb;
             sb.lease_holder = [0u8; 32];
             sb.lease_expiry = 0;
-            superblock::write_slots(&mut sh.dev, &sb).map_err(|e| FsError::Invalid(format!("{e}")))?;
+            superblock::write_slots(&mut sh.dev, &sb)
+                .map_err(|e| FsError::Invalid(format!("{e}")))?;
         }
         Ok(())
     }

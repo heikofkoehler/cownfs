@@ -136,6 +136,27 @@ impl Drop for TestServer {
     }
 }
 
+/// Serve an existing image file read-write on 127.0.0.1:0. The image is
+/// NOT removed on drop (caller owns it).
+pub fn spawn_server_on(img: &std::path::Path) -> TestServer {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+    let addr = listener.local_addr().expect("listener local addr");
+    let img2 = img.to_path_buf();
+    let fs = Fs::open(&img2).expect("open test image");
+    let uuid = fs.uuid();
+    drop(fs);
+    std::thread::spawn(move || {
+        let fs = Fs::open(&img2).expect("open test image");
+        let shared = cownfs_nfs::server::Shared::new(fs);
+        let _ = cownfs_nfs::server::serve_concurrent(listener, shared);
+    });
+    TestServer {
+        addr,
+        uuid,
+        img: None,
+    }
+}
+
 /// Serve an existing image file read-only on 127.0.0.1:0. The image is
 /// NOT removed on drop (caller owns it).
 pub fn spawn_read_only_server_on(img: &std::path::Path) -> TestServer {

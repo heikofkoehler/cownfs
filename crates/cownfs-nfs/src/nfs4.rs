@@ -207,6 +207,85 @@ impl From<XdrError> for NfsError {
 pub const FH_MAGIC: u32 = 0x434f5746; // "COWF"
 pub const FH_LEN: usize = 32;
 
+/// Snapshot filehandle magic: `[magic:4][fs_uuid:16][snap_id:4][inode:8]`.
+/// snap_id=0 is the `.snapshots` directory itself; snap_id>0 is a specific
+/// snapshot's view (read-only).
+pub const SNAP_FH_MAGIC: u32 = 0x534E4150; // "SNAP"
+
+/// A filehandle pointing into a snapshot (or the `.snapshots` dir).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapFileHandle {
+    pub fs_uuid: [u8; 16],
+    pub snap_id: u32, // 0 = .snapshots dir, >0 = snapshot id
+    pub inode: u64,   // inode within the snapshot (ignored for snap_id=0)
+}
+
+/// Either a live filehandle or a snapshot filehandle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnyFileHandle {
+    Live(FileHandle),
+    Snap(SnapFileHandle),
+}
+
+impl AnyFileHandle {
+    pub fn decode(r: &mut Reader) -> Result<Self, NfsError> {
+        let b = r.opaque()?;
+        if let Some(snap) = SnapFileHandle::detect(&b) {
+            return Ok(AnyFileHandle::Snap(snap));
+        }
+        // Fall back to live filehandle decode.
+        if b.len() != FH_LEN {
+            return Err(NfsError::Xdr(XdrError::Invalid("filehandle length")));
+        }
+        if u32::from_be_bytes(b[0..4].try_into().unwrap()) != FH_MAGIC {
+            return Err(NfsError::Xdr(XdrError::Invalid("filehandle magic")));
+        }
+        let mut fs_uuid = [0u8; 16];
+        fs_uuid.copy_from_slice(&b[4..20]);
+        let inode = u64::from_be_bytes(b[20..28].try_into().unwrap());
+        let gen = u32::from_be_bytes(b[28..32].try_into().unwrap());
+        Ok(AnyFileHandle::Live(FileHandle {
+            fs_uuid,
+            inode,
+            gen,
+        }))
+    }
+}
+
+impl SnapFileHandle {
+    pub fn to_bytes(&self) -> [u8; FH_LEN] {
+        let mut fh = [0u8; FH_LEN];
+        fh[0..4].copy_from_slice(&SNAP_FH_MAGIC.to_be_bytes());
+        fh[4..20].copy_from_slice(&self.fs_uuid);
+        fh[20..24].copy_from_slice(&self.snap_id.to_be_bytes());
+        fh[24..32].copy_from_slice(&self.inode.to_be_bytes());
+        fh
+    }
+
+    pub fn encode(&self, w: &mut Writer) {
+        w.opaque(&self.to_bytes());
+    }
+
+    /// Returns Some if the bytes are a snapshot filehandle.
+    pub fn detect(b: &[u8]) -> Option<Self> {
+        if b.len() != FH_LEN {
+            return None;
+        }
+        if u32::from_be_bytes(b[0..4].try_into().unwrap()) != SNAP_FH_MAGIC {
+            return None;
+        }
+        let mut fs_uuid = [0u8; 16];
+        fs_uuid.copy_from_slice(&b[4..20]);
+        let snap_id = u32::from_be_bytes(b[20..24].try_into().unwrap());
+        let inode = u64::from_be_bytes(b[24..32].try_into().unwrap());
+        Some(Self {
+            fs_uuid,
+            snap_id,
+            inode,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHandle {
     pub fs_uuid: [u8; 16],
@@ -254,7 +333,7 @@ impl FileHandle {
 
 #[derive(Debug, Clone)]
 pub enum Op {
-    PutFh(FileHandle),
+    PutFh(AnyFileHandle),
     PutRootFh,
     GetFh,
     Lookup(Vec<u8>),
@@ -564,7 +643,7 @@ impl Op {
     pub fn decode(r: &mut Reader) -> Result<Self, NfsError> {
         let opnum = r.u32()?;
         let op = match opnum {
-            OP_PUTFH => Op::PutFh(FileHandle::decode(r)?),
+            OP_PUTFH => Op::PutFh(AnyFileHandle::decode(r)?),
             OP_PUTROOTFH => Op::PutRootFh,
             OP_GETFH => Op::GetFh,
             OP_LOOKUP => Op::Lookup(r.string()?.to_vec()),
