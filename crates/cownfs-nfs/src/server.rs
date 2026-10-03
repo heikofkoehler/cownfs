@@ -95,9 +95,6 @@ fn fs_to_nfs(e: FsError) -> u32 {
         // map to SERVERFAULT if they do.
         FsError::InjectedFault(_) => NFS4ERR_SERVERFAULT,
         FsError::QuotaExceeded => NFS4ERR_DQUOT,
-        // Corrupt bitmap: I/O error (shouldn't reach the wire — open()
-        // falls back to the older generation first).
-        FsError::BitmapCorrupt => NFS4ERR_IO,
     }
 }
 

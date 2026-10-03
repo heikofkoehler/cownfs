@@ -20,19 +20,8 @@ use crate::{Block, BLOCK_SIZE};
 pub const MAGIC: u64 = u64::from_le_bytes(*b"cownfs01");
 pub const VERSION: u32 = 3;
 
-/// Magic for the bitmap CRC sidecar area (P0.1/B2). Each bitmap area has a
-/// CRC area holding one CRC32C per full-bitmap block. Presence of the magic
-/// means the image was formatted with CRC support; absence (v3 images)
-/// means CRC verification is skipped.
-pub const BITMAP_CRC_MAGIC: u64 = u64::from_le_bytes(*b"cbmcrc32");
-
 /// Block numbers of the two superblock slots.
 pub const SLOT_BLOCKS: [u64; 2] = [0, 1];
-
-/// Number of blocks needed to hold one CRC32C per bitmap block.
-pub fn bitmap_crc_blocks(bitmap_blocks: u64) -> u64 {
-    (bitmap_blocks * 4 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64
-}
 
 const HDR_LEN: usize = 256;
 const OFF_CHECKSUM: usize = 64;
@@ -205,12 +194,6 @@ impl Superblock {
             bitmap_base_area: 0,
         }
     }
-
-    /// Start of the bitmap CRC sidecar areas. Two areas of
-    /// `bitmap_crc_blocks(bitmap_blocks)` blocks each, one per bitmap area.
-    pub fn bitmap_crc_start(&self) -> u64 {
-        self.bitmap_start + 2 * self.bitmap_blocks
-    }
 }
 
 fn write_slot(dev: &mut impl BlockDevice, slot: usize, sb: &Superblock) -> io::Result<()> {
@@ -289,20 +272,6 @@ pub fn open(dev: &impl BlockDevice) -> io::Result<(Superblock, usize)> {
         }
     }
     best.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no valid superblock slot"))
-}
-
-/// Open all valid superblock slots, newest generation first.
-/// Used by `Fs::open` to fall back to the older generation when the
-/// newest one's bitmap is corrupt (P0.1/B2).
-pub fn open_all(dev: &impl BlockDevice) -> Vec<(Superblock, usize)> {
-    let mut slots = Vec::new();
-    for i in 0..SLOT_BLOCKS.len() {
-        if let Some(sb) = read_slot(dev, i) {
-            slots.push((sb, i));
-        }
-    }
-    slots.sort_by(|a, b| b.0.generation.cmp(&a.0.generation));
-    slots
 }
 
 /// Transaction commit: advances the generation by writing the inactive slot

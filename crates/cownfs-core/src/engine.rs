@@ -85,9 +85,6 @@ pub enum FsError {
     InjectedFault(FaultPoint),
     /// Per-UID block quota exceeded.
     QuotaExceeded,
-    /// Full bitmap block failed CRC verification (bit rot detected).
-    /// `Fs::open` falls back to the older superblock generation.
-    BitmapCorrupt,
 }
 
 impl std::fmt::Display for FsError {
@@ -101,7 +98,6 @@ impl std::fmt::Display for FsError {
             FsError::NotEmpty => write!(f, "directory not empty"),
             FsError::InjectedFault(p) => write!(f, "injected fault at {p:?}"),
             FsError::QuotaExceeded => write!(f, "disk quota exceeded"),
-            FsError::BitmapCorrupt => write!(f, "bitmap CRC mismatch"),
             FsError::BadName => write!(f, "invalid file name"),
             FsError::NoSpace => write!(f, "no space left on device"),
             FsError::Invalid(s) => write!(f, "invalid: {s}"),
@@ -394,7 +390,7 @@ fn read_from(
     // Group contiguous physical blocks (skip holes).
     let mut i = 0;
     while i < mappings.len() {
-        let (fblk, pblk, _cksum) = mappings[i];
+        let (fblk, pblk, cksum) = mappings[i];
         if pblk == u64::MAX {
             // Hole: emit zeros.
             let in_blk = if fblk == start_blk {
@@ -531,7 +527,6 @@ impl TxgCoord {
     }
 
     /// Clear a previous error (on successful sync).
-    #[allow(dead_code)] // used by future sync-error recovery paths
     fn clear_error(&self) {
         let mut s = self.state.lock().unwrap();
         s.error = None;
@@ -573,9 +568,6 @@ pub struct Fs {
     /// Blocks allocated in the current txg (not yet committed).
     /// In-place overwrites are only safe for these blocks.
     txg_allocated: std::collections::HashSet<u64>,
-    /// True if the image has bitmap CRC sidecar areas (magic present).
-    /// v3 images lack them → CRC verification skipped.
-    has_bitmap_crcs: bool,
 }
 
 /// Name of the hidden file backing extended attributes.
@@ -599,9 +591,7 @@ impl Fs {
     pub fn format(path: &Path, blocks: u64) -> Result<Self, FsError> {
         let mut dev = FileDevice::create(path, blocks)?;
         let bblocks = store::bitmap_blocks_for(blocks);
-        // slots + two alternating bitmap areas + two bitmap CRC sidecars (P0.1/B2)
-        let cb = superblock::bitmap_crc_blocks(bblocks);
-        let reserved = 2 + 2 * bblocks + 2 * cb;
+        let reserved = 2 + 2 * bblocks; // slots + two alternating bitmap areas
         if blocks < reserved + 64 {
             return Err(FsError::Invalid("image too small to format".into()));
         }
@@ -610,10 +600,6 @@ impl Fs {
             bitmap.set(b);
         }
         store::write_bitmap(&mut dev, &bitmap, 2, bblocks)?;
-        // Mark the CRC sidecar areas with the magic so open() knows this
-        // image has bitmap CRCs (v3 images lack the magic → skip verify).
-        Self::write_crc_magic(&mut dev, 2 + 2 * bblocks, cb)?;
-        Self::write_crc_magic(&mut dev, 2 + 2 * bblocks + cb, cb)?;
         let shared = Arc::new(Mutex::new(Shared {
             dev,
             bitmap,
@@ -644,7 +630,6 @@ impl Fs {
             commits_since_checkpoint: 0,
             last_bitmap_write_bytes: 0,
             txg_allocated: std::collections::HashSet::new(),
-            has_bitmap_crcs: true, // fresh format always has CRC sidecars
         };
 
         let now = now_secs();
@@ -689,47 +674,12 @@ impl Fs {
     }
 
     /// Open an existing image, locating all trees from the superblock.
-    /// Tries superblock slots newest-first; if the newest generation's
-    /// bitmap fails CRC verification (P0.1/B2), falls back to the older
-    /// generation instead of refusing to mount.
     pub fn open(path: &Path) -> Result<Self, FsError> {
         let mut dev = FileDevice::open(path)?;
-        let slots = superblock::open_all(&dev);
-        if slots.is_empty() {
-            return Err(FsError::Invalid("no valid superblock slot".into()));
-        }
-        let mut bitmap_err: Option<FsError> = None;
-        for (sb, active_slot) in &slots {
-            match Self::load_bitmap(&mut dev, sb) {
-                Ok(bitmap) => {
-                    if bitmap_err.is_some() {
-                        eprintln!(
-                            "cownfs: newest generation {} has corrupt bitmap, \
-                             fell back to generation {}",
-                            slots[0].0.generation, sb.generation
-                        );
-                    }
-                    return Self::open_with_bitmap(path, sb.clone(), *active_slot, bitmap);
-                }
-                Err(FsError::BitmapCorrupt) => {
-                    bitmap_err = Some(FsError::BitmapCorrupt);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(bitmap_err.unwrap_or_else(|| FsError::Invalid("no valid superblock slot".into())))
-    }
-
-    /// Finish opening once the superblock and bitmap are selected.
-    /// `path` is only used for error context; the device is reopened.
-    fn open_with_bitmap(
-        path: &Path,
-        sb: Superblock,
-        active_slot: usize,
-        bitmap: Bitmap,
-    ) -> Result<Self, FsError> {
-        let dev = FileDevice::open(path)?;
+        let (sb, active_slot) = superblock::open(&dev)?;
+        let next_inode = sb.next_inode;
+        let next_snap = sb.next_snap;
+        let bitmap = Self::load_bitmap(&mut dev, &sb)?;
         let shared = Arc::new(Mutex::new(Shared {
             dev,
             bitmap,
@@ -810,18 +760,6 @@ impl Fs {
         ea.lock().unwrap().set_live(n_extents);
         sa.lock().unwrap().set_live(n_snaps);
 
-        let next_inode = sb.next_inode;
-        let next_snap = sb.next_snap;
-        // Detect CRC sidecar presence for future checkpoints: magic in
-        // either CRC area indicates a CRC-capable image (v3 images have
-        // neither, so verification and CRC writes stay disabled there).
-        let has_bitmap_crcs = {
-            let mut sh = shared.lock().unwrap();
-            let cb = superblock::bitmap_crc_blocks(sb.bitmap_blocks);
-            let c0 = sb.bitmap_crc_start();
-            Self::crc_magic_present(&mut sh.dev, c0)
-                || Self::crc_magic_present(&mut sh.dev, c0 + cb)
-        };
         let mut fs = Fs {
             shared,
             sb,
@@ -840,7 +778,6 @@ impl Fs {
             commits_since_checkpoint: 0,
             last_bitmap_write_bytes: 0,
             txg_allocated: std::collections::HashSet::new(),
-            has_bitmap_crcs,
         };
         fs.rebuild_pinned()?;
         fs.rebuild_quota_usage()?;
@@ -977,54 +914,12 @@ impl Fs {
         let base_start = sb.bitmap_start + sb.bitmap_base_area * sb.bitmap_blocks;
         let mut bitmap = store::read_bitmap(dev, sb.block_count, base_start, sb.bitmap_blocks)
             .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
-        // P0.1/B2: verify per-block CRCs if the sidecar is present.
-        // A mismatch means bit rot on the base bitmap → caller falls back
-        // to the older superblock generation.
-        let cb = superblock::bitmap_crc_blocks(sb.bitmap_blocks);
-        let crc_start = sb.bitmap_crc_start() + sb.bitmap_base_area * cb;
-        if Self::crc_magic_present(dev, crc_start) {
-            Self::verify_bitmap_crcs(dev, sb, base_start, crc_start)?;
-        }
         // Apply delta if one is pending.
         if sb.bitmap_delta_gen > sb.bitmap_full_gen {
             let delta_start = sb.bitmap_start + (1 - sb.bitmap_base_area) * sb.bitmap_blocks;
             Self::apply_delta(dev, sb, delta_start, &mut bitmap)?;
         }
         Ok(bitmap)
-    }
-
-    /// Verify per-block CRC32C of the full bitmap against the sidecar.
-    /// Returns `FsError::BitmapCorrupt` on any mismatch.
-    fn verify_bitmap_crcs(
-        dev: &mut FileDevice,
-        sb: &superblock::Superblock,
-        base_start: u64,
-        crc_start: u64,
-    ) -> Result<(), FsError> {
-        let cvt = |e: std::io::Error| FsError::Store(crate::store::StoreError::Io(e));
-        let cb = superblock::bitmap_crc_blocks(sb.bitmap_blocks);
-        // Read all CRCs (first block has magic + CRCs, rest are continuation).
-        let mut crc_bytes = Vec::new();
-        let mut blk = [0u8; BLOCK_SIZE];
-        for i in 0..cb {
-            dev.read_block(crc_start + i, &mut blk).map_err(cvt)?;
-            let start = if i == 0 { 8 } else { 0 };
-            crc_bytes.extend_from_slice(&blk[start..]);
-        }
-        let mut data = [0u8; BLOCK_SIZE];
-        for b in 0..sb.bitmap_blocks {
-            dev.read_block(base_start + b, &mut data).map_err(cvt)?;
-            let expected = crate::checksum::checksum32(&data);
-            let off = b as usize * 4;
-            if off + 4 > crc_bytes.len() {
-                return Err(FsError::BitmapCorrupt);
-            }
-            let stored = u32::from_le_bytes(crc_bytes[off..off + 4].try_into().unwrap());
-            if stored != expected {
-                return Err(FsError::BitmapCorrupt);
-            }
-        }
-        Ok(())
     }
 
     /// Read the delta area and apply word updates to the bitmap.
@@ -1119,76 +1014,22 @@ impl Fs {
         Ok(())
     }
 
-    /// Write the CRC sidecar magic to a CRC area (format path).
-    fn write_crc_magic(dev: &mut FileDevice, crc_start: u64, cb: u64) -> Result<(), FsError> {
-        let cvt = |e: std::io::Error| FsError::Store(crate::store::StoreError::Io(e));
-        let mut blk = [0u8; BLOCK_SIZE];
-        blk[0..8].copy_from_slice(&superblock::BITMAP_CRC_MAGIC.to_le_bytes());
-        dev.write_block(crc_start, &blk).map_err(cvt)?;
-        // Zero the remaining CRC blocks.
-        let zero = [0u8; BLOCK_SIZE];
-        for i in 1..cb {
-            dev.write_block(crc_start + i, &zero).map_err(cvt)?;
-        }
-        Ok(())
-    }
-
-    /// Check whether the CRC sidecar magic is present at `crc_start`.
-    fn crc_magic_present(dev: &mut FileDevice, crc_start: u64) -> bool {
-        let mut blk = [0u8; BLOCK_SIZE];
-        if dev.read_block(crc_start, &mut blk).is_err() {
-            return false;
-        }
-        u64::from_le_bytes(blk[0..8].try_into().unwrap()) == superblock::BITMAP_CRC_MAGIC
-    }
-
-    /// Write the full bitmap to the inactive area and reset delta state.
-    /// If the image has CRC sidecars, writes per-block CRC32C to the
-    /// inactive area's CRC sidecar (P0.1/B2).
+    /// Write the full bitmap to area 0 and reset delta state.
     fn persist_bitmap_full(&mut self) -> Result<(), FsError> {
         let blocks = self.sb.bitmap_blocks;
         let raw = self.shared.lock().unwrap().bitmap.to_bytes();
         let mut sh = self.shared.lock().unwrap();
-        // Write to the inactive area (not the base); the swap happens via
+        // Write to the delta area (not the base); the swap happens via
         // bitmap_base_area in the superblock, so a crash before the
         // superblock commit leaves the old base intact.
-        let inactive = 1 - self.sb.bitmap_base_area;
-        let write_start = self.sb.bitmap_start + inactive * blocks;
+        let write_start = self.sb.bitmap_start + (1 - self.sb.bitmap_base_area) * blocks;
         let mut buf = vec![0u8; blocks as usize * BLOCK_SIZE];
         let n = raw.len().min(buf.len());
         buf[..n].copy_from_slice(&raw[..n]);
-        // CRC32C per block (computed before writing).
-        let crcs: Vec<u32> = buf
-            .chunks_exact(BLOCK_SIZE)
-            .map(|c| crate::checksum::checksum32(c))
-            .collect();
         for (i, chunk) in buf.chunks_exact(BLOCK_SIZE).enumerate() {
             let mut blk = [0u8; BLOCK_SIZE];
             blk.copy_from_slice(chunk);
             sh.dev.write_block(write_start + i as u64, &blk)?;
-        }
-        // Write CRCs to the inactive area's sidecar (may span blocks).
-        if self.has_bitmap_crcs {
-            let cb = superblock::bitmap_crc_blocks(blocks);
-            let crc_start = self.sb.bitmap_crc_start() + inactive * cb;
-            let mut crc_bytes = Vec::with_capacity(crcs.len() * 4);
-            for c in &crcs {
-                crc_bytes.extend_from_slice(&c.to_le_bytes());
-            }
-            // First block: magic + CRCs; remaining blocks: CRC continuation.
-            let mut blk = [0u8; BLOCK_SIZE];
-            blk[0..8].copy_from_slice(&superblock::BITMAP_CRC_MAGIC.to_le_bytes());
-            let n0 = crc_bytes.len().min(BLOCK_SIZE - 8);
-            blk[8..8 + n0].copy_from_slice(&crc_bytes[..n0]);
-            sh.dev.write_block(crc_start, &blk)?;
-            let mut off = n0;
-            for i in 1..cb {
-                let mut blk = [0u8; BLOCK_SIZE];
-                let n = (crc_bytes.len() - off).min(BLOCK_SIZE);
-                blk[..n].copy_from_slice(&crc_bytes[off..off + n]);
-                sh.dev.write_block(crc_start + i, &blk)?;
-                off += n;
-            }
         }
         let gen = self.sb.generation + 1; // the generation we're committing
         self.sb.bitmap_full_gen = gen;
@@ -1603,10 +1444,7 @@ impl Fs {
 
         // Reconcile against the active bitmap area.
         let sh = self.shared.lock().unwrap();
-        let mut reserved = 2 + 2 * self.sb.bitmap_blocks;
-        if self.has_bitmap_crcs {
-            reserved += 2 * superblock::bitmap_crc_blocks(self.sb.bitmap_blocks);
-        }
+        let reserved = 2 + 2 * self.sb.bitmap_blocks;
         let mut allocated_blocks = 0u64;
         for b in 0..self.sb.block_count {
             if !sh.bitmap.test(b) {
@@ -1669,10 +1507,7 @@ impl Fs {
             }
         }
 
-        let mut reserved = 2 + 2 * self.sb.bitmap_blocks;
-        if self.has_bitmap_crcs {
-            reserved += 2 * superblock::bitmap_crc_blocks(self.sb.bitmap_blocks);
-        }
+        let reserved = 2 + 2 * self.sb.bitmap_blocks;
         let mut reclaimed = 0u64;
         {
             let mut sh = self.shared.lock().unwrap();
@@ -2551,61 +2386,36 @@ impl Fs {
     /// Try to acquire the write lease. Returns true if acquired.
     /// Returns false if another node holds a live lease.
     pub fn lease_acquire(&mut self, node_id: &str, ttl_secs: u64) -> Result<bool, FsError> {
-        // Serialize the read-modify-write against other processes via an
-        // exclusive file lock; without it two racers can both see an empty
-        // holder and both "win" (split-brain).
         let mut sh = self.shared.lock().unwrap();
-        sh.dev
-            .lock_exclusive()
-            .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
-        let res = (|| -> Result<bool, FsError> {
-            let (sb, _) =
-                superblock::open(&sh.dev).map_err(|e| FsError::Invalid(format!("{e}")))?;
-            let now = now_secs();
+        let (sb, _) = superblock::open(&sh.dev).map_err(|e| FsError::Invalid(format!("{e}")))?;
+        let now = now_secs();
 
-            let holder_empty = sb.lease_holder.iter().all(|&b| b == 0);
-            let expired = sb.lease_expiry <= now;
-            let holder = lease_holder_name(&sb);
+        let holder_empty = sb.lease_holder.iter().all(|&b| b == 0);
+        let expired = sb.lease_expiry <= now;
+        let holder = lease_holder_name(&sb);
 
-            if !holder_empty && !expired && holder != node_id {
-                return Ok(false);
-            }
+        if !holder_empty && !expired && holder != node_id {
+            return Ok(false);
+        }
 
-            let mut sb = sb;
-            sb.lease_holder = lease_node_id_bytes(node_id);
-            sb.lease_expiry = now + ttl_secs;
-            superblock::write_slots(&mut sh.dev, &sb)
-                .map_err(|e| FsError::Invalid(format!("{e}")))?;
-            Ok(true)
-        })();
-        sh.dev
-            .unlock()
-            .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
-        res
+        let mut sb = sb;
+        sb.lease_holder = lease_node_id_bytes(node_id);
+        sb.lease_expiry = now + ttl_secs;
+        superblock::write_slots(&mut sh.dev, &sb).map_err(|e| FsError::Invalid(format!("{e}")))?;
+        Ok(true)
     }
 
     /// Renew the lease. Returns true if renewed, false if we lost it.
     pub fn lease_renew(&mut self, node_id: &str, ttl_secs: u64) -> Result<bool, FsError> {
         let mut sh = self.shared.lock().unwrap();
-        sh.dev
-            .lock_exclusive()
-            .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
-        let res = (|| -> Result<bool, FsError> {
-            let (sb, _) =
-                superblock::open(&sh.dev).map_err(|e| FsError::Invalid(format!("{e}")))?;
-            if lease_holder_name(&sb) != node_id {
-                return Ok(false);
-            }
-            let mut sb = sb;
-            sb.lease_expiry = now_secs() + ttl_secs;
-            superblock::write_slots(&mut sh.dev, &sb)
-                .map_err(|e| FsError::Invalid(format!("{e}")))?;
-            Ok(true)
-        })();
-        sh.dev
-            .unlock()
-            .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
-        res
+        let (sb, _) = superblock::open(&sh.dev).map_err(|e| FsError::Invalid(format!("{e}")))?;
+        if lease_holder_name(&sb) != node_id {
+            return Ok(false);
+        }
+        let mut sb = sb;
+        sb.lease_expiry = now_secs() + ttl_secs;
+        superblock::write_slots(&mut sh.dev, &sb).map_err(|e| FsError::Invalid(format!("{e}")))?;
+        Ok(true)
     }
 
     /// Check if we still hold the lease (without renewing).
@@ -2618,25 +2428,15 @@ impl Fs {
     /// Voluntarily release the lease.
     pub fn lease_release(&mut self, node_id: &str) -> Result<(), FsError> {
         let mut sh = self.shared.lock().unwrap();
-        sh.dev
-            .lock_exclusive()
-            .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
-        let res = (|| -> Result<(), FsError> {
-            let (sb, _) =
-                superblock::open(&sh.dev).map_err(|e| FsError::Invalid(format!("{e}")))?;
-            if lease_holder_name(&sb) == node_id {
-                let mut sb = sb;
-                sb.lease_holder = [0u8; 32];
-                sb.lease_expiry = 0;
-                superblock::write_slots(&mut sh.dev, &sb)
-                    .map_err(|e| FsError::Invalid(format!("{e}")))?;
-            }
-            Ok(())
-        })();
-        sh.dev
-            .unlock()
-            .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
-        res
+        let (sb, _) = superblock::open(&sh.dev).map_err(|e| FsError::Invalid(format!("{e}")))?;
+        if lease_holder_name(&sb) == node_id {
+            let mut sb = sb;
+            sb.lease_holder = [0u8; 32];
+            sb.lease_expiry = 0;
+            superblock::write_slots(&mut sh.dev, &sb)
+                .map_err(|e| FsError::Invalid(format!("{e}")))?;
+        }
+        Ok(())
     }
 }
 
@@ -3473,24 +3273,14 @@ mod tests {
         fs.commit().unwrap();
         drop(fs);
 
-        // Mark block 500 allocated in the active base bitmap area; nothing
-        // references it. Fix up the CRC sidecar so open() succeeds and
-        // check() is the layer that catches the stray bit.
+        // Mark block 500 allocated in the active bitmap area; nothing
+        // references it.
         let mut dev = FileDevice::open(&path).unwrap();
         let (sb, _) = superblock::open(&dev).unwrap();
-        let base_start = sb.bitmap_start + sb.bitmap_base_area * sb.bitmap_blocks;
         let mut blk = [0u8; BLOCK_SIZE];
-        dev.read_block(base_start, &mut blk).unwrap();
+        dev.read_block(sb.bitmap_area_start(), &mut blk).unwrap();
         blk[500 / 8] |= 1 << (500 % 8);
-        dev.write_block(base_start, &blk).unwrap();
-        // Recompute this block's CRC in the sidecar.
-        let new_crc = crate::checksum::checksum32(&blk);
-        let cb = superblock::bitmap_crc_blocks(sb.bitmap_blocks);
-        let crc_start = sb.bitmap_crc_start() + sb.bitmap_base_area * cb;
-        let mut cblk = [0u8; BLOCK_SIZE];
-        dev.read_block(crc_start, &mut cblk).unwrap();
-        cblk[8..12].copy_from_slice(&new_crc.to_le_bytes());
-        dev.write_block(crc_start, &cblk).unwrap();
+        dev.write_block(sb.bitmap_area_start(), &blk).unwrap();
         dev.sync().unwrap();
         drop(dev);
 

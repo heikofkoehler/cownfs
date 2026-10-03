@@ -70,18 +70,6 @@ impl FileDevice {
         self.faults = None;
     }
 
-    /// Take an exclusive advisory lock on the image file (flock).
-    /// Serializes lease acquire/renew/release across processes.
-    pub fn lock_exclusive(&self) -> io::Result<()> {
-        use fs2::FileExt;
-        self.file.lock_exclusive()
-    }
-
-    /// Release the advisory lock.
-    pub fn unlock(&self) -> io::Result<()> {
-        fs2::FileExt::unlock(&self.file)
-    }
-
     /// Reads `buf.len() / BLOCK_SIZE` contiguous blocks starting at `start`
     /// in a single syscall. `buf.len()` must be a multiple of BLOCK_SIZE.
     pub fn read_blocks(&self, start: u64, buf: &mut [u8]) -> io::Result<()> {
