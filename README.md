@@ -279,6 +279,7 @@ See [docs/production-readiness.md](docs/production-readiness.md) for complete op
 - [`docs/`](docs/) — In-depth architectural and operational specifications:
   - [architecture-plan.md](docs/architecture-plan.md) — Comprehensive technical design and on-disk format.
   - [garbage-collection.md](docs/garbage-collection.md) — Three-tier space reclamation, snapshot pinning, and offline mark-and-sweep GC.
+  - [snapshot-schedules.md](docs/snapshot-schedules.md) — Telescoping snapshot retention policies, NetApp-style tiers, and `.snapshots` NFS access.
   - [production-readiness.md](docs/production-readiness.md) — Production operations, reliability, and failover.
   - [v40-scaleout.md](docs/v40-scaleout.md) & [horizontal-scaling-plan.md](docs/horizontal-scaling-plan.md) — Referrals and sharding architecture.
   - [benchmark.md](docs/benchmark.md) & [p7-soak-results.md](docs/p7-soak-results.md) — Performance metrics and soak test results.
