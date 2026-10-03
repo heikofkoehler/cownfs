@@ -49,8 +49,9 @@ pub trait NodeStore<K, V> {
     /// unreachable children) when it reaches zero.
     fn dec_ref(&mut self, id: NodeId) -> Result<(), StoreError>;
     /// Persist dirty state. No-op for in-memory stores.
-    fn flush(&mut self) -> Result<(), StoreError> {
-        Ok(())
+    /// Returns true if any dirty state was actually written.
+    fn flush(&mut self) -> Result<bool, StoreError> {
+        Ok(false)
     }
     /// Nodes currently allocated (for leak checks).
     fn live(&mut self) -> usize;
@@ -372,7 +373,8 @@ impl<K, V, S: NodeStore<K, V>, const T: usize> BTree<K, V, S, T> {
     }
 
     /// Flush dirty state in block-backed stores.
-    pub fn flush(&self) -> Result<(), StoreError> {
+    /// Returns true if any dirty nodes were written.
+    pub fn flush(&self) -> Result<bool, StoreError> {
         self.store.lock().unwrap().flush()
     }
 }

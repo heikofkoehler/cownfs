@@ -885,12 +885,12 @@ impl Fs {
 
     // -- transactions ------------------------------------------------------
 
-    fn flush_all(&self) -> Result<(), FsError> {
-        self.inodes.flush()?;
-        self.dirs.flush()?;
-        self.extents.flush()?;
-        self.snaps.flush()?;
-        Ok(())
+    fn flush_all(&self) -> Result<bool, FsError> {
+        let a = self.inodes.flush()?;
+        let b = self.dirs.flush()?;
+        let c = self.extents.flush()?;
+        let d = self.snaps.flush()?;
+        Ok(a || b || c || d)
     }
 
     /// Load the bitmap, applying a delta if the superblock indicates one.
@@ -1139,7 +1139,7 @@ impl Fs {
     /// crash before [`Fs::sync_txg`] loses the open txg, leaving the
     /// previous generation intact.
     pub fn commit_async(&mut self) -> Result<u64, FsError> {
-        self.flush_all()?;
+        let flushed = self.flush_all()?;
         self.check_fault(FaultPoint::AfterFlush)?;
         self.persist_bitmap(0)?; // area_start unused (delta bitmap)
         self.check_fault(FaultPoint::AfterBitmap)?;
@@ -1148,7 +1148,13 @@ impl Fs {
         // since commit_async is the persist point.
         self.txg_allocated.clear();
         let mut t = self.txg.state.lock().unwrap();
-        t.dirty = true;
+        // Only mark dirty if we actually wrote something. The old
+        // unconditional dirty=true caused spurious generation advances
+        // on empty commits, which could leave the two superblock slots
+        // with divergent generations.
+        if flushed {
+            t.dirty = true;
+        }
         Ok(t.current)
     }
 

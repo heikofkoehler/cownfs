@@ -549,7 +549,7 @@ impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<(), StoreError> {
+    fn flush(&mut self) -> Result<bool, StoreError> {
         // Collect dirty blocks first so the device borrow is short.
         let dirty: Vec<u64> = self
             .cache
@@ -557,6 +557,7 @@ impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
             .filter(|(_, e)| e.dirty)
             .map(|(b, _)| *b)
             .collect();
+        let did_work = !dirty.is_empty();
         for block in dirty {
             let buf = {
                 let e = &self.cache[&block];
@@ -570,7 +571,7 @@ impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
         for e in self.cache.values_mut() {
             e.frozen = true;
         }
-        Ok(())
+        Ok(did_work)
     }
 
     fn live(&mut self) -> usize {
