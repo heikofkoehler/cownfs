@@ -114,11 +114,27 @@ flowchart TD
 
 ## Status
 
-**Current Tier: Minimal Production Readiness** (2026-10).
+**Working prototype, not production.** Updated 2026-10-03.
 
-The project has completed its core development milestones (P0–P7) and production hardening phases (P8–P28). All **178 integration and unit tests pass** across the workspace.
+All **258 tests pass** across the workspace (`cargo test --workspace`), zero compiler warnings, `cargo fmt --check` clean.
 
-See [docs/production-readiness.md](docs/production-readiness.md) for the detailed production checklist and operational runbooks.
+### Recently landed
+
+- **Crash safety**: per-block CRC32C sidecars on the allocation bitmap with fallback to the older superblock generation on corruption; post-unlink commit so reopen-after-crash can't resurrect deleted files; fixed a spurious transaction-group dirty flag that caused nondeterministic generation advances.
+- **Backup**: incremental restore (`restore-inc`) — full backup plus chained incrementals, with UUID/generation/CRC validation, verified end-to-end.
+- **NFS protocol**: paged READDIR (no longer materializes huge directories in memory, 10K-entry wire test); AUTH_SYS UID/GID now flows into audit logs instead of hardcoded root.
+- **Performance work**: vectored contiguous-block reads; sequential readahead (measured honestly: it warms the page cache but does not reduce syscall count — see `docs/readahead-strace.md`); O(1) indexed LRU replacing the old O(n) hit path, with a 12K-file eviction/reread test; paged bitmap core (64-page LRU, 256KiB bound) implemented but not yet wired into the filesystem.
+- **Operational**: SIGTERM/SIGINT graceful shutdown (drains connections, commits, exits clean); fixed a shutdown bug where persisting an unchanged bitmap wrote a spurious delta that failed `fsck`.
+- **Docs**: `docs/security-decisions.md` — honest writeup of AUTH_SYS-only auth, cleartext transport, and unimplemented ACLs/delegations, with mitigations.
+
+### Known gaps
+
+- **SIGKILL chaos test** (`p50_sigkill_chaos`) still fails intermittently with stale generation errors and stays ignored; the library-level chaos test covers the path.
+- **Multi-hour soak** (100M operations) and fio-over-mounted-NFS haven't run — no mount privileges in this environment.
+- **Perf gate** is currently red: `commit_p99` regressed ~25% vs baseline after the bitmap CRC work. Needs an optimize-or-rebaseline decision.
+- **Paged bitmap** core is done but not yet integrated into `Fs` (18 call sites still use the in-memory bitmap).
+- **Quotas** are accounting only, keyed by client-asserted UID — a resource feature, not a security boundary.
+- **Auth**: `AUTH_SYS` only. No Kerberos, no transport encryption. See `docs/security-decisions.md`.
 
 ### Implementation Breakdown
 
@@ -160,8 +176,9 @@ The server is actively tested against native operating system clients:
 
 ### Known Gaps & Limitations
 
-- **Authentication**: `AUTH_SYS` only (suitable for trusted networks, isolated VPCs, and container networks). Kerberos / `RPCSEC_GSS` is deferred.
-- **Advanced POSIX/NFS Features**: No quotas, POSIX ACLs, extended attributes (xattrs), or server-side delegations.
+- **Authentication**: `AUTH_SYS` only (suitable for trusted networks, isolated VPCs, and container networks). Kerberos / `RPCSEC_GSS` is not implemented. See `docs/security-decisions.md`.
+- **Transport**: NFS traffic is cleartext. Use stunnel, WireGuard, or IPsec on untrusted networks. See `docs/security-decisions.md`.
+- **Advanced POSIX/NFS Features**: No POSIX ACLs, extended attributes (xattrs), or server-side delegations. Per-UID block quotas exist but are accounting only (keyed by client-asserted UID).
 - **Clustering Strategy**: pNFS is experimental; NFSv4.0 referrals are the recommended production path for horizontal scaling. See [docs/v40-scaleout.md](docs/v40-scaleout.md).
 
 ---
