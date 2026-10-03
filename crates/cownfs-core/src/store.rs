@@ -301,9 +301,14 @@ struct CacheEntry<K, V> {
 pub struct BlockArena<K, V> {
     shared: Arc<Mutex<Shared>>,
     cache: HashMap<u64, CacheEntry<K, V>>,
+    /// LRU order for cache eviction (front = oldest).
+    lru_order: std::collections::VecDeque<u64>,
     /// Blocks currently allocated to this arena's nodes (leak-check aid).
     alloc_count: u64,
 }
+
+/// Maximum cached nodes per arena (A5: bounds memory; ~40 MiB for 10k nodes).
+const MAX_CACHE_NODES: usize = 10_000;
 
 impl<K, V> BlockArena<K, V> {
     /// Create an arena over `shared`. `t` is the tree's minimum degree;
@@ -321,6 +326,7 @@ impl<K, V> BlockArena<K, V> {
         BlockArena {
             shared,
             cache: HashMap::new(),
+            lru_order: std::collections::VecDeque::new(),
             alloc_count: 0,
         }
     }
@@ -361,6 +367,28 @@ impl<K, V> BlockArena<K, V> {
                 "stale NodeId {:?}: block has generation {gen}",
                 id
             );
+            // A5: LRU eviction if cache is full. Only evict clean nodes;
+            // dirty nodes must be flushed first.
+            if self.cache.len() >= MAX_CACHE_NODES {
+                // Find oldest clean node.
+                let mut evict_idx = None;
+                for &idx in &self.lru_order {
+                    if let Some(entry) = self.cache.get(&idx) {
+                        if !entry.dirty {
+                            evict_idx = Some(idx);
+                            break;
+                        }
+                    }
+                }
+                if let Some(idx) = evict_idx {
+                    self.cache.remove(&idx);
+                    if let Some(pos) = self.lru_order.iter().position(|&x| x == idx) {
+                        self.lru_order.remove(pos);
+                    }
+                }
+                // If all nodes are dirty, we skip eviction (cache grows
+                // temporarily; flush will clean them).
+            }
             self.cache.insert(
                 id.idx,
                 CacheEntry {
@@ -370,6 +398,7 @@ impl<K, V> BlockArena<K, V> {
                     frozen: true,
                 },
             );
+            self.lru_order.push_back(id.idx);
         } else {
             // The generation check applies on cache hits too: the block may
             // have been freed and reallocated since `id` was issued, in which
@@ -380,6 +409,11 @@ impl<K, V> BlockArena<K, V> {
                 "stale NodeId {:?}: cached block has generation {gen}",
                 id
             );
+            // A5: move to back of LRU on hit.
+            if let Some(pos) = self.lru_order.iter().position(|&x| x == id.idx) {
+                self.lru_order.remove(pos);
+            }
+            self.lru_order.push_back(id.idx);
         }
         Ok(&self.cache[&id.idx])
     }
