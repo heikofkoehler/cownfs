@@ -146,3 +146,148 @@ fn snapshots_dir_getattr_is_dir() {
     }
     let _ = std::fs::remove_file(&img);
 }
+
+/// Regression test for macOS `cd` into a snapshot: READDIR returns
+/// FATTR4_FILEHANDLE per entry; the client PUTFHs that handle directly.
+/// Before the fix, snapshot entries carried live filehandles with bogus
+/// inodes and PUTFH failed with NFS4ERR_STALE.
+#[test]
+fn snapshot_readdir_filehandles_roundtrip() {
+    let img = setup_image();
+    let srv = spawn_server_on(&img);
+    let mut c = NfsClient::connect(&srv.addr);
+
+    // READDIR .snapshots, asking for FILEHANDLE per entry.
+    let mut ops = Ops::new();
+    ops.putrootfh();
+    ops.lookup(b".snapshots");
+    ops.readdir(0, 8192, &[FATTR4_TYPE, FATTR4_FILEHANDLE]);
+    let res = c.check_ok(b"snap-readdir-fh", ops);
+    let fhs: Vec<Vec<u8>> = match &res[2] {
+        Reply::Dir(entries) => {
+            assert!(!entries.is_empty());
+            entries
+                .iter()
+                .map(|e| common::attr_raw(&e.attrs, FATTR4_FILEHANDLE).to_vec())
+                .collect()
+        }
+        r => panic!("{r:?}"),
+    };
+
+    // Each entry filehandle must PUTFH cleanly and be a directory
+    // (this is what `cd` does).
+    for fh in &fhs {
+        let mut ops = Ops::new();
+        ops.putfh_raw(fh);
+        ops.getattr(&[FATTR4_TYPE]);
+        let res = c.check_ok(b"snap-cd", ops);
+        match &res[1] {
+            Reply::Attrs(a) => {
+                assert_eq!(common::attr_u32(a, FATTR4_TYPE), NF4DIR);
+            }
+            r => panic!("fh {fh:?}: {r:?}"),
+        }
+    }
+    let _ = std::fs::remove_file(&img);
+}
+
+/// GETATTR FILEHANDLE on a looked-up snapshot must return a handle that
+/// PUTFHs back to the same snapshot (not a live handle).
+#[test]
+fn snapshot_getattr_filehandle_roundtrip() {
+    let img = setup_image();
+    let srv = spawn_server_on(&img);
+    let mut c = NfsClient::connect(&srv.addr);
+
+    let mut ops = Ops::new();
+    ops.putrootfh();
+    ops.lookup(b".snapshots");
+    ops.lookup(b"snap1");
+    ops.getattr(&[FATTR4_FILEHANDLE]);
+    let res = c.check_ok(b"snap-fh-getattr", ops);
+    let fh = match &res[3] {
+        Reply::Attrs(a) => common::attr_raw(a, FATTR4_FILEHANDLE).to_vec(),
+        r => panic!("{r:?}"),
+    };
+
+    // The handle must be a snapshot handle (SNAP magic), not a live one.
+    assert_eq!(&fh[4..8], b"SNAP", "expected snapshot filehandle");
+
+    // PUTFH it back and read the snapshot's root: must list data.txt.
+    let mut ops = Ops::new();
+    ops.putfh_raw(&fh);
+    ops.readdir(0, 8192, &[FATTR4_TYPE]);
+    let res = c.check_ok(b"snap-fh-readdir", ops);
+    match &res[1] {
+        Reply::Dir(entries) => {
+            let names: Vec<Vec<u8>> = entries.iter().map(|e| e.name.clone()).collect();
+            assert!(names.contains(&b"data.txt".to_vec()), "names: {names:?}");
+        }
+        r => panic!("{r:?}"),
+    }
+    let _ = std::fs::remove_file(&img);
+}
+
+/// Same round-trip for a file inside a snapshot: the handle must read
+/// the snapshot's version of the data.
+#[test]
+fn snapshot_file_filehandle_roundtrip() {
+    let img = setup_image();
+    let srv = spawn_server_on(&img);
+    let mut c = NfsClient::connect(&srv.addr);
+
+    let mut ops = Ops::new();
+    ops.putrootfh();
+    ops.lookup(b".snapshots");
+    ops.lookup(b"snap1");
+    ops.lookup(b"data.txt");
+    ops.getattr(&[FATTR4_FILEHANDLE]);
+    let res = c.check_ok(b"snapfile-fh-getattr", ops);
+    let fh = match &res[4] {
+        Reply::Attrs(a) => common::attr_raw(a, FATTR4_FILEHANDLE).to_vec(),
+        r => panic!("{r:?}"),
+    };
+    assert_eq!(&fh[4..8], b"SNAP", "expected snapshot filehandle");
+
+    // PUTFH the file handle directly and read: old content.
+    let mut ops = Ops::new();
+    ops.putfh_raw(&fh);
+    ops.read(0, 100);
+    let res = c.check_ok(b"snapfile-fh-read", ops);
+    match &res[1] {
+        Reply::Read { data, .. } => assert_eq!(data, b"version1"),
+        r => panic!("{r:?}"),
+    }
+    let _ = std::fs::remove_file(&img);
+}
+
+/// The .snapshots dir's own FILEHANDLE must round-trip too.
+#[test]
+fn snapshots_dir_filehandle_roundtrip() {
+    let img = setup_image();
+    let srv = spawn_server_on(&img);
+    let mut c = NfsClient::connect(&srv.addr);
+
+    let mut ops = Ops::new();
+    ops.putrootfh();
+    ops.lookup(b".snapshots");
+    ops.getattr(&[FATTR4_FILEHANDLE]);
+    let res = c.check_ok(b"snapdir-fh-getattr", ops);
+    let fh = match &res[2] {
+        Reply::Attrs(a) => common::attr_raw(a, FATTR4_FILEHANDLE).to_vec(),
+        r => panic!("{r:?}"),
+    };
+
+    let mut ops = Ops::new();
+    ops.putfh_raw(&fh);
+    ops.readdir(0, 8192, &[FATTR4_TYPE]);
+    let res = c.check_ok(b"snapdir-fh-readdir", ops);
+    match &res[1] {
+        Reply::Dir(entries) => {
+            let names: Vec<Vec<u8>> = entries.iter().map(|e| e.name.clone()).collect();
+            assert!(names.contains(&b"snap1".to_vec()), "names: {names:?}");
+        }
+        r => panic!("{r:?}"),
+    }
+    let _ = std::fs::remove_file(&img);
+}

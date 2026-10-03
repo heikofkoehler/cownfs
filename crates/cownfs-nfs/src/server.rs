@@ -1117,7 +1117,42 @@ impl Session {
 
     /// Build a `FileAttrs` for the given inode, including filesystem-level
     /// space statistics needed by the REQUIRED/RECOMMENDED GETATTR attrs.
-    fn make_file_attrs(&self, ino: u64, inode: &cownfs_core::engine::Inode) -> FileAttrs {
+    /// Filehandle bytes for FATTR4_FILEHANDLE, matching the Fh variant.
+    /// Snapshot objects get snapshot filehandles so clients can PUTFH them
+    /// back; a live filehandle here would fail validation with STALE.
+    fn fh_attr_bytes(&self, fh: &Fh, inode: &cownfs_core::engine::Inode) -> Vec<u8> {
+        let fs_uuid = self.fs().uuid();
+        match fh {
+            Fh::Live(ino) => FileHandle {
+                fs_uuid,
+                inode: *ino,
+                gen: inode.gen as u32,
+            }
+            .to_bytes()
+            .to_vec(),
+            Fh::SnapshotsDir => SnapFileHandle {
+                fs_uuid,
+                snap_id: 0,
+                inode: 0,
+            }
+            .to_bytes()
+            .to_vec(),
+            Fh::Snapshot { snap_id, ino } => SnapFileHandle {
+                fs_uuid,
+                snap_id: *snap_id,
+                inode: *ino,
+            }
+            .to_bytes()
+            .to_vec(),
+        }
+    }
+
+    fn make_file_attrs(
+        &self,
+        ino: u64,
+        inode: &cownfs_core::engine::Inode,
+        fh_bytes: Vec<u8>,
+    ) -> FileAttrs {
         let ftype = match inode.ftype {
             FTYPE_DIR => NF4DIR,
             FTYPE_SYMLINK => NF4LNK,
@@ -1135,13 +1170,7 @@ impl Session {
             nlink: inode.nlink,
             fsid_major: u64::from_be_bytes(fs_uuid[..8].try_into().unwrap()),
             fsid_minor: u64::from_be_bytes(fs_uuid[8..].try_into().unwrap()),
-            fh: FileHandle {
-                fs_uuid,
-                inode: ino,
-                gen: inode.gen as u32,
-            }
-            .to_bytes()
-            .to_vec(),
+            fh: fh_bytes,
             uid: inode.uid,
             gid: inode.gid,
             atime: inode.atime,
@@ -1178,14 +1207,14 @@ impl Session {
             Err(r) => return r,
         };
         // Get inode attributes based on filehandle type.
-        let (ino, inode) = match fh {
+        let (fh_for_attr, ino, inode) = match fh {
             Fh::Live(ino) => {
                 let inode_res = self.fs().getattr(ino);
                 let inode = match inode_res {
                     Ok(i) => i,
                     Err(e) => return OpResult::err(OP_GETATTR, fs_to_nfs(e)),
                 };
-                (ino, inode)
+                (Fh::Live(ino), ino, inode)
             }
             Fh::SnapshotsDir => {
                 // Synthetic directory attributes for .snapshots.
@@ -1202,7 +1231,7 @@ impl Session {
                     gen: 0,
                     parent: ROOT_INO,
                 };
-                (u64::MAX, inode)
+                (Fh::SnapshotsDir, u64::MAX, inode)
             }
             Fh::Snapshot { snap_id, ino } => {
                 let inode_res = self.fs().snapshot_getattr(snap_id as u64, ino);
@@ -1210,10 +1239,11 @@ impl Session {
                     Ok(i) => i,
                     Err(e) => return OpResult::err(OP_GETATTR, fs_to_nfs(e)),
                 };
-                (ino, inode)
+                (Fh::Snapshot { snap_id, ino }, ino, inode)
             }
         };
-        let fa = self.make_file_attrs(ino, &inode);
+        let fh_bytes = self.fh_attr_bytes(&fh_for_attr, &inode);
+        let fa = self.make_file_attrs(ino, &inode, fh_bytes);
         let vals = AttrValues::encode(mask, &fa);
         let mut w = Writer::new();
         vals.encode_result(&mut w);
@@ -1285,13 +1315,13 @@ impl Session {
         let max = maxcount.min(1024 * 1024);
         let mut emitted = 0usize;
         for (idx, (name, child_fh, _typ)) in entries.iter().enumerate().skip(start) {
-            let (attr_ino, inode) = match child_fh {
+            let (attr_ino, inode, fh_for_attr) = match child_fh {
                 EntryFh::Live(child_ino) => {
                     let inode = match self.fs().getattr(*child_ino) {
                         Ok(i) => i,
                         Err(_) => continue,
                     };
-                    (*child_ino, inode)
+                    (*child_ino, inode, Fh::Live(*child_ino))
                 }
                 EntryFh::Snap(snap_id, child_ino) => {
                     let inode = match self.fs().snapshot_getattr(*snap_id as u64, *child_ino) {
@@ -1299,10 +1329,18 @@ impl Session {
                         Err(_) => continue,
                     };
                     // Use a synthetic ino for attrs (snap_id in high bits).
-                    ((*snap_id as u64) << 32 | *child_ino, inode)
+                    (
+                        (*snap_id as u64) << 32 | *child_ino,
+                        inode,
+                        Fh::Snapshot {
+                            snap_id: *snap_id,
+                            ino: *child_ino,
+                        },
+                    )
                 }
             };
-            let fa = self.make_file_attrs(attr_ino, &inode);
+            let fh_bytes = self.fh_attr_bytes(&fh_for_attr, &inode);
+            let fa = self.make_file_attrs(attr_ino, &inode, fh_bytes);
             let vals = AttrValues::encode(mask, &fa);
             // entry: cookie, name, attrs, next-entry flag
             let mut ew = Writer::new();
