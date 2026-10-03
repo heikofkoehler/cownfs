@@ -291,3 +291,85 @@ fn snapshots_dir_filehandle_roundtrip() {
     }
     let _ = std::fs::remove_file(&img);
 }
+
+/// macOS `cat` pattern: OPEN (read-only) a file inside a snapshot must
+/// succeed; READ returns the snapshot's version. Before the fix, any OPEN
+/// on a snapshot handle failed with NFS4ERR_ROFS.
+#[test]
+fn snapshot_open_read_succeeds() {
+    let img = setup_image();
+    let srv = spawn_server_on(&img);
+    let mut c = NfsClient::connect(&srv.addr);
+    let id = common::establish_client(&mut c, b"snap-open");
+
+    // LOOKUP into the snapshot, then OPEN the file read-only.
+    let mut ops = Ops::new();
+    ops.putrootfh();
+    ops.lookup(b".snapshots");
+    ops.lookup(b"snap1");
+    ops.open_nocreate(id, b"owner1", 1, b"data.txt"); // flags=1: read access
+    let res = c.check_ok(b"snap-open", ops);
+    let stateid = match &res[3] {
+        Reply::Open { stateid } => *stateid,
+        r => panic!("{r:?}"),
+    };
+
+    // READ via the opened (snapshot) FH: old content.
+    let mut ops = Ops::new();
+    ops.putrootfh();
+    ops.lookup(b".snapshots");
+    ops.lookup(b"snap1");
+    ops.lookup(b"data.txt");
+    ops.read(0, 100);
+    let res = c.check_ok(b"snap-open-read", ops);
+    match &res[4] {
+        Reply::Read { data, .. } => assert_eq!(data, b"version1"),
+        r => panic!("{r:?}"),
+    }
+
+    // CLOSE the open.
+    let mut ops = Ops::new();
+    ops.putrootfh();
+    ops.lookup(b".snapshots");
+    ops.lookup(b"snap1");
+    ops.lookup(b"data.txt");
+    ops.close(1, &stateid);
+    c.check_ok(b"snap-close", ops);
+    let _ = std::fs::remove_file(&img);
+}
+
+/// OPEN with CREATE inside a snapshot must fail with ROFS.
+#[test]
+fn snapshot_open_create_fails_rofs() {
+    let img = setup_image();
+    let srv = spawn_server_on(&img);
+    let mut c = NfsClient::connect(&srv.addr);
+    let id = common::establish_client(&mut c, b"snap-open2");
+
+    let mut ops = Ops::new();
+    ops.putrootfh();
+    ops.lookup(b".snapshots");
+    ops.lookup(b"snap1");
+    ops.open_create(id, b"owner1", 1, b"newfile", 0o644);
+    let (status, replies) = c.call(b"snap-open-create", ops);
+    assert_eq!(status, NFS4ERR_ROFS, "replies: {replies:?}");
+    let _ = std::fs::remove_file(&img);
+}
+
+/// OPEN requesting WRITE access inside a snapshot must fail with ROFS.
+#[test]
+fn snapshot_open_write_fails_rofs() {
+    let img = setup_image();
+    let srv = spawn_server_on(&img);
+    let mut c = NfsClient::connect(&srv.addr);
+    let id = common::establish_client(&mut c, b"snap-open3");
+
+    let mut ops = Ops::new();
+    ops.putrootfh();
+    ops.lookup(b".snapshots");
+    ops.lookup(b"snap1");
+    ops.open_nocreate(id, b"owner1", 2, b"data.txt"); // flags=2: write access
+    let (status, replies) = c.call(b"snap-open-write", ops);
+    assert_eq!(status, NFS4ERR_ROFS, "replies: {replies:?}");
+    let _ = std::fs::remove_file(&img);
+}

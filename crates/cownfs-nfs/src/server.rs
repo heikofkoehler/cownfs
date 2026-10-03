@@ -27,7 +27,7 @@ use crate::nfs4::{
     OP_WRITE, UNCHECKED4,
 };
 use crate::rpc::{self, Call, RecordReader, RpcError};
-use crate::state::StateManager;
+use crate::state::{StateManager, OPEN4_SHARE_ACCESS_WRITE};
 use crate::xdr::{Writer, XdrError};
 use cownfs_core::engine::SetAttrs;
 
@@ -1460,22 +1460,53 @@ impl Session {
         if let Err(e) = Self::check_name(filename, OP_OPEN) {
             return e;
         }
-        let dir_ino = match self.current_live(OP_OPEN) {
-            Ok(i) => i,
+        // Resolve the directory handle: live or snapshot. Snapshot handles
+        // allow read-only opens (no CREATE, no WRITE share access).
+        #[derive(Clone, Copy)]
+        enum DirCtx {
+            Live(u64),
+            Snap(u32, u64),
+        }
+        let dir = match self.current(OP_OPEN) {
+            Ok(Fh::Live(ino)) => DirCtx::Live(ino),
+            Ok(Fh::SnapshotsDir) => return OpResult::err(OP_OPEN, NFS4ERR_ISDIR),
+            Ok(Fh::Snapshot { snap_id, ino }) => {
+                if opentype == OPEN4_CREATE {
+                    return OpResult::err(OP_OPEN, NFS4ERR_ROFS);
+                }
+                if share_access & OPEN4_SHARE_ACCESS_WRITE != 0 {
+                    return OpResult::err(OP_OPEN, NFS4ERR_ROFS);
+                }
+                DirCtx::Snap(snap_id, ino)
+            }
             Err(r) => return r,
         };
         // Check the cfh is a directory.
-        match self.fs().getattr(dir_ino) {
+        let dir_inode = match dir {
+            DirCtx::Live(dir_ino) => self.fs().getattr(dir_ino),
+            DirCtx::Snap(snap_id, dir_ino) => self.fs().snapshot_getattr(snap_id as u64, dir_ino),
+        };
+        match dir_inode {
             Ok(inode) if inode.ftype == FTYPE_DIR => {}
             Ok(_) => return OpResult::err(OP_OPEN, NFS4ERR_NOTDIR),
             Err(e) => return OpResult::err(OP_OPEN, fs_to_nfs(e)),
         }
+        let (snap_id_opt, dir_ino) = match dir {
+            DirCtx::Live(ino) => (None, ino),
+            DirCtx::Snap(snap_id, ino) => (Some(snap_id), ino),
+        };
 
-        let existing = match self.fs().lookup(dir_ino, filename) {
+        let existing = match snap_id_opt {
+            Some(snap_id) => self.fs().snapshot_lookup(snap_id as u64, dir_ino, filename),
+            None => self.fs().lookup(dir_ino, filename),
+        };
+        let existing = match existing {
             Ok(o) => o,
             Err(e) => return OpResult::err(OP_OPEN, fs_to_nfs(e)),
         };
 
+        // Snapshots are read-only: CREATE was already rejected above, so a
+        // missing file here is always NOENT (never create).
         let file_ino = match (existing, opentype == OPEN4_CREATE) {
             (Some(_), _) if createmode == GUARDED4 && opentype == OPEN4_CREATE => {
                 return OpResult::err(OP_OPEN, NFS4ERR_EXIST)
@@ -1498,13 +1529,26 @@ impl Session {
             (None, false) => return OpResult::err(OP_OPEN, NFS4ERR_NOENT),
         };
 
-        self.cfh = Some(Fh::Live(file_ino));
+        // Set the current FH to the opened file (snapshot-aware) and record
+        // open state. Snapshot inodes are namespaced into the high bits for
+        // the state table so they can't collide with live inodes.
+        let (new_cfh, state_ino) = match snap_id_opt {
+            Some(snap_id) => (
+                Fh::Snapshot {
+                    snap_id,
+                    ino: file_ino,
+                },
+                ((snap_id as u64) << 32) | file_ino,
+            ),
+            None => (Fh::Live(file_ino), file_ino),
+        };
+        self.cfh = Some(new_cfh);
         // P6: create real open state with share reservation checking.
         let open_rec = match self.state().open(
             seqid,
             clientid,
             owner.to_vec(),
-            file_ino,
+            state_ino,
             share_access,
             share_deny,
         ) {
