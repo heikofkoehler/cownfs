@@ -1190,6 +1190,16 @@ impl Fs {
         Arc::clone(&self.txg)
     }
 
+    /// Set device-level fault injection (B3/D3 testing).
+    pub fn set_device_faults(&mut self, faults: crate::block::FaultInjector) {
+        self.shared.lock().unwrap().dev.set_faults(faults);
+    }
+
+    /// Clear device-level fault injection.
+    pub fn clear_device_faults(&mut self) {
+        self.shared.lock().unwrap().dev.clear_faults();
+    }
+
     // -- quotas ------------------------------------------------------------
 
     /// Set a per-UID block quota (0 = no limit). In-memory only.
