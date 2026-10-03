@@ -107,7 +107,7 @@ impl<const N: usize> BlockCodec for [u8; N] {
 /// Each tree owns a [`BlockArena`] over the same `Shared`.
 pub struct Shared {
     pub dev: crate::block::FileDevice,
-    pub bitmap: crate::bitmap::PagedBitmap,
+    pub bitmap: crate::bitmap::Bitmap,
     /// Blocks freed in the current (uncommitted) transaction. Their bitmap
     /// bits stay set until commit: the blocks may still be reachable from
     /// the last committed generation, so they must not be reallocated
