@@ -301,8 +301,13 @@ struct CacheEntry<K, V> {
 pub struct BlockArena<K, V> {
     shared: Arc<Mutex<Shared>>,
     cache: HashMap<u64, CacheEntry<K, V>>,
-    /// LRU order for cache eviction (front = oldest).
-    lru_order: std::collections::VecDeque<u64>,
+    /// Indexed LRU for cache eviction.
+    /// `lru_stack` holds block indices in use order (index 0 = least
+    /// recently used, back = most recently used). `lru_index` maps a
+    /// block index to its position in `lru_stack`, making cache hits
+    /// O(1) (the old VecDeque `position()` scan was O(n)).
+    lru_stack: Vec<u64>,
+    lru_index: HashMap<u64, usize>,
     /// Blocks currently allocated to this arena's nodes (leak-check aid).
     alloc_count: u64,
 }
@@ -326,9 +331,63 @@ impl<K, V> BlockArena<K, V> {
         BlockArena {
             shared,
             cache: HashMap::new(),
-            lru_order: std::collections::VecDeque::new(),
+            lru_stack: Vec::new(),
+            lru_index: HashMap::new(),
             alloc_count: 0,
         }
+    }
+
+    /// Remove `idx` from the LRU position index (if present). O(1).
+    fn lru_remove(&mut self, idx: u64) {
+        if let Some(&pos) = self.lru_index.get(&idx) {
+            self.lru_remove_at(pos);
+        }
+    }
+
+    /// Remove the entry at `pos` from `lru_stack`, fixing up the index
+    /// of the element swapped into its place. O(1).
+    fn lru_remove_at(&mut self, pos: usize) {
+        let idx = self.lru_stack[pos];
+        self.lru_index.remove(&idx);
+        let last = self.lru_stack.len() - 1;
+        if pos != last {
+            self.lru_stack.swap(pos, last);
+            let moved = self.lru_stack[pos];
+            self.lru_index.insert(moved, pos);
+        }
+        self.lru_stack.pop();
+    }
+
+    /// Record a use of `idx` (move to most-recently-used). O(1).
+    fn lru_touch(&mut self, idx: u64) {
+        self.lru_remove(idx);
+        let pos = self.lru_stack.len();
+        self.lru_stack.push(idx);
+        self.lru_index.insert(idx, pos);
+    }
+
+    /// Evict the least-recently-used clean node from cache.
+    /// Returns the evicted block index, or None if every cached node is
+    /// dirty (callers then skip eviction; flush will clean them).
+    fn lru_evict_oldest_clean(&mut self) -> Option<u64> {
+        let mut pos = 0;
+        while pos < self.lru_stack.len() {
+            let idx = self.lru_stack[pos];
+            match self.cache.get(&idx) {
+                Some(entry) if entry.dirty => {
+                    pos += 1;
+                }
+                Some(_) => {
+                    self.lru_remove_at(pos);
+                    self.cache.remove(&idx);
+                    return Some(idx);
+                }
+                None => {
+                    self.lru_remove_at(pos);
+                }
+            }
+        }
+        None
     }
 
     /// Allocate a fresh empty root and return the arena in an `Arc<Mutex>`.
@@ -368,26 +427,11 @@ impl<K, V> BlockArena<K, V> {
                 id
             );
             // A5: LRU eviction if cache is full. Only evict clean nodes;
-            // dirty nodes must be flushed first.
+            // dirty nodes must be flushed first. If all nodes are dirty,
+            // we skip eviction (cache grows temporarily; flush will clean
+            // them).
             if self.cache.len() >= MAX_CACHE_NODES {
-                // Find oldest clean node.
-                let mut evict_idx = None;
-                for &idx in &self.lru_order {
-                    if let Some(entry) = self.cache.get(&idx) {
-                        if !entry.dirty {
-                            evict_idx = Some(idx);
-                            break;
-                        }
-                    }
-                }
-                if let Some(idx) = evict_idx {
-                    self.cache.remove(&idx);
-                    if let Some(pos) = self.lru_order.iter().position(|&x| x == idx) {
-                        self.lru_order.remove(pos);
-                    }
-                }
-                // If all nodes are dirty, we skip eviction (cache grows
-                // temporarily; flush will clean them).
+                self.lru_evict_oldest_clean();
             }
             self.cache.insert(
                 id.idx,
@@ -398,7 +442,7 @@ impl<K, V> BlockArena<K, V> {
                     frozen: true,
                 },
             );
-            self.lru_order.push_back(id.idx);
+            self.lru_touch(id.idx);
         } else {
             // The generation check applies on cache hits too: the block may
             // have been freed and reallocated since `id` was issued, in which
@@ -409,11 +453,9 @@ impl<K, V> BlockArena<K, V> {
                 "stale NodeId {:?}: cached block has generation {gen}",
                 id
             );
-            // A5: move to back of LRU on hit.
-            if let Some(pos) = self.lru_order.iter().position(|&x| x == id.idx) {
-                self.lru_order.remove(pos);
-            }
-            self.lru_order.push_back(id.idx);
+            // A5: move to most-recent on hit. O(1) via the position index
+            // (the old VecDeque `position()` scan was O(n)).
+            self.lru_touch(id.idx);
         }
         Ok(&self.cache[&id.idx])
     }
@@ -431,6 +473,7 @@ impl<K, V> BlockArena<K, V> {
 
     fn free_block(&mut self, block: u64) {
         self.cache.remove(&block);
+        self.lru_remove(block);
         // Deferred: the bit is cleared at commit, after the new bitmap
         // area is written. See `Shared::pending_free`.
         self.shared.lock().unwrap().pending_free.push(block);
@@ -512,6 +555,9 @@ impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
                 frozen: false,
             },
         );
+        // Track newly allocated nodes in the LRU (most-recent). They are
+        // dirty so eviction will skip them until flushed.
+        self.lru_touch(block);
         self.alloc_count += 1;
         Ok(NodeId { idx: block, gen })
     }
@@ -520,6 +566,7 @@ impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
         let rc = self.load(id)?.node.refcount;
         debug_assert_eq!(rc, 1, "take of shared node");
         let entry = self.cache.remove(&id.idx).expect("just loaded");
+        self.lru_remove(id.idx);
         self.shared.lock().unwrap().pending_free.push(id.idx);
         self.alloc_count -= 1;
         Ok(entry.node)
