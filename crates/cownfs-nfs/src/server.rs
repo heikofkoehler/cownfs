@@ -1868,6 +1868,36 @@ pub fn serve_listener(listener: TcpListener, shared: &Shared) -> Result<(), Serv
     Ok(())
 }
 
+/// Serve metrics/health HTTP endpoint on the given address.
+/// Runs in the calling thread (spawn it for background).
+pub fn serve_metrics(addr: &str, shared: &Shared) -> Result<(), ServerError> {
+    let listener = std::net::TcpListener::bind(addr).map_err(ServerError::Io)?;
+    eprintln!("metrics on http://{addr}/metrics");
+    for stream in listener.incoming() {
+        if let Ok(mut s) = stream {
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf);
+            let req = String::from_utf8_lossy(&buf);
+            let (status, ctype, body) = if req.starts_with("GET /metrics") {
+                ("200 OK", "text/plain", shared.metrics.render())
+            } else if req.starts_with("GET /healthz") {
+                ("200 OK", "text/plain", "ok\n".to_string())
+            } else {
+                ("404 Not Found", "text/plain", "not found\n".to_string())
+            };
+            let _ = s.write_all(
+                format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Run the server on an already-bound `listener`, spawning one thread per
 /// connection. Filesystem and NFSv4 state are shared across connections.
 /// Handles SIGTERM/SIGINT gracefully: stops accepting, drains connections

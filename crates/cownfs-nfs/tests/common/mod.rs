@@ -68,9 +68,16 @@ pub fn spawn_server_with_referrals(blocks: u64, conf: &std::path::Path) -> TestS
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
     let addr = listener.local_addr().expect("listener local addr");
     let img2 = img.clone();
+    // Metrics on port+1000.
+    let metrics_addr = format!("127.0.0.1:{}", addr.port() + 1000);
     std::thread::spawn(move || {
         let fs = Fs::open(&img2).expect("open test image");
         let shared = cownfs_nfs::server::Shared::new(fs).with_referrals(table);
+        let shared2 = shared.clone();
+        let metrics_addr2 = metrics_addr.clone();
+        std::thread::spawn(move || {
+            let _ = cownfs_nfs::server::serve_metrics(&metrics_addr2, &shared2);
+        });
         let _ = cownfs_nfs::server::serve_listener(listener, &shared);
     });
     TestServer {
