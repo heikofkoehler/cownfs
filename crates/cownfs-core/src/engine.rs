@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::bitmap::Bitmap;
 use crate::block::{BlockDevice, FileDevice};
 use crate::btree::{BTree, NodeId};
+use crate::checksum::checksum32;
 use crate::store::{self, BlockArena, BlockCodec, Shared, StoreError};
 use crate::superblock::{self, Superblock};
 use crate::BLOCK_SIZE;
@@ -78,6 +79,8 @@ pub enum FsError {
     BadName,
     NoSpace,
     Invalid(String),
+    /// Data block checksum mismatch (bit rot detected).
+    Corrupt(String),
     /// Deterministic fault injected by `Fs::set_fault_point` (P7).
     InjectedFault(FaultPoint),
 }
@@ -95,6 +98,7 @@ impl std::fmt::Display for FsError {
             FsError::BadName => write!(f, "invalid file name"),
             FsError::NoSpace => write!(f, "no space left on device"),
             FsError::Invalid(s) => write!(f, "invalid: {s}"),
+            FsError::Corrupt(s) => write!(f, "corrupt: {s}"),
         }
     }
 }
@@ -277,6 +281,9 @@ impl BlockCodec for ExtentKey {
 pub struct Extent {
     pub blk: u64,
     pub len: u32,
+    /// CRC32C of the data block (parent-stored checksum).
+    /// 0 = unknown (pre-checksum extents); verification skipped.
+    pub cksum: u32,
 }
 
 impl BlockCodec for Extent {
@@ -284,11 +291,13 @@ impl BlockCodec for Extent {
     fn encode(&self, out: &mut [u8]) {
         out[0..8].copy_from_slice(&self.blk.to_le_bytes());
         out[8..12].copy_from_slice(&self.len.to_le_bytes());
+        out[12..16].copy_from_slice(&self.cksum.to_le_bytes());
     }
     fn decode(raw: &[u8]) -> Self {
         Extent {
             blk: u64::from_le_bytes(raw[0..8].try_into().unwrap()),
             len: u32::from_le_bytes(raw[8..12].try_into().unwrap()),
+            cksum: u32::from_le_bytes(raw[12..16].try_into().unwrap()),
         }
     }
 }
@@ -373,6 +382,16 @@ fn read_from(
                     .dev
                     .read_block(ext.blk, &mut buf)
                     .map_err(StoreError::Io)?;
+                // Verify parent-stored checksum (if present).
+                if ext.cksum != 0 {
+                    let actual = checksum32(&buf);
+                    if actual != ext.cksum {
+                        return Err(FsError::Corrupt(format!(
+                            "data block {} checksum mismatch: expected {:08x}, got {:08x}",
+                            ext.blk, ext.cksum, actual
+                        )));
+                    }
+                }
                 out.extend_from_slice(&buf[in_blk..in_blk + n]);
             }
             None => out.extend(std::iter::repeat(0).take(n)),
@@ -1356,11 +1375,13 @@ impl Fs {
             }
             buf[in_blk..in_blk + n].copy_from_slice(&data[pos..pos + n]);
             self.write_block(new_blk, &buf)?;
+            let cksum = checksum32(&buf);
             self.extents.insert(
                 key,
                 Extent {
                     blk: new_blk,
                     len: 1,
+                    cksum,
                 },
             )?;
             pos += n;
@@ -1400,8 +1421,15 @@ impl Fs {
                     buf[(size % BLOCK_SIZE as u64) as usize..].fill(0);
                     let nb = self.alloc_block()?;
                     self.write_block(nb, &buf)?;
-                    self.extents
-                        .insert(ExtentKey { ino, off: blk_off }, Extent { blk: nb, len: 1 })?;
+                    let cksum = checksum32(&buf);
+                    self.extents.insert(
+                        ExtentKey { ino, off: blk_off },
+                        Extent {
+                            blk: nb,
+                            len: 1,
+                            cksum,
+                        },
+                    )?;
                     self.free_block(ext.blk);
                 }
             }
