@@ -13,9 +13,10 @@ use crate::nfs4::{
     StateId, ACCESS4_DELETE, ACCESS4_EXECUTE, ACCESS4_EXTEND, ACCESS4_LOOKUP, ACCESS4_MODIFY,
     ACCESS4_READ, FATTR4_MODE, FATTR4_SIZE, FILE_SYNC4, GUARDED4, LAYOUT4_NFSV4_1_FILES, NF4DIR,
     NF4LNK, NF4REG, NFS4ERR_BADNAME, NFS4ERR_BADSESSION, NFS4ERR_BADSLOT, NFS4ERR_BADTYPE,
-    NFS4ERR_BADXDR, NFS4ERR_BAD_COOKIE, NFS4ERR_EXIST, NFS4ERR_EXPIRED, NFS4ERR_INVAL,
+    NFS4ERR_BADXDR, NFS4ERR_BAD_COOKIE, NFS4ERR_DELAY, NFS4ERR_EXIST, NFS4ERR_EXPIRED, NFS4ERR_INVAL,
     NFS4ERR_IO, NFS4ERR_ISDIR, NFS4ERR_MOVED, NFS4ERR_NAMETOOLONG, NFS4ERR_NOENT, NFS4ERR_NOFILEHANDLE,
-    NFS4ERR_NOSPC, NFS4ERR_NOTDIR, NFS4ERR_NOTSUPP, NFS4ERR_OP_ILLEGAL, NFS4ERR_RECALLCONFLICT, NFS4ERR_ROFS,
+    NFS4ERR_NOSPC, NFS4ERR_NOTDIR, NFS4ERR_NOTSUPP, NFS4ERR_OP_ILLEGAL, NFS4ERR_RECALLCONFLICT,
+    NFS4ERR_RESOURCE, NFS4ERR_ROFS,
     NFS4ERR_SEQ_MISORDERED, NFS4ERR_SERVERFAULT, NFS4ERR_STALE, NFS4ERR_STALE_CLIENTID,
     NFS4ERR_TOOSMALL, NFS4_OK, OPEN4_CREATE, OP_ACCESS, OP_CLOSE, OP_COMMIT, OP_CREATE,
     OP_CREATE_SESSION, OP_DESTROY_CLIENTID, OP_DESTROY_SESSION, OP_EXCHANGE_ID, OP_GETATTR,
@@ -116,6 +117,8 @@ pub struct Shared {
     pub referrals: Arc<crate::referrals::ReferralTable>,
     /// Metrics registry.
     pub metrics: Arc<crate::metrics::Metrics>,
+    /// Throttling (per-client and per-file rate limits).
+    pub throttle: Arc<crate::throttle::Throttle>,
 }
 
 impl Shared {
@@ -129,6 +132,9 @@ impl Shared {
             read_only: false,
             referrals: Arc::new(crate::referrals::ReferralTable::new()),
             metrics: crate::metrics::Metrics::new(),
+            throttle: Arc::new(crate::throttle::Throttle::new(
+                crate::throttle::ThrottleConfig::default(),
+            )),
         }
     }
 
@@ -142,6 +148,9 @@ impl Shared {
             read_only: true,
             referrals: Arc::new(crate::referrals::ReferralTable::new()),
             metrics: crate::metrics::Metrics::new(),
+            throttle: Arc::new(crate::throttle::Throttle::new(
+                crate::throttle::ThrottleConfig::default(),
+            )),
         }
     }
 
@@ -372,6 +381,30 @@ impl Session {
     }
 
     fn exec(&mut self, op: &Op) -> OpResult {
+        // Throttling: per-client op rate limit.
+        // Returns NFS4ERR_DELAY if the client is over the limit.
+        if !self.shared.throttle.check_client_op(&self.client_addr) {
+            let opnum = match op {
+                Op::PutFh(_) => OP_PUTFH,
+                Op::PutRootFh => OP_PUTROOTFH,
+                Op::GetFh => OP_GETFH,
+                Op::Lookup(_) => OP_LOOKUP,
+                Op::LookupP => OP_LOOKUPP,
+                Op::GetAttr(_) => OP_GETATTR,
+                Op::SetAttr { .. } => OP_SETATTR,
+                Op::Read { .. } => OP_READ,
+                Op::Write { .. } => OP_WRITE,
+                Op::Create { .. } => OP_CREATE,
+                Op::Remove(_) => OP_REMOVE,
+                Op::Rename { .. } => OP_RENAME,
+                Op::Link { .. } => OP_LINK,
+                Op::ReadDir { .. } => OP_READDIR,
+                Op::Open { .. } => OP_OPEN,
+                Op::Close { .. } => OP_CLOSE,
+                _ => OP_ILLEGAL,
+            };
+            return OpResult::err(opnum, NFS4ERR_DELAY);
+        }
         match op {
             Op::PutFh(fh) => match self.check_fh(fh) {
                 Ok(ino) => {
@@ -513,7 +546,27 @@ impl Session {
                 if self.shared.read_only {
                     return OpResult::err(OP_WRITE, NFS4ERR_ROFS);
                 }
-                self.op_write(*offset, *stable, data)
+                // Per-file throttling: limit bytes/sec and concurrent writers.
+                let ino = match self.cfh {
+                    Some(i) => i,
+                    None => return OpResult::err(OP_WRITE, NFS4ERR_NOFILEHANDLE),
+                };
+                if !self
+                    .shared
+                    .throttle
+                    .check_client_bytes(&self.client_addr, data.len() as u64)
+                {
+                    return OpResult::err(OP_WRITE, NFS4ERR_DELAY);
+                }
+                if !self.shared.throttle.check_file_bytes(ino, data.len() as u64) {
+                    return OpResult::err(OP_WRITE, NFS4ERR_DELAY);
+                }
+                if !self.shared.throttle.acquire_writer(ino) {
+                    return OpResult::err(OP_WRITE, NFS4ERR_RESOURCE);
+                }
+                let res = self.op_write(*offset, *stable, data);
+                self.shared.throttle.release_writer(ino);
+                res
             }
             Op::Commit { offset, count } => self.op_commit(*offset, *count),
             Op::SetClientId {

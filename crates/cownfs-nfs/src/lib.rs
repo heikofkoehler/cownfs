@@ -12,4 +12,5 @@ pub mod rpc;
 pub mod server;
 pub mod sessions;
 pub mod state;
+pub mod throttle;
 pub mod xdr;
