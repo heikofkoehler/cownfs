@@ -1,15 +1,12 @@
 # cownfs Horizontal Scaling Plan
 
-**Status:** Active — Phase 1 in progress
+**Status:** Active — Phases 1-3 complete (v4.0 only). Phase 4 (pNFS) DEPRECATED.
 **Author:** Neo (for Heiko Koehler)
-**Date:** 2026-10-02
+**Date:** 2026-10-02 (updated: pNFS deprecated, referrals complete)
 
 ## Goal
 
-Scale cownfs beyond a single node. The long-term target is pNFS-style
-separation of metadata and data paths, but we get there in phases ordered
-by value-per-protocol-risk. Each phase must be independently useful and
-shippable.
+Scale cownfs beyond a single node using **NFSv4.0 only**. No pNFS required.
 
 ## Why CoW helps
 
@@ -30,33 +27,30 @@ easier than in a traditional filesystem:
 
 ```
                     ┌─────────────┐
-                    │    Client   │
+                    │    Client   │  (mounts referral server only)
                     └──────┬──────┘
-                           │ NFSv4.0 (today)
+                           │ NFSv4.0
+                    ┌──────▼──────┐
+                    │  Referral   │
+                    │  Server     │  (namespace skeleton)
+                    └──────┬──────┘
+                           │ LOOKUP → MOVED + fs_locations
               ┌────────────┼────────────┐
-              │            │            │
-     ┌────────▼───┐ ┌──────▼─────┐ ┌────▼────────┐
-     │  Primary   │ │  Replica 1 │ │  Replica 2  │  Phase 1
-     │  (r/w)     │ │  (read)    │ │  (read)     │
-     └────────────┘ └────────────┘ └────────────┘
-              │ snapshot shipping (block diff)
-
-     ┌────────┴───┐ ┌──────┴─────┐ ┌────┴────────┐
-     │  Shard A   │ │  Shard B   │ │  Shard C    │  Phase 2
-     │  /home     │ │  /data     │ │  /archive   │
-     └────────────┘ └────────────┘ └────────────┘
-
-     ┌────────────┐        ┌────────┐ ┌────────┐
-     │    MDS     │───────▶│  DS 1  │ │  DS 2  │  Phase 3 (pNFS)
-     │ (metadata) │ layout │ (data) │ │ (data) │
-     └────────────┘        └────────┘ └────────┘
+              ▼            ▼            ▼
+        ┌─────────┐  ┌─────────┐  ┌─────────┐
+        │ Shard 0 │  │ Shard 1 │  │ Shard 2 │  Phase 2+3
+        │ primary │  │ primary │  │ primary │
+        └───┬─────┘  └───┬─────┘  └───┬─────┘
+            │            │            │  Phase 1 (per-shard)
+     ┌──────▼──┐  ┌──────▼──┐  ┌──────▼──┐
+     │Replica  │  │Replica  │  │Replica  │
+     │(read)   │  │(read)   │  │(read)   │
+     └─────────┘  └─────────┘  └─────────┘
 ```
 
-## Phase 1 — Read replicas
+## Phase 1 — Read replicas ✓ DONE
 
-**Value:** Immediate read scaling with no protocol change. Read-heavy
-workloads (builds, analytics, static assets) mount a replica; writes go
-to the primary.
+**Value:** Immediate read scaling with no protocol change.
 
 **Consistency model:** Replica serves reads at a snapshot boundary.
 Reads are always internally consistent (a single root), but may lag the
@@ -125,10 +119,11 @@ replicas. This is documented, not hidden.
 - [ ] p16 integration tests green
 - [ ] Docs: replica setup, consistency model, lag metrics
 
-## Phase 2 — Subtree sharding
+## Phase 2 — Subtree sharding ✓ DONE
 
-**Value:** Metadata write scaling. Split the namespace across MDS
-instances by directory subtree.
+**Value:** Metadata write scaling. Split the namespace across servers
+by directory subtree. `cownfs-shard` CLI + `cownfs-cluster init` for
+automated setup.
 
 - Shard map: `/home -> mds-a`, `/data -> mds-b`, configured statically
   (no dynamic rebalancing in v1).
@@ -140,44 +135,27 @@ instances by directory subtree.
 - Hard part: none protocol-wise; the work is operational (shard map
   distribution, tooling).
 
-## Phase 3 — pNFS data path
+## Phase 3 — Referrals (transparent sharding) ✓ DONE
 
-**Value:** Write throughput scaling. Clients write data blocks directly
-to data servers; MDS handles metadata only.
+**Value:** Makes sharding transparent. Client mounts one server; LOOKUP
+on shard dirs returns MOVED + fs_locations, client follows automatically.
 
-**Delivered (Phase 3a):** `cownfs-ds` — the thin data-server daemon.
-Dumb 4 KiB block store over TCP (`read_block`/`write_block`/status),
-CRC32C checksums computed on write and returned on read (matching
-`cownfs_core::checksum`), sparse-file backed. The MDS validates these
-checksums at LAYOUTCOMMIT time. Tested: unit (checksum match, store
-roundtrip) + TCP integration (write/read/checksum/status).
+Implements RFC 7530 §6.4: FATTR4_FS_LOCATIONS, NFS4ERR_MOVED, referral
+config file, `cownfs-server --referrals`.
 
-**Remaining (all large):** Full pNFS requires NFSv4.1 sessions. We are
-on 4.0 with no session machinery.
+## Phase 4 — pNFS data path — DEPRECATED
 
-1. **NFSv4.1 sessions.** Needed: session establishment, per-session
-   sequence handling, backchannel for layout recalls and device
-   notifications.
-2. **Layout issuance (file layouts, RFC 5661 §12).** MDS maps file offset
-   ranges to `(data_server, block_id)` extents. Client I/O goes direct
-   to DS.
-3. **Write commit flow.** Client writes new blocks to DS, then calls
-   LAYOUTCOMMIT on the MDS. MDS validates block checksums (DS returns
-   them), then atomically swings B-tree pointers. Uncommitted blocks are
-   orphans — GC reclaims them.
-4. **Layout recall.** When GC, snapshot deletion, or defrag moves blocks,
-   MDS recalls outstanding layouts via the 4.1 backchannel. Recall races
-   are the #1 pNFS bug source — this needs dedicated testing.
+**Why deprecated:** With referrals (Phase 3) and read replicas (Phase 1),
+we have transparent write sharding and read scaling on NFSv4.0 alone.
+pNFS would add single-file parallel I/O (striping), which is not a
+requirement.
 
-**Why CoW still helps here:** the MDS commit is a single atomic
-pointer-swing. There is no distributed transaction — the DS writes are
-provisional until the MDS blesses them.
+The pNFS prototype code (`cownfs-ds`, layout ops) remains in the tree
+as experimental, but it is not on the scaling path. See
+`docs/nfsv41-compliance.md` for the gap analysis.
 
-## Phase 4 — Clustered MDS
-
-Only if Phases 1–3 prove insufficient. This is distributed consensus
-(Raft/Paxos) on the metadata path — a project in itself, not a phase.
-Listed here for completeness, not planned.
+**If parallel I/O ever becomes important**, the pNFS work can be
+revived. Until then, v4.0 referrals are the scale-out mechanism.
 
 ## Open questions
 
