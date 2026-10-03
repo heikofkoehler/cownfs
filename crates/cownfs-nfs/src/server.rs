@@ -234,6 +234,10 @@ struct Session {
     session41: Option<[u8; 16]>,
     /// Client address for audit logging.
     client_addr: String,
+    /// UID from AUTH_SYS credentials (for audit logging).
+    uid: u32,
+    /// GID from AUTH_SYS credentials (for audit logging).
+    gid: u32,
 }
 
 /// A filehandle: either a live filesystem inode, or a snapshot view.
@@ -255,6 +259,8 @@ impl Session {
             saved_fh: None,
             session41: None,
             client_addr: addr,
+            uid: 0,
+            gid: 0,
         }
     }
 
@@ -589,7 +595,7 @@ impl Session {
                     crate::log::audit(
                         "CREATE",
                         &self.client_addr,
-                        0, // TODO: extract UID from RPC credentials
+                        self.uid,
                         &String::from_utf8_lossy(name),
                     );
                 }
@@ -604,7 +610,7 @@ impl Session {
                     crate::log::audit(
                         "REMOVE",
                         &self.client_addr,
-                        0,
+                        self.uid,
                         &String::from_utf8_lossy(name),
                     );
                 }
@@ -2229,6 +2235,9 @@ fn handle_record(record: &[u8], session: &mut Session, debug_rpc: bool) -> Vec<u
         }
         Err(_) => return Vec::new(), // drop malformed records silently
     };
+    // Extract UID/GID from AUTH_SYS credentials for audit logging.
+    session.uid = call.auth.uid;
+    session.gid = call.auth.gid;
     let mut params = call.params;
     let results = match call.proc {
         crate::rpc::PROC_NULL => rpc::encode_reply(call.xid, &[]),
