@@ -107,7 +107,7 @@ impl<const N: usize> BlockCodec for [u8; N] {
 /// Each tree owns a [`BlockArena`] over the same `Shared`.
 pub struct Shared {
     pub dev: crate::block::FileDevice,
-    pub bitmap: Bitmap,
+    pub bitmap: crate::bitmap::PagedBitmap,
     /// Blocks freed in the current (uncommitted) transaction. Their bitmap
     /// bits stay set until commit: the blocks may still be reachable from
     /// the last committed generation, so they must not be reallocated
@@ -369,20 +369,24 @@ impl<K, V> BlockArena<K, V> {
     /// Evict the least-recently-used clean node from cache.
     /// Returns the evicted block index, or None if every cached node is
     /// dirty (callers then skip eviction; flush will clean them).
+    /// Stale LRU entries (node freed without LRU removal) are cleaned up.
     fn lru_evict_oldest_clean(&mut self) -> Option<u64> {
         let mut pos = 0;
         while pos < self.lru_stack.len() {
             let idx = self.lru_stack[pos];
             match self.cache.get(&idx) {
                 Some(entry) if entry.dirty => {
-                    pos += 1;
+                    pos += 1; // dirty: cannot evict, try next oldest
                 }
                 Some(_) => {
+                    // Oldest clean node: evict from LRU and cache.
                     self.lru_remove_at(pos);
                     self.cache.remove(&idx);
                     return Some(idx);
                 }
                 None => {
+                    // Stale LRU entry (freed without removal): drop it and
+                    // re-examine this position (swap moved a new element here).
                     self.lru_remove_at(pos);
                 }
             }
@@ -473,7 +477,6 @@ impl<K, V> BlockArena<K, V> {
 
     fn free_block(&mut self, block: u64) {
         self.cache.remove(&block);
-        self.lru_remove(block);
         // Deferred: the bit is cleared at commit, after the new bitmap
         // area is written. See `Shared::pending_free`.
         self.shared.lock().unwrap().pending_free.push(block);
@@ -566,7 +569,6 @@ impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
         let rc = self.load(id)?.node.refcount;
         debug_assert_eq!(rc, 1, "take of shared node");
         let entry = self.cache.remove(&id.idx).expect("just loaded");
-        self.lru_remove(id.idx);
         self.shared.lock().unwrap().pending_free.push(id.idx);
         self.alloc_count -= 1;
         Ok(entry.node)

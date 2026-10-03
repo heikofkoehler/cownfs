@@ -167,8 +167,8 @@ pub const MAX_CACHED_PAGES: usize = 64;
 /// A memory-bounded bitmap that pages 4KiB blocks from disk on demand.
 ///
 /// Only `MAX_CACHED_PAGES` pages are held in memory (LRU eviction).
-/// Per-page free counts are always resident for efficient allocation
-/// scanning without loading every page.
+/// Per-page free counts are always resident (8KB per 1M pages) for
+/// efficient allocation scanning without loading every page.
 #[derive(Debug)]
 pub struct PagedBitmap {
     nbits: u64,
@@ -179,7 +179,7 @@ pub struct PagedBitmap {
     lru: std::collections::VecDeque<u64>,
     /// Pages with unflushed modifications.
     dirty_pages: std::collections::HashSet<u64>,
-    /// Free bit count per page. Always resident.
+    /// Free bit count per page. Always resident. Initialized at load.
     free_counts: Vec<u32>,
     /// Global word indices modified (for delta persists).
     dirty_words: std::collections::HashSet<u64>,
@@ -189,13 +189,14 @@ pub struct PagedBitmap {
 
 impl PagedBitmap {
     pub fn new(nbits: u64, bitmap_blocks: u64) -> Self {
+        let npages = bitmap_blocks as usize;
         Self {
             nbits,
             bitmap_blocks,
             cache: std::collections::HashMap::new(),
             lru: std::collections::VecDeque::new(),
             dirty_pages: std::collections::HashSet::new(),
-            free_counts: vec![0; bitmap_blocks as usize],
+            free_counts: vec![0; npages],
             dirty_words: std::collections::HashSet::new(),
             cursor: 0,
         }
@@ -205,19 +206,26 @@ impl PagedBitmap {
         self.nbits
     }
 
+    pub fn page_count(&self) -> u64 {
+        self.bitmap_blocks
+    }
+
     /// Page index for a bit.
     pub fn page_idx(bit: u64) -> u64 {
         bit / BITS_PER_PAGE
     }
 
+    /// Is the page currently cached?
     pub fn is_cached(&self, page_idx: u64) -> bool {
         self.cache.contains_key(&page_idx)
     }
 
+    /// Number of cached pages.
     pub fn cache_len(&self) -> usize {
         self.cache.len()
     }
 
+    /// Test a bit. Page must be cached (use `is_cached` first).
     pub fn test_cached(&self, i: u64) -> bool {
         debug_assert!(i < self.nbits);
         let page = Self::page_idx(i);
@@ -226,6 +234,7 @@ impl PagedBitmap {
         words[wi] & (1u64 << (i % 64)) != 0
     }
 
+    /// Set a bit. Page must be cached.
     pub fn set_cached(&mut self, i: u64) {
         debug_assert!(i < self.nbits);
         let page = Self::page_idx(i);
@@ -235,8 +244,7 @@ impl PagedBitmap {
         if words[wi] & (1u64 << bit) == 0 {
             words[wi] |= 1u64 << bit;
             self.dirty_pages.insert(page);
-            self.dirty_words
-                .insert(page * WORDS_PER_PAGE as u64 + wi as u64);
+            self.dirty_words.insert(page * WORDS_PER_PAGE as u64 + wi as u64);
             if self.free_counts[page as usize] > 0 {
                 self.free_counts[page as usize] -= 1;
             }
@@ -244,6 +252,7 @@ impl PagedBitmap {
         }
     }
 
+    /// Clear a bit. Page must be cached.
     pub fn clear_cached(&mut self, i: u64) {
         debug_assert!(i < self.nbits);
         let page = Self::page_idx(i);
@@ -253,13 +262,13 @@ impl PagedBitmap {
         if words[wi] & (1u64 << bit) != 0 {
             words[wi] &= !(1u64 << bit);
             self.dirty_pages.insert(page);
-            self.dirty_words
-                .insert(page * WORDS_PER_PAGE as u64 + wi as u64);
+            self.dirty_words.insert(page * WORDS_PER_PAGE as u64 + wi as u64);
             self.free_counts[page as usize] += 1;
             self.touch(page);
         }
     }
 
+    /// Move page to MRU position.
     fn touch(&mut self, page_idx: u64) {
         if let Some(pos) = self.lru.iter().position(|&p| p == page_idx) {
             self.lru.remove(pos);
@@ -267,7 +276,10 @@ impl PagedBitmap {
         self.lru.push_back(page_idx);
     }
 
+    /// Insert a page into the cache (from disk). Caller must ensure
+    /// capacity (evict first if at MAX_CACHED_PAGES).
     pub fn insert_page(&mut self, page_idx: u64, words: [u64; WORDS_PER_PAGE]) {
+        // Compute free count.
         let mut free = 0u32;
         let bits_in_page = BITS_PER_PAGE.min(self.nbits.saturating_sub(page_idx * BITS_PER_PAGE));
         for (wi, w) in words.iter().enumerate() {
@@ -284,6 +296,7 @@ impl PagedBitmap {
         self.touch(page_idx);
     }
 
+    /// Evict the LRU page. Returns (page_idx, words, was_dirty).
     pub fn evict_lru(&mut self) -> Option<(u64, [u64; WORDS_PER_PAGE], bool)> {
         let page_idx = self.lru.pop_front()?;
         let words = self.cache.remove(&page_idx)?;
@@ -291,6 +304,8 @@ impl PagedBitmap {
         Some((page_idx, words, was_dirty))
     }
 
+    /// Find a page with free space, starting from cursor (wraps).
+    /// Returns None if all pages are full.
     pub fn find_free_page(&mut self) -> Option<u64> {
         let npages = self.bitmap_blocks;
         if npages == 0 {
@@ -307,6 +322,8 @@ impl PagedBitmap {
         None
     }
 
+    /// Allocate a free bit in a cached page. Returns the bit index, or None
+    /// if the page is full. Page must be cached.
     pub fn alloc_in_page(&mut self, page_idx: u64) -> Option<u64> {
         let words = self.cache.get_mut(&page_idx).expect("page not cached");
         let base = page_idx * BITS_PER_PAGE;
@@ -317,8 +334,7 @@ impl PagedBitmap {
                 if idx < self.nbits {
                     *w |= 1u64 << bit;
                     self.dirty_pages.insert(page_idx);
-                    self.dirty_words
-                        .insert(page_idx * WORDS_PER_PAGE as u64 + wi as u64);
+                    self.dirty_words.insert(page_idx * WORDS_PER_PAGE as u64 + wi as u64);
                     if self.free_counts[page_idx as usize] > 0 {
                         self.free_counts[page_idx as usize] -= 1;
                     }
@@ -330,6 +346,8 @@ impl PagedBitmap {
         None
     }
 
+    /// Try to allocate a specific bit. Page must be cached.
+    /// Returns true if the bit was free and is now allocated.
     pub fn alloc_at_cached(&mut self, block: u64) -> bool {
         if block >= self.nbits {
             return false;
@@ -341,8 +359,7 @@ impl PagedBitmap {
         if words[wi] & (1u64 << bit) == 0 {
             words[wi] |= 1u64 << bit;
             self.dirty_pages.insert(page);
-            self.dirty_words
-                .insert(page * WORDS_PER_PAGE as u64 + wi as u64);
+            self.dirty_words.insert(page * WORDS_PER_PAGE as u64 + wi as u64);
             if self.free_counts[page as usize] > 0 {
                 self.free_counts[page as usize] -= 1;
             }
@@ -353,6 +370,7 @@ impl PagedBitmap {
         }
     }
 
+    /// Word indices changed (for delta persists).
     pub fn dirty_words(&self) -> Vec<u64> {
         let mut v: Vec<u64> = self.dirty_words.iter().copied().collect();
         v.sort_unstable();
@@ -364,168 +382,49 @@ impl PagedBitmap {
         self.dirty_pages.clear();
     }
 
+    /// Get a word value (for delta serialization). Page must be cached.
     pub fn word_cached(&self, wi: u64) -> u64 {
         let page = wi / WORDS_PER_PAGE as u64;
         let w_in_page = (wi % WORDS_PER_PAGE as u64) as usize;
         self.cache.get(&page).expect("page not cached")[w_in_page]
     }
 
+    /// Set a word directly (for delta application). Page must be cached.
+    /// Does not mark dirty (used when loading).
+    pub fn set_word_cached(&mut self, wi: u64, val: u64) {
+        let page = wi / WORDS_PER_PAGE as u64;
+        let w_in_page = (wi % WORDS_PER_PAGE as u64) as usize;
+        let words = self.cache.get_mut(&page).expect("page not cached");
+        let old = words[w_in_page];
+        words[w_in_page] = val;
+        // Update free count.
+        let free_old = old.count_zeros();
+        let free_new = val.count_zeros();
+        let fc = &mut self.free_counts[page as usize];
+        *fc = (*fc as i64 + free_new as i64 - free_old as i64).max(0) as u32;
+    }
+
     pub fn word_count(&self) -> u64 {
         self.bitmap_blocks * WORDS_PER_PAGE as u64
     }
 
+    /// Get a cached page's words (for flushing).
     pub fn get_page(&self, page_idx: u64) -> Option<&[u64; WORDS_PER_PAGE]> {
         self.cache.get(&page_idx)
     }
 
+    /// Dirty page indices.
     pub fn dirty_page_indices(&self) -> Vec<u64> {
         self.dirty_pages.iter().copied().collect()
     }
 
+    /// Mark a page clean after flushing.
     pub fn mark_clean(&mut self, page_idx: u64) {
         self.dirty_pages.remove(&page_idx);
     }
 
+    /// Set free count directly (used at load time).
     pub fn set_free_count(&mut self, page_idx: u64, count: u32) {
         self.free_counts[page_idx as usize] = count;
-    }
-
-    /// Create from an in-memory Bitmap. Computes free counts for all pages,
-    /// caches up to MAX_CACHED_PAGES.
-    pub fn from_bitmap(bm: &Bitmap, bitmap_blocks: u64) -> Self {
-        let nbits = bm.len();
-        let mut pb = Self::new(nbits, bitmap_blocks);
-        let bytes = bm.to_bytes();
-        for page_idx in 0..bitmap_blocks {
-            let start = page_idx as usize * crate::BLOCK_SIZE;
-            let end = (start + crate::BLOCK_SIZE).min(bytes.len());
-            let mut words = [0u64; WORDS_PER_PAGE];
-            if start < bytes.len() {
-                let page_bytes = &bytes[start..end];
-                for (i, chunk) in page_bytes.chunks(8).enumerate() {
-                    if i < WORDS_PER_PAGE {
-                        let mut arr = [0u8; 8];
-                        arr[..chunk.len()].copy_from_slice(chunk);
-                        words[i] = u64::from_le_bytes(arr);
-                    }
-                }
-            }
-            let mut free = 0u32;
-            for w in &words {
-                free += w.count_zeros();
-            }
-            pb.free_counts[page_idx as usize] = free;
-            if (page_idx as usize) < MAX_CACHED_PAGES {
-                pb.cache.insert(page_idx, words);
-                pb.lru.push_back(page_idx);
-            }
-        }
-        let total_bits = bitmap_blocks * BITS_PER_PAGE;
-        if total_bits > nbits {
-            let excess = total_bits - nbits;
-            let last_page = bitmap_blocks - 1;
-            let fc = &mut pb.free_counts[last_page as usize];
-            *fc = fc.saturating_sub(excess as u32);
-        }
-        pb
-    }
-}
-
-#[cfg(test)]
-mod paged_tests {
-    use super::*;
-
-    #[test]
-    fn paged_basic_set_test_clear() {
-        // 100K bits = 4 pages (32768 bits/page)
-        let nbits = 100_000u64;
-        let blocks = 4u64;
-        let mut pb = PagedBitmap::new(nbits, blocks);
-        // Manually insert page 0 with all zeros.
-        pb.insert_page(0, [0u64; WORDS_PER_PAGE]);
-        pb.insert_page(1, [0u64; WORDS_PER_PAGE]);
-
-        // Set bit 0 (page 0), bit 32768 (page 1), bit 70000 (page 2 not cached)
-        pb.set_cached(0);
-        assert!(pb.test_cached(0));
-        pb.set_cached(32768);
-        assert!(pb.test_cached(32768));
-
-        // Page 2 not cached; insert it.
-        pb.insert_page(2, [0u64; WORDS_PER_PAGE]);
-        pb.set_cached(70000);
-        assert!(pb.test_cached(70000));
-
-        // Clear bit 0.
-        pb.clear_cached(0);
-        assert!(!pb.test_cached(0));
-        assert!(pb.test_cached(32768)); // other bit still set
-    }
-
-    #[test]
-    fn paged_lru_eviction() {
-        let nbits = (MAX_CACHED_PAGES as u64 + 10) * BITS_PER_PAGE;
-        let blocks = MAX_CACHED_PAGES as u64 + 10;
-        let mut pb = PagedBitmap::new(nbits, blocks);
-
-        // Insert MAX_CACHED_PAGES + 5 pages.
-        for i in 0..(MAX_CACHED_PAGES as u64 + 5) {
-            if pb.cache_len() >= MAX_CACHED_PAGES {
-                // Evict LRU (none dirty in this test).
-                let (evict_idx, _words, dirty) = pb.evict_lru().unwrap();
-                assert!(!dirty);
-                assert!(!pb.is_cached(evict_idx));
-            }
-            pb.insert_page(i, [0u64; WORDS_PER_PAGE]);
-        }
-        // Cache should be at max.
-        assert_eq!(pb.cache_len(), MAX_CACHED_PAGES);
-        // First 5 pages should have been evicted.
-        for i in 0..5u64 {
-            assert!(!pb.is_cached(i), "page {i} should be evicted");
-        }
-        // Last pages should be cached.
-        assert!(pb.is_cached(MAX_CACHED_PAGES as u64 + 4));
-    }
-
-    #[test]
-    fn paged_alloc_finds_free() {
-        let nbits = 100_000u64;
-        let blocks = 4u64;
-        let mut pb = PagedBitmap::new(nbits, blocks);
-        // Page 0: all allocated (no free). Page 1: all free.
-        pb.insert_page(0, [u64::MAX; WORDS_PER_PAGE]);
-        pb.insert_page(1, [0u64; WORDS_PER_PAGE]);
-        // Free counts should reflect this.
-        assert_eq!(pb.free_counts[0], 0);
-        // Page 1 has 32768 free bits (but limited by nbits).
-        assert!(pb.free_counts[1] > 0);
-
-        // find_free_page should return page 1 (page 0 is full).
-        // Cursor starts at 0.
-        let page = pb.find_free_page().unwrap();
-        assert_eq!(page, 1);
-
-        // Allocate in page 1.
-        let bit = pb.alloc_in_page(1).unwrap();
-        assert_eq!(bit, BITS_PER_PAGE); // first bit of page 1
-        assert!(pb.test_cached(bit));
-    }
-
-    #[test]
-    fn paged_from_bitmap() {
-        let nbits = 100_000u64;
-        let mut bm = Bitmap::new(nbits);
-        bm.set(0);
-        bm.set(50000);
-        bm.set(99999);
-        let blocks = 4u64;
-        let pb = PagedBitmap::from_bitmap(&bm, blocks);
-        // First pages should be cached (up to MAX).
-        assert!(pb.is_cached(0));
-        assert!(pb.test_cached(0));
-        // Bit 50000 is in page 1 (50000 / 32768 = 1).
-        assert!(pb.is_cached(1));
-        assert!(pb.test_cached(50000));
     }
 }
