@@ -1,11 +1,12 @@
 //! cownfs-backup: snapshot backup and restore to/from portable files.
 //!
-//!   cownfs-backup create <image> <backup-file>   - export full image to backup
-//!   cownfs-backup restore <backup-file> <image>  - import backup to new image
-//!   cownfs-backup verify <backup-file>           - check backup integrity
-//!   cownfs-backup list <backup-file>             - show backup metadata
+//!   cownfs-backup create <image> <backup-file>          - export full image to backup
+//!   cownfs-backup create-inc <image> <snap> <backup-file> - incremental since snapshot
+//!   cownfs-backup restore <backup-file> <image>           - import backup to new image
+//!   cownfs-backup verify <backup-file>                    - check backup integrity
+//!   cownfs-backup list <backup-file>                      - show backup metadata
 //!
-//! Format: file-based, portable, checksummed. Not incremental (v1).
+//! Format: file-based, portable, checksummed. v1=full, v2=incremental.
 
 use std::env;
 use std::fs::File;
@@ -23,6 +24,7 @@ const BLOCK_SIZE: usize = 4096;
 fn usage() -> ! {
     eprintln!("usage:");
     eprintln!("  cownfs-backup create <image> <backup-file>");
+    eprintln!("  cownfs-backup create-inc <image> <snap> <backup-file>");
     eprintln!("  cownfs-backup restore <backup-file> <image>");
     eprintln!("  cownfs-backup verify <backup-file>");
     eprintln!("  cownfs-backup list <backup-file>");
@@ -194,6 +196,71 @@ fn do_restore(backup: &Path, image: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// B5: Create an incremental backup — only blocks changed since the named
+/// snapshot. Format v2: same as v1 plus base snapshot name.
+fn do_create_inc(image: &Path, snap_name: &str, backup: &Path) -> Result<(), String> {
+    let mut fs = Fs::open(image).map_err(|e| format!("open image: {e:?}"))?;
+    let dev = FileDevice::open(image).map_err(|e| format!("open device: {e}"))?;
+
+    // Find the snapshot by name.
+    let snaps = fs.snapshot_list().map_err(|e| format!("list snaps: {e:?}"))?;
+    let snap_id = snaps
+        .iter()
+        .find(|(_, name)| name == snap_name.as_bytes())
+        .map(|(id, _)| *id)
+        .ok_or_else(|| format!("snapshot '{snap_name}' not found"))?;
+
+    // Diff snapshot roots against current.
+    let old_roots = fs
+        .snapshot_roots(snap_id)
+        .map_err(|e| format!("get snap roots: {e:?}"))?;
+    let mut changed = fs
+        .diff_roots(&old_roots)
+        .map_err(|e| format!("diff: {e:?}"))?;
+    changed.sort_unstable();
+    changed.dedup();
+
+    let mut out = File::create(backup).map_err(|e| format!("create backup: {e}"))?;
+
+    // Header (v2).
+    write_u64(&mut out, MAGIC).map_err(|e| e.to_string())?;
+    write_u32(&mut out, 2).map_err(|e| e.to_string())?; // VERSION 2
+    let uuid = fs.uuid();
+    out.write_all(&uuid).map_err(|e| e.to_string())?;
+    write_u64(&mut out, fs.generation()).map_err(|e| e.to_string())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    write_u64(&mut out, now).map_err(|e| e.to_string())?;
+    // Base snapshot name (null-padded to 64 bytes).
+    let mut snap_buf = [0u8; 64];
+    let name_bytes = snap_name.as_bytes();
+    let n = name_bytes.len().min(64);
+    snap_buf[..n].copy_from_slice(&name_bytes[..n]);
+    out.write_all(&snap_buf).map_err(|e| e.to_string())?;
+
+    // Changed blocks.
+    write_u64(&mut out, changed.len() as u64).map_err(|e| e.to_string())?;
+    let mut buf = [0u8; BLOCK_SIZE];
+    for &blk in &changed {
+        dev.read_block(blk, &mut buf)
+            .map_err(|e| format!("read block {blk}: {e}"))?;
+        let cksum = checksum32(&buf);
+        write_u64(&mut out, blk).map_err(|e| e.to_string())?;
+        write_u32(&mut out, cksum).map_err(|e| e.to_string())?;
+        out.write_all(&buf).map_err(|e| e.to_string())?;
+    }
+
+    println!(
+        "Incremental backup complete: {} blocks (since '{}') to {}",
+        changed.len(),
+        snap_name,
+        backup.display()
+    );
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -201,6 +268,11 @@ fn main() {
     }
     let result = match args[1].as_str() {
         "create" if args.len() == 4 => do_create(Path::new(&args[2]), Path::new(&args[3])),
+        "create-inc" if args.len() == 5 => do_create_inc(
+            Path::new(&args[2]),
+            &args[3],
+            Path::new(&args[4]),
+        ),
         "restore" if args.len() == 4 => do_restore(Path::new(&args[2]), Path::new(&args[3])),
         "verify" if args.len() == 3 => do_verify(Path::new(&args[2])),
         "list" if args.len() == 3 => do_list(Path::new(&args[2])),

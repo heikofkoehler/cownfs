@@ -2294,6 +2294,24 @@ impl Fs {
 
     /// Open read-only views of a snapshot's trees. The handles borrow the
     /// shared arenas and never take ownership, so dropping them releases
+    /// Get the B-tree roots for a snapshot (for B5 incremental backup).
+    pub fn snapshot_roots(&self, snap_id: u64) -> Result<FsRoots, FsError> {
+        let rec = self.snaps.get(&snap_id)?.ok_or(FsError::NotFound)?;
+        let id = |i: usize| NodeId {
+            idx: rec.roots[i],
+            gen: rec.root_gens[i],
+        };
+        // FsRoots has 4 trees; snaps tree root is the current one (snapshots
+        // don't nest, so the snap tree is the same).
+        let cur = self.roots();
+        Ok(FsRoots {
+            inode: id(0),
+            dir: id(1),
+            extent: id(2),
+            snap: cur.snap,
+        })
+    }
+
     /// nothing.
     fn snap_trees(&self, snap_id: u64) -> Result<(InodeTree, DirTree, ExtentTree), FsError> {
         let rec = self.snaps.get(&snap_id)?.ok_or(FsError::NotFound)?;
