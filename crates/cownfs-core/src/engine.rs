@@ -9,7 +9,7 @@
 
 use std::io;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -83,6 +83,8 @@ pub enum FsError {
     Corrupt(String),
     /// Deterministic fault injected by `Fs::set_fault_point` (P7).
     InjectedFault(FaultPoint),
+    /// Per-UID block quota exceeded.
+    QuotaExceeded,
 }
 
 impl std::fmt::Display for FsError {
@@ -95,6 +97,7 @@ impl std::fmt::Display for FsError {
             FsError::NotFile => write!(f, "not a regular file"),
             FsError::NotEmpty => write!(f, "directory not empty"),
             FsError::InjectedFault(p) => write!(f, "injected fault at {p:?}"),
+            FsError::QuotaExceeded => write!(f, "disk quota exceeded"),
             FsError::BadName => write!(f, "invalid file name"),
             FsError::NoSpace => write!(f, "no space left on device"),
             FsError::Invalid(s) => write!(f, "invalid: {s}"),
@@ -415,6 +418,53 @@ pub struct CheckReport {
     pub allocated_blocks: u64,
 }
 
+/// Transaction group coordination (ZFS-style txg).
+///
+/// Writes are staged into the open txg via [`Fs::commit_async`]; a
+/// background sync thread makes them durable with [`Fs::sync_txg`]
+/// (single fsync per group). [`TxgCoord::wait`] blocks until a txg is
+/// durable, coalescing many concurrent FILE_SYNC4 writes onto one fsync.
+///
+/// Crash semantics: a crash before `sync_txg` loses the open txg but the
+/// previous superblock generation is intact (the slot flip only happens
+/// inside `sync_txg`, after the fsync).
+#[derive(Debug)]
+pub struct TxgCoord {
+    state: Mutex<TxgInner>,
+    cv: Condvar,
+}
+
+#[derive(Debug)]
+struct TxgInner {
+    /// The txg currently accepting writes.
+    current: u64,
+    /// The highest txg made durable.
+    synced: u64,
+    /// The open txg has staged changes not yet synced.
+    dirty: bool,
+}
+
+impl TxgCoord {
+    fn new() -> Self {
+        TxgCoord {
+            state: Mutex::new(TxgInner {
+                current: 1,
+                synced: 0,
+                dirty: false,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Block until txg `id` is durable.
+    pub fn wait(&self, id: u64) {
+        let mut s = self.state.lock().unwrap();
+        while s.synced < id {
+            s = self.cv.wait(s).unwrap();
+        }
+    }
+}
+
 pub struct Fs {
     shared: Arc<Mutex<Shared>>,
     sb: Superblock,
@@ -431,7 +481,22 @@ pub struct Fs {
     /// not the live tree) references them. Rebuilt from the snapshot
     /// records on open; purely in-memory.
     snapshot_pinned: std::collections::HashSet<u64>,
+    /// Transaction group coordination. Shared via Arc so the background
+    /// sync thread and waiters can coordinate without the Fs lock.
+    txg: Arc<TxgCoord>,
+    /// Per-UID block quotas (uid -> max blocks). Empty = no limits.
+    /// Configured at startup; in-memory only (not stored on disk).
+    quotas: std::collections::HashMap<u32, u64>,
+    /// Per-UID block usage (uid -> blocks used). Rebuilt on open by
+    /// scanning inodes; updated on write/create/remove/truncate.
+    quota_usage: std::collections::HashMap<u32, u64>,
+    /// Extended attributes: (ino, name) -> value. Backed by the hidden
+    /// `.xattrs` file in the root directory; loaded on open.
+    xattrs: std::collections::HashMap<(u64, Vec<u8>), Vec<u8>>,
 }
+
+/// Name of the hidden file backing extended attributes.
+pub const XATTR_FILE: &[u8] = b".xattrs";
 
 /// Optional setattr fields.
 #[derive(Default)]
@@ -483,6 +548,10 @@ impl Fs {
             next_inode: ROOT_INO + 1,
             next_snap: 1,
             snapshot_pinned: std::collections::HashSet::new(),
+            txg: Arc::new(TxgCoord::new()),
+            quotas: std::collections::HashMap::new(),
+            quota_usage: std::collections::HashMap::new(),
+            xattrs: std::collections::HashMap::new(),
         };
 
         let now = now_secs();
@@ -625,8 +694,14 @@ impl Fs {
             next_inode,
             next_snap,
             snapshot_pinned: std::collections::HashSet::new(),
+            txg: Arc::new(TxgCoord::new()),
+            quotas: std::collections::HashMap::new(),
+            quota_usage: std::collections::HashMap::new(),
+            xattrs: std::collections::HashMap::new(),
         };
         fs.rebuild_pinned()?;
+        fs.rebuild_quota_usage()?;
+        fs.load_xattrs()?;
         Ok(fs)
     }
 
@@ -806,11 +881,36 @@ impl Fs {
     /// leaves the previous slot pointing at the previous bitmap area: the
     /// previous generation stays fully consistent.
     pub fn commit(&mut self) -> Result<(), FsError> {
+        self.commit_async()?;
+        self.sync_txg()?;
+        Ok(())
+    }
+
+    /// Stage the current changes into the open transaction group without
+    /// making them durable. Returns the txg id containing these changes.
+    ///
+    /// Flushes dirty B-tree nodes and persists the bitmap to the inactive
+    /// area, but does NOT fsync and does NOT flip the superblock slot: a
+    /// crash before [`Fs::sync_txg`] loses the open txg, leaving the
+    /// previous generation intact.
+    pub fn commit_async(&mut self) -> Result<u64, FsError> {
         self.flush_all()?;
         self.check_fault(FaultPoint::AfterFlush)?;
         let inactive = self.sb.bitmap_start + (1 - self.sb.bitmap_area) * self.sb.bitmap_blocks;
         self.persist_bitmap(inactive)?;
         self.check_fault(FaultPoint::AfterBitmap)?;
+        let mut t = self.txg.state.lock().unwrap();
+        t.dirty = true;
+        Ok(t.current)
+    }
+
+    /// Make the staged transaction group durable: fsync, then flip the
+    /// superblock slot. Called by the background sync thread; returns true
+    /// if a txg was synced. Wakes all [`TxgCoord::wait`] waiters.
+    pub fn sync_txg(&mut self) -> Result<bool, FsError> {
+        if !self.txg.state.lock().unwrap().dirty {
+            return Ok(false);
+        }
         // The new generation's blocks must be on stable storage *before*
         // any superblock slot points at them.
         self.shared.lock().unwrap().dev.sync()?;
@@ -819,7 +919,182 @@ impl Fs {
         self.sb.bitmap_area = 1 - self.sb.bitmap_area;
         let mut sh = self.shared.lock().unwrap();
         superblock::commit_generation(&mut sh.dev, &mut self.sb, &mut self.active_slot)?;
+        let mut t = self.txg.state.lock().unwrap();
+        t.synced = t.current;
+        t.current += 1;
+        t.dirty = false;
+        drop(t);
+        self.txg.cv.notify_all();
+        Ok(true)
+    }
+
+    /// The transaction group coordinator (for [`TxgCoord::wait`]).
+    pub fn txg(&self) -> Arc<TxgCoord> {
+        Arc::clone(&self.txg)
+    }
+
+    // -- quotas ------------------------------------------------------------
+
+    /// Set a per-UID block quota (0 = no limit). In-memory only.
+    pub fn set_quota(&mut self, uid: u32, max_blocks: u64) {
+        if max_blocks == 0 {
+            self.quotas.remove(&uid);
+        } else {
+            self.quotas.insert(uid, max_blocks);
+        }
+    }
+
+    /// Get the block quota for a UID (None = no limit).
+    pub fn get_quota(&self, uid: u32) -> Option<u64> {
+        self.quotas.get(&uid).copied()
+    }
+
+    /// Current block usage for a UID.
+    pub fn quota_usage(&self, uid: u32) -> u64 {
+        self.quota_usage.get(&uid).copied().unwrap_or(0)
+    }
+
+    /// Blocks charged for a file of `size` bytes (data + 1 for the inode).
+    fn blocks_for_size(size: u64) -> u64 {
+        size.div_ceil(BLOCK_SIZE as u64) + 1
+    }
+
+    /// Fail with QuotaExceeded if `uid` adding `new_blocks` would exceed
+    /// its quota. No-op if the uid has no quota.
+    fn check_quota(&self, uid: u32, new_blocks: u64) -> Result<(), FsError> {
+        if let Some(&limit) = self.quotas.get(&uid) {
+            let used = self.quota_usage(uid);
+            if used + new_blocks > limit {
+                return Err(FsError::QuotaExceeded);
+            }
+        }
         Ok(())
+    }
+
+    /// Add `delta` blocks to `uid`'s usage.
+    fn add_usage(&mut self, uid: u32, delta: u64) {
+        *self.quota_usage.entry(uid).or_insert(0) += delta;
+    }
+
+    /// Subtract `delta` blocks from `uid`'s usage (saturating).
+    fn sub_usage(&mut self, uid: u32, delta: u64) {
+        let e = self.quota_usage.entry(uid).or_insert(0);
+        *e = e.saturating_sub(delta);
+    }
+
+    /// Rebuild per-UID usage by scanning all inodes. Called on open.
+    fn rebuild_quota_usage(&mut self) -> Result<(), FsError> {
+        self.quota_usage.clear();
+        for (_ino, inode) in self.inodes.to_sorted_vec().map_err(FsError::Store)? {
+            let blocks = Self::blocks_for_size(inode.size);
+            *self.quota_usage.entry(inode.uid).or_insert(0) += blocks;
+        }
+        Ok(())
+    }
+
+    // -- xattrs ------------------------------------------------------------
+
+    /// Set an extended attribute on an inode.
+    pub fn setxattr(&mut self, ino: u64, name: &[u8], value: &[u8]) -> Result<(), FsError> {
+        // Verify the inode exists.
+        self.getattr(ino)?;
+        if name.is_empty() || name.len() > 255 {
+            return Err(FsError::Invalid("bad xattr name".into()));
+        }
+        if value.len() > 65536 {
+            return Err(FsError::Invalid("xattr value too large".into()));
+        }
+        self.xattrs.insert((ino, name.to_vec()), value.to_vec());
+        self.persist_xattrs()?;
+        Ok(())
+    }
+
+    /// Get an extended attribute. Returns None if not set.
+    pub fn getxattr(&self, ino: u64, name: &[u8]) -> Result<Option<Vec<u8>>, FsError> {
+        self.getattr(ino)?;
+        Ok(self.xattrs.get(&(ino, name.to_vec())).cloned())
+    }
+
+    /// List xattr names on an inode.
+    pub fn listxattrs(&self, ino: u64) -> Result<Vec<Vec<u8>>, FsError> {
+        self.getattr(ino)?;
+        Ok(self
+            .xattrs
+            .keys()
+            .filter(|(i, _)| *i == ino)
+            .map(|(_, n)| n.clone())
+            .collect())
+    }
+
+    /// Remove an extended attribute. Returns None if not set.
+    pub fn removexattr(&mut self, ino: u64, name: &[u8]) -> Result<bool, FsError> {
+        self.getattr(ino)?;
+        let removed = self.xattrs.remove(&(ino, name.to_vec())).is_some();
+        if removed {
+            self.persist_xattrs()?;
+        }
+        Ok(removed)
+    }
+
+    /// Serialize the xattr map into the hidden `.xattrs` file.
+    fn persist_xattrs(&mut self) -> Result<(), FsError> {
+        let mut buf = Vec::new();
+        for ((ino, name), value) in &self.xattrs {
+            buf.extend_from_slice(&ino.to_le_bytes());
+            buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            buf.extend_from_slice(name);
+            buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            buf.extend_from_slice(value);
+        }
+        // Truncate and rewrite.
+        let ino = self.xattr_file_ino()?;
+        self.truncate(ino, 0)?;
+        self.write(ino, 0, &buf)?;
+        Ok(())
+    }
+
+    /// Load xattrs from the hidden `.xattrs` file. Called on open.
+    fn load_xattrs(&mut self) -> Result<(), FsError> {
+        self.xattrs.clear();
+        let ino = match self.lookup(ROOT_INO, XATTR_FILE)? {
+            Some((ino, _)) => ino,
+            None => return Ok(()), // old image without xattr file
+        };
+        let size = self.getattr(ino)?.size;
+        if size == 0 {
+            return Ok(());
+        }
+        let data = self.read(ino, 0, size as usize)?;
+        let mut pos = 0;
+        while pos + 8 + 4 <= data.len() {
+            let ino = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let nlen = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            if pos + nlen + 4 > data.len() {
+                break;
+            }
+            let name = data[pos..pos + nlen].to_vec();
+            pos += nlen;
+            let vlen = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            if pos + vlen > data.len() {
+                break;
+            }
+            let value = data[pos..pos + vlen].to_vec();
+            pos += vlen;
+            self.xattrs.insert((ino, name), value);
+        }
+        Ok(())
+    }
+
+    /// Get (or create) the `.xattrs` file inode.
+    fn xattr_file_ino(&mut self) -> Result<u64, FsError> {
+        if let Some((ino, _)) = self.lookup(ROOT_INO, XATTR_FILE)? {
+            return Ok(ino);
+        }
+        // Create it (owned by root, hidden from NFS readdir).
+        self.create(ROOT_INO, XATTR_FILE, 0o600, 0, 0)
     }
 
     /// Check for an armed fault point; if matched, disarm and abort.
@@ -1051,6 +1326,8 @@ impl Fs {
         if self.dirs.get(&key)?.is_some() {
             return Err(FsError::AlreadyExists);
         }
+        // Quota: a new inode charges 1 block.
+        self.check_quota(uid, 1)?;
         let ino = self.next_inode;
         self.next_inode += 1;
         let now = now_secs();
@@ -1091,6 +1368,7 @@ impl Fs {
         pp.mtime = now;
         pp.ctime = now;
         self.inodes.insert(parent, pp)?;
+        self.add_usage(uid, 1);
         Ok(ino)
     }
 
@@ -1220,6 +1498,8 @@ impl Fs {
             self.inodes.insert(ino, inode)?;
             return Ok(());
         }
+        let uid = inode.uid;
+        let blocks = Self::blocks_for_size(inode.size);
         let nblocks = inode.size.div_ceil(BLOCK_SIZE as u64);
         for blk_off in 0..nblocks {
             let k = ExtentKey { ino, off: blk_off };
@@ -1228,6 +1508,20 @@ impl Fs {
             }
         }
         self.inodes.remove(&ino)?;
+        self.sub_usage(uid, blocks);
+        // Drop xattrs.
+        let names: Vec<Vec<u8>> = self
+            .xattrs
+            .keys()
+            .filter(|(i, _)| *i == ino)
+            .map(|(_, n)| n.clone())
+            .collect();
+        if !names.is_empty() {
+            for n in names {
+                self.xattrs.remove(&(ino, n));
+            }
+            self.persist_xattrs()?;
+        }
         Ok(())
     }
 
@@ -1314,6 +1608,10 @@ impl Fs {
             if name == b"." || name == b".." {
                 continue;
             }
+            // Hide the xattr backing file.
+            if ino == ROOT_INO && name == XATTR_FILE {
+                continue;
+            }
             out.push((name.to_vec(), e.ino, e.typ));
         }
         Ok(out)
@@ -1358,6 +1656,13 @@ impl Fs {
         if inode.ftype != FTYPE_FILE && inode.ftype != FTYPE_SYMLINK {
             return Err(FsError::NotFile);
         }
+        // Quota: check the growth (extension) before allocating.
+        let old_blocks = Self::blocks_for_size(inode.size);
+        let new_size = (offset + data.len() as u64).max(inode.size);
+        let new_blocks = Self::blocks_for_size(new_size);
+        if new_blocks > old_blocks {
+            self.check_quota(inode.uid, new_blocks - old_blocks)?;
+        }
         let mut pos = 0usize;
         while pos < data.len() {
             let foff = offset + pos as u64;
@@ -1386,13 +1691,20 @@ impl Fs {
             pos += n;
         }
         let end = offset + data.len() as u64;
+        let old_size = inode.size;
         if end > inode.size {
             inode.size = end;
         }
         let now = now_secs();
         inode.mtime = now;
         inode.ctime = now;
+        let uid = inode.uid;
         self.inodes.insert(ino, inode)?;
+        // Quota: account for growth.
+        let grown = Self::blocks_for_size(end.max(old_size)) - Self::blocks_for_size(old_size);
+        if grown > 0 {
+            self.add_usage(uid, grown);
+        }
         Ok(())
     }
 
@@ -1401,9 +1713,11 @@ impl Fs {
         if inode.ftype != FTYPE_FILE && inode.ftype != FTYPE_SYMLINK {
             return Err(FsError::NotFile);
         }
-        if size < inode.size {
+        let old_size = inode.size;
+        let uid = inode.uid;
+        if size < old_size {
             let first_gone = size.div_ceil(BLOCK_SIZE as u64);
-            let last = inode.size.div_ceil(BLOCK_SIZE as u64);
+            let last = old_size.div_ceil(BLOCK_SIZE as u64);
             for blk_off in first_gone..last {
                 let k = ExtentKey { ino, off: blk_off };
                 if let Some(ext) = self.extents.remove(&k)? {
@@ -1434,12 +1748,26 @@ impl Fs {
             }
             inode.size = size;
         } else if size > inode.size {
+            // Growing: check quota for the new blocks.
+            let old_blocks = Self::blocks_for_size(old_size);
+            let new_blocks = Self::blocks_for_size(size);
+            if new_blocks > old_blocks {
+                self.check_quota(uid, new_blocks - old_blocks)?;
+            }
             inode.size = size; // holes read as zeros
         }
         let now = now_secs();
         inode.mtime = now;
         inode.ctime = now;
         self.inodes.insert(ino, inode)?;
+        // Quota: account for the size delta.
+        let old_blocks = Self::blocks_for_size(old_size);
+        let new_blocks = Self::blocks_for_size(size);
+        if new_blocks > old_blocks {
+            self.add_usage(uid, new_blocks - old_blocks);
+        } else if old_blocks > new_blocks {
+            self.sub_usage(uid, old_blocks - new_blocks);
+        }
         Ok(())
     }
 
@@ -1745,6 +2073,164 @@ mod tests {
         let (found, typ) = fs2.lookup(ROOT_INO, b"hello.txt").unwrap().unwrap();
         assert_eq!((found, typ), (ino, FTYPE_FILE));
         assert_eq!(fs2.read(ino, 0, 99).unwrap(), b"hello, cow");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn txg_async_stages_without_durability() {
+        let (mut fs, path) = test_fs(512);
+        let ino = fs.create(ROOT_INO, b"f", 0o644, 1000, 1000).unwrap();
+        fs.write(ino, 0, b"staged").unwrap();
+        let gen = fs.generation();
+        // commit_async stages but does NOT advance the generation.
+        let txg = fs.commit_async().unwrap();
+        assert_eq!(fs.generation(), gen);
+        // Data is visible in memory.
+        assert_eq!(fs.read(ino, 0, 99).unwrap(), b"staged");
+        drop(fs);
+
+        // Reopen: the staged txg was never synced, so it's gone.
+        let fs2 = Fs::open(&path).unwrap();
+        assert_eq!(fs2.generation(), gen);
+        assert!(fs2.lookup(ROOT_INO, b"f").unwrap().is_none());
+        std::fs::remove_file(&path).unwrap();
+        let _ = txg;
+    }
+
+    #[test]
+    fn txg_sync_makes_staged_durable() {
+        let (mut fs, path) = test_fs(512);
+        let ino = fs.create(ROOT_INO, b"f", 0o644, 1000, 1000).unwrap();
+        fs.write(ino, 0, b"durable").unwrap();
+        let gen = fs.generation();
+        let txg = fs.commit_async().unwrap();
+        // sync_txg with nothing staged is a no-op.
+        // (dirty is true here, so it syncs.)
+        assert!(fs.sync_txg().unwrap());
+        assert_eq!(fs.generation(), gen + 1);
+        // Second sync with nothing dirty is a no-op.
+        assert!(!fs.sync_txg().unwrap());
+        drop(fs);
+
+        let fs2 = Fs::open(&path).unwrap();
+        assert_eq!(fs2.generation(), gen + 1);
+        assert_eq!(fs2.read(ino, 0, 99).unwrap(), b"durable");
+        std::fs::remove_file(&path).unwrap();
+        let _ = txg;
+    }
+
+    #[test]
+    fn txg_wait_blocks_until_synced() {
+        let (mut fs, path) = test_fs(512);
+        let ino = fs.create(ROOT_INO, b"f", 0o644, 1000, 1000).unwrap();
+        fs.write(ino, 0, b"wait").unwrap();
+        let txg = fs.commit_async().unwrap();
+        let coord = fs.txg();
+
+        // Wait in another thread; sync from here.
+        let h = std::thread::spawn(move || {
+            coord.wait(txg);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!h.is_finished(), "wait returned before sync");
+        fs.sync_txg().unwrap();
+        h.join().unwrap();
+
+        // Waiting on an already-synced txg returns immediately.
+        fs.txg().wait(txg);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn txg_coalesces_concurrent_writes() {
+        // Many commit_async calls before a sync share one txg id;
+        // one sync_txg makes them all durable.
+        let (mut fs, path) = test_fs(512);
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            let name = format!("f{i}");
+            let ino = fs
+                .create(ROOT_INO, name.as_bytes(), 0o644, 1000, 1000)
+                .unwrap();
+            fs.write(ino, 0, b"x").unwrap();
+            ids.push(fs.commit_async().unwrap());
+        }
+        // All in the same open txg.
+        assert!(ids.windows(2).all(|w| w[0] == w[1]));
+        fs.sync_txg().unwrap();
+        let gen = fs.generation();
+        drop(fs);
+        let fs2 = Fs::open(&path).unwrap();
+        assert_eq!(fs2.generation(), gen);
+        assert!(fs2.lookup(ROOT_INO, b"f9").unwrap().is_some());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn quota_blocks_over_limit_writes() {
+        let (mut fs, path) = test_fs(512);
+        // uid 1000 gets 10 blocks.
+        fs.set_quota(1000, 10);
+        assert_eq!(fs.get_quota(1000), Some(10));
+        assert_eq!(fs.get_quota(1001), None);
+
+        // Create charges 1 block (the inode).
+        let ino = fs.create(ROOT_INO, b"q", 0o644, 1000, 1000).unwrap();
+        assert_eq!(fs.quota_usage(1000), 1);
+
+        // Write 2 blocks (8KB) -> usage 3.
+        fs.write(ino, 0, &vec![1u8; 8192]).unwrap();
+        assert_eq!(fs.quota_usage(1000), 3);
+
+        // Writing 8 more blocks would exceed 10 -> QuotaExceeded.
+        let err = fs.write(ino, 8192, &vec![2u8; 32768]).unwrap_err();
+        assert!(matches!(err, FsError::QuotaExceeded));
+        // Usage unchanged after the failed write.
+        assert_eq!(fs.quota_usage(1000), 3);
+
+        // A different uid with no quota is unaffected.
+        let ino2 = fs.create(ROOT_INO, b"q2", 0o644, 1001, 1001).unwrap();
+        fs.write(ino2, 0, &vec![3u8; 65536]).unwrap();
+        assert_eq!(fs.quota_usage(1001), 17);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn quota_usage_tracks_truncate_and_remove() {
+        let (mut fs, path) = test_fs(512);
+        fs.set_quota(1000, 100);
+        let ino = fs.create(ROOT_INO, b"q", 0o644, 1000, 1000).unwrap();
+        fs.write(ino, 0, &vec![1u8; 12288]).unwrap(); // 3 data + 1 inode
+        assert_eq!(fs.quota_usage(1000), 4);
+
+        // Truncate to 1 block.
+        fs.truncate(ino, 4096).unwrap();
+        assert_eq!(fs.quota_usage(1000), 2);
+
+        // Remove frees everything.
+        fs.unlink(ROOT_INO, b"q").unwrap();
+        assert_eq!(fs.quota_usage(1000), 0);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn quota_usage_rebuilt_on_open() {
+        let (mut fs, path) = test_fs(512);
+        let ino = fs.create(ROOT_INO, b"q", 0o644, 1000, 1000).unwrap();
+        fs.write(ino, 0, &vec![1u8; 8192]).unwrap();
+        fs.commit().unwrap();
+        drop(fs);
+
+        let mut fs2 = Fs::open(&path).unwrap();
+        // 1 inode + 2 data blocks.
+        assert_eq!(fs2.quota_usage(1000), 3);
+        // Quotas are in-memory only; re-set and enforce.
+        fs2.set_quota(1000, 3);
+        let err = fs2.write(ino, 8192, &vec![2u8; 4096]).unwrap_err();
+        assert!(matches!(err, FsError::QuotaExceeded));
+
         std::fs::remove_file(&path).unwrap();
     }
 

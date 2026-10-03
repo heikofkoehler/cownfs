@@ -16,6 +16,7 @@ use crate::nfs4::{
     NFS4ERR_BADSESSION, NFS4ERR_BADSLOT, NFS4ERR_BADTYPE, NFS4ERR_BADXDR, NFS4ERR_BAD_COOKIE,
     NFS4ERR_DELAY, NFS4ERR_EXIST, NFS4ERR_EXPIRED, NFS4ERR_INVAL, NFS4ERR_IO, NFS4ERR_ISDIR,
     NFS4ERR_MOVED, NFS4ERR_NAMETOOLONG, NFS4ERR_NOENT, NFS4ERR_NOFILEHANDLE, NFS4ERR_NOSPC,
+    NFS4ERR_DQUOT,
     NFS4ERR_NOTDIR, NFS4ERR_NOTSUPP, NFS4ERR_OP_ILLEGAL, NFS4ERR_RECALLCONFLICT, NFS4ERR_RESOURCE,
     NFS4ERR_ROFS, NFS4ERR_SEQ_MISORDERED, NFS4ERR_SERVERFAULT, NFS4ERR_STALE,
     NFS4ERR_STALE_CLIENTID, NFS4ERR_TOOSMALL, NFS4_OK, OPEN4_CREATE, OP_ACCESS, OP_CLOSE,
@@ -94,6 +95,7 @@ fn fs_to_nfs(e: FsError) -> u32 {
         // Injected faults (P7) never reach the wire in production;
         // map to SERVERFAULT if they do.
         FsError::InjectedFault(_) => NFS4ERR_SERVERFAULT,
+        FsError::QuotaExceeded => NFS4ERR_DQUOT,
     }
 }
 
@@ -120,12 +122,39 @@ pub struct Shared {
     pub metrics: Arc<crate::metrics::Metrics>,
     /// Throttling (per-client and per-file rate limits).
     pub throttle: Arc<crate::throttle::Throttle>,
+    /// Transaction group coordinator (for FILE_SYNC4 wait without the Fs lock).
+    pub txg: Arc<cownfs_core::engine::TxgCoord>,
+    /// txg sync interval in milliseconds (atomic so the sync thread sees updates).
+    txg_interval_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Shared {
     pub fn new(fs: Fs) -> Self {
+        let txg = fs.txg();
+        let fs = Arc::new(Mutex::new(fs));
+        let txg_interval_ms = Arc::new(std::sync::atomic::AtomicU64::new(100));
+        // Background txg sync thread. Uses a Weak so it exits when the
+        // last Shared clone is dropped. Required: FILE_SYNC4 waits on the
+        // txg condvar, which never fires without this thread.
+        let weak_fs = Arc::downgrade(&fs);
+        let interval = Arc::clone(&txg_interval_ms);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(
+                interval.load(std::sync::atomic::Ordering::Relaxed),
+            ));
+            match weak_fs.upgrade() {
+                Some(fs) => {
+                    if let Ok(mut f) = fs.lock() {
+                        let _ = f.sync_txg();
+                    }
+                }
+                None => break,
+            }
+        });
         Shared {
-            fs: Arc::new(Mutex::new(fs)),
+            fs,
+            txg,
+            txg_interval_ms,
             state: Arc::new(Mutex::new(StateManager::new())),
             sessions: Arc::new(Mutex::new(crate::sessions::SessionTable::new())),
             layouts: Arc::new(Mutex::new(crate::layouts::LayoutTable::new())),
@@ -139,9 +168,19 @@ impl Shared {
         }
     }
 
+    /// Set the txg sync interval (milliseconds). The background thread
+    /// picks it up on its next loop.
+    pub fn set_txg_interval_ms(&self, ms: u64) {
+        self.txg_interval_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn new_read_only(fs: Fs) -> Self {
+        let txg = fs.txg();
         Shared {
             fs: Arc::new(Mutex::new(fs)),
+            txg,
+            txg_interval_ms: Arc::new(std::sync::atomic::AtomicU64::new(100)),
             state: Arc::new(Mutex::new(StateManager::new())),
             sessions: Arc::new(Mutex::new(crate::sessions::SessionTable::new())),
             layouts: Arc::new(Mutex::new(crate::layouts::LayoutTable::new())),
@@ -969,6 +1008,12 @@ impl Session {
             Some(fh) => fh,
             None => return OpResult::err(opnum, NFS4ERR_NOFILEHANDLE),
         };
+        // Hide the xattr backing file from NFS clients.
+        if let Fh::Live(ino) = cfh {
+            if ino == ROOT_INO && name == cownfs_core::engine::XATTR_FILE {
+                return OpResult::err(opnum, NFS4ERR_NOENT);
+            }
+        }
         // "." and ".." are handled by LOOKUPP; treat "." as self.
         // Handle snapshot filehandles.
         let result: Result<Option<(Fh, u8)>, u32> = match cfh {
@@ -1841,15 +1886,21 @@ impl Session {
         if let Err(e) = self.fs().write(ino, offset, data) {
             return OpResult::err(OP_WRITE, fs_to_nfs(e));
         }
-        // Stable-write semantics: FILE_SYNC4 must hit stable storage
-        // before we reply. P5: commit the transaction.
+        // Transaction groups: stage the write, then handle stability.
+        // FILE_SYNC4 waits for the open txg to sync (coalescing many
+        // concurrent sync writes onto one fsync); UNSTABLE just stages.
         let committed = if stable == FILE_SYNC4 {
-            match self.fs().commit() {
-                Ok(()) => FILE_SYNC4,
+            let txg = match self.fs().commit_async() {
+                Ok(t) => t,
+                Err(e) => return OpResult::err(OP_WRITE, fs_to_nfs(e)),
+            };
+            self.shared.txg.wait(txg);
+            FILE_SYNC4
+        } else {
+            match self.fs().commit_async() {
+                Ok(_) => stable,
                 Err(e) => return OpResult::err(OP_WRITE, fs_to_nfs(e)),
             }
-        } else {
-            stable
         };
         let mut w = Writer::new();
         w.u32(data.len() as u32);

@@ -23,6 +23,7 @@ pub const NFS4ERR_TOOSMALL: u32 = 10005;
 pub const NFS4ERR_ISDIR: u32 = 21;
 pub const NFS4ERR_INVAL: u32 = 22;
 pub const NFS4ERR_NOSPC: u32 = 28;
+pub const NFS4ERR_DQUOT: u32 = 69;
 pub const NFS4ERR_ROFS: u32 = 30;
 pub const NFS4ERR_NOTSUPP: u32 = 10004;
 pub const NFS4ERR_SERVERFAULT: u32 = 10006;

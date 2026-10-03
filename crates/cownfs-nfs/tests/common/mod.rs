@@ -54,6 +54,7 @@ pub fn spawn_server(blocks: u64) -> TestServer {
 
 /// Spawn a server with a referral table loaded from `conf`.
 /// If `conf` does not exist or is empty, referrals are disabled.
+/// Note: Shared::new auto-starts the txg sync thread (FILE_SYNC4 needs it).
 pub fn spawn_server_with_referrals(blocks: u64, conf: &std::path::Path) -> TestServer {
     let n = IMG_COUNTER.fetch_add(1, Ordering::SeqCst);
     let img = std::env::temp_dir().join(format!("cownfs-it-{}-{n}.img", std::process::id()));
@@ -119,6 +120,8 @@ fn spawn_concurrent_server_inner(blocks: u64, read_only: bool) -> TestServer {
         } else {
             cownfs_nfs::server::Shared::new(fs)
         };
+        if !read_only {
+            }
         let _ = cownfs_nfs::server::serve_concurrent(listener, shared);
     });
     TestServer {
@@ -147,6 +150,34 @@ pub fn spawn_server_on(img: &std::path::Path) -> TestServer {
     drop(fs);
     std::thread::spawn(move || {
         let fs = Fs::open(&img2).expect("open test image");
+        let shared = cownfs_nfs::server::Shared::new(fs);
+        let _ = cownfs_nfs::server::serve_concurrent(listener, shared);
+    });
+    TestServer {
+        addr,
+        uuid,
+        img: None,
+    }
+}
+
+/// Serve an existing image file with per-UID quotas set.
+/// Quotas are (uid, max_blocks) pairs.
+pub fn spawn_server_with_quotas(
+    img: &std::path::Path,
+    quotas: &[(u32, u64)],
+) -> TestServer {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+    let addr = listener.local_addr().expect("listener local addr");
+    let img2 = img.to_path_buf();
+    let fs = Fs::open(&img2).expect("open test image");
+    let uuid = fs.uuid();
+    drop(fs);
+    let quotas = quotas.to_vec();
+    std::thread::spawn(move || {
+        let mut fs = Fs::open(&img2).expect("open test image");
+        for (uid, blocks) in &quotas {
+            fs.set_quota(*uid, *blocks);
+        }
         let shared = cownfs_nfs::server::Shared::new(fs);
         let _ = cownfs_nfs::server::serve_concurrent(listener, shared);
     });

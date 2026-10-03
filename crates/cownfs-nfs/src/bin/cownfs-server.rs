@@ -7,7 +7,7 @@ use cownfs_nfs::server;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: cownfs-server [--read-only] [--ds-addr <addr>] [--referrals <file>] [--node-id <id>] [--lease-ttl <secs>] [--snapshot-policy <spec>] <image> [addr]");
+        eprintln!("usage: cownfs-server [--read-only] [--ds-addr <addr>] [--referrals <file>] [--node-id <id>] [--lease-ttl <secs>] [--snapshot-policy <spec>] [--txg-interval-ms <ms>] [--quota <uid>:<blocks>]... <image> [addr]");
         std::process::exit(1);
     }
     let read_only = args.iter().any(|a| a == "--read-only");
@@ -44,6 +44,31 @@ fn main() {
         .position(|a| a == "--snapshot-policy")
         .and_then(|i| args.get(i + 1))
         .cloned();
+    let txg_interval_ms: u64 = args
+        .iter()
+        .position(|a| a == "--txg-interval-ms")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
+    let txg_interval_arg = args
+        .iter()
+        .position(|a| a == "--txg-interval-ms")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    // --quota uid:blocks (repeatable).
+    let quota_args: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| *a == "--quota")
+        .filter_map(|(i, _)| args.get(i + 1).cloned())
+        .collect();
+    let quota_specs: Vec<(u32, u64)> = quota_args
+        .iter()
+        .filter_map(|s| {
+            let (u, b) = s.split_once(':')?;
+            Some((u.parse().ok()?, b.parse().ok()?))
+        })
+        .collect();
     let positional: Vec<&String> = args[1..]
         .iter()
         .filter(|a| {
@@ -54,6 +79,8 @@ fn main() {
                 && *a != "--lease-ttl"
                 && *a != "--log-level"
                 && *a != "--snapshot-policy"
+                && *a != "--txg-interval-ms"
+                && *a != "--quota"
         })
         .collect();
     // Remove the option values from positionals.
@@ -69,6 +96,8 @@ fn main() {
                         .position(|a| a == "--lease-ttl")
                         .and_then(|i| args.get(i + 1))
                 && Some(*a) != snapshot_policy.as_ref()
+                && Some(*a) != txg_interval_arg.as_ref()
+                && !quota_args.iter().any(|q| *a == q)
         })
         .collect();
     let addr = positional
@@ -77,6 +106,12 @@ fn main() {
         .cloned()
         .unwrap_or_else(|| "127.0.0.1:2049".into());
     let mut fs = Fs::open(std::path::Path::new(positional[0])).expect("open image");
+
+    // Per-UID block quotas.
+    for (uid, blocks) in &quota_specs {
+        fs.set_quota(*uid, *blocks);
+        eprintln!("quota: uid {uid} limited to {blocks} blocks");
+    }
 
     // Leader lease: acquire on startup if --node-id is given (and not read-only).
     // The lease prevents split-brain: two primaries cannot both hold it.
@@ -164,6 +199,13 @@ fn main() {
     std::thread::spawn(move || {
         let _ = server::serve_metrics(&metrics_addr, &metrics_shared);
     });
+
+    // Transaction group sync interval. Shared::new already started the
+    // background sync thread; just tune its interval.
+    if !read_only {
+        shared.set_txg_interval_ms(txg_interval_ms);
+        eprintln!("txg sync every {txg_interval_ms}ms");
+    }
 
     // Telescoping snapshot scheduler (NetApp-style). Ticks once a minute;
     // creates timestamped snapshots per tier and prunes beyond keep counts.
