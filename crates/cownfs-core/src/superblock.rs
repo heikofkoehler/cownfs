@@ -63,6 +63,15 @@ pub struct Superblock {
     pub lease_holder: [u8; 32],
     /// Unix timestamp when the lease expires. 0 = no lease.
     pub lease_expiry: u64,
+    /// Generation of the last full bitmap write. 0 = legacy mode: the
+    /// `bitmap_area` selects a full bitmap (pre-delta format).
+    pub bitmap_full_gen: u64,
+    /// Generation that the delta area brings the bitmap up to.
+    /// Equals `bitmap_full_gen` when no delta is pending.
+    pub bitmap_delta_gen: u64,
+    /// Which bitmap area (0 or 1) holds the full bitmap at `bitmap_full_gen`.
+    /// The other area holds the delta. Swapped on checkpoint.
+    pub bitmap_base_area: u64,
 }
 
 impl Superblock {
@@ -92,6 +101,9 @@ impl Superblock {
         hdr[176..184].copy_from_slice(&self.next_snap.to_le_bytes());
         hdr[192..224].copy_from_slice(&self.lease_holder);
         hdr[224..232].copy_from_slice(&self.lease_expiry.to_le_bytes());
+        hdr[232..240].copy_from_slice(&self.bitmap_full_gen.to_le_bytes());
+        hdr[240..248].copy_from_slice(&self.bitmap_delta_gen.to_le_bytes());
+        hdr[248..256].copy_from_slice(&self.bitmap_base_area.to_le_bytes());
         // Checksum covers the header with the checksum field zeroed.
         let sum = checksum(&hdr);
         hdr[OFF_CHECKSUM..OFF_CHECKSUM + 8].copy_from_slice(&sum.to_le_bytes());
@@ -142,6 +154,9 @@ impl Superblock {
             next_snap: u64_at(176)?,
             lease_holder: hdr[192..224].try_into().ok()?,
             lease_expiry: u64_at(224)?,
+            bitmap_full_gen: u64_at(232)?,
+            bitmap_delta_gen: u64_at(240)?,
+            bitmap_base_area: u64_at(248)?,
         })
     }
 
@@ -174,6 +189,9 @@ impl Superblock {
             next_snap: 0,
             lease_holder: [0u8; 32],
             lease_expiry: 0,
+            bitmap_full_gen: 0,
+            bitmap_delta_gen: 0,
+            bitmap_base_area: 0,
         }
     }
 }

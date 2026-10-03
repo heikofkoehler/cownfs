@@ -14,6 +14,10 @@ pub fn blocks_needed(nbits: u64) -> u64 {
 pub struct Bitmap {
     words: Vec<u64>,
     nbits: u64,
+    /// Word indices modified since the last full bitmap write (or since
+    /// load). Used for delta-bitmap persists: only dirty words are written
+    /// per txg instead of the full bitmap.
+    dirty: std::collections::HashSet<u64>,
 }
 
 impl Bitmap {
@@ -21,6 +25,7 @@ impl Bitmap {
         Self {
             words: vec![0; nbits.div_ceil(64) as usize],
             nbits,
+            dirty: std::collections::HashSet::new(),
         }
     }
 
@@ -30,12 +35,16 @@ impl Bitmap {
 
     pub fn set(&mut self, i: u64) {
         debug_assert!(i < self.nbits);
-        self.words[(i / 64) as usize] |= 1u64 << (i % 64);
+        let wi = i / 64;
+        self.words[wi as usize] |= 1u64 << (i % 64);
+        self.dirty.insert(wi);
     }
 
     pub fn clear(&mut self, i: u64) {
         debug_assert!(i < self.nbits);
-        self.words[(i / 64) as usize] &= !(1u64 << (i % 64));
+        let wi = i / 64;
+        self.words[wi as usize] &= !(1u64 << (i % 64));
+        self.dirty.insert(wi);
     }
 
     pub fn test(&self, i: u64) -> bool {
@@ -51,11 +60,40 @@ impl Bitmap {
                 let idx = wi as u64 * 64 + bit as u64;
                 if idx < self.nbits {
                     *w |= 1u64 << bit;
+                    self.dirty.insert(wi as u64);
                     return Some(idx);
                 }
             }
         }
         None
+    }
+
+    /// Word indices changed since the last [`Self::clear_dirty`].
+    pub fn dirty_words(&self) -> Vec<u64> {
+        let mut v: Vec<u64> = self.dirty.iter().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Clear the dirty set (after a full bitmap write or checkpoint).
+    pub fn clear_dirty(&mut self) {
+        self.dirty.clear();
+    }
+
+    /// Get a word value (for delta serialization).
+    pub fn word(&self, wi: u64) -> u64 {
+        self.words[wi as usize]
+    }
+
+    /// Set a word value directly (for delta application on open).
+    /// Does not mark dirty.
+    pub fn set_word(&mut self, wi: u64, val: u64) {
+        self.words[wi as usize] = val;
+    }
+
+    /// Number of words.
+    pub fn word_count(&self) -> u64 {
+        self.words.len() as u64
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -83,6 +121,7 @@ impl Bitmap {
                 *last &= u64::MAX >> excess;
             }
         }
+        b.dirty.clear();
         b
     }
 }
