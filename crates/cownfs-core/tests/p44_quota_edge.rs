@@ -1,6 +1,6 @@
 //! D1: quota edge cases — rename-over, setattr uid change, rmdir.
 
-use cownfs_core::engine::{Fs, ROOT_INO, SetAttrs};
+use cownfs_core::engine::{Fs, SetAttrs, ROOT_INO};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static CTR: AtomicU64 = AtomicU64::new(0);
@@ -28,7 +28,10 @@ fn quota_released_on_rename_over() {
     fs.rename(ROOT_INO, b"a", ROOT_INO, b"b").unwrap();
     let after = fs.quota_usage(1000);
     // b's blocks (3) should be freed; a's blocks remain.
-    assert!(after < before, "quota not released on rename-over: {before} -> {after}");
+    assert!(
+        after < before,
+        "quota not released on rename-over: {before} -> {after}"
+    );
     assert_eq!(after, 3, "expected 3 blocks (just a)");
 }
 

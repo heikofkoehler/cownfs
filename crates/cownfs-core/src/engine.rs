@@ -419,9 +419,7 @@ fn read_from(
         }
         // Read the run in one syscall.
         let mut buf = vec![0u8; run_len * BLOCK_SIZE];
-        sh.dev
-            .read_blocks(pblk, &mut buf)
-            .map_err(StoreError::Io)?;
+        sh.dev.read_blocks(pblk, &mut buf).map_err(StoreError::Io)?;
         // Verify checksums and copy out.
         for j in 0..run_len {
             let (fblk_j, _, cksum_j) = mappings[i + j];
@@ -914,9 +912,8 @@ impl Fs {
         }
         // Load full bitmap from the base area.
         let base_start = sb.bitmap_start + sb.bitmap_base_area * sb.bitmap_blocks;
-        let mut bitmap =
-            store::read_bitmap(dev, sb.block_count, base_start, sb.bitmap_blocks)
-                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+        let mut bitmap = store::read_bitmap(dev, sb.block_count, base_start, sb.bitmap_blocks)
+            .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
         // Apply delta if one is pending.
         if sb.bitmap_delta_gen > sb.bitmap_full_gen {
             let delta_start = sb.bitmap_start + (1 - sb.bitmap_base_area) * sb.bitmap_blocks;
@@ -1079,7 +1076,8 @@ impl Fs {
             sh.dev.write_block(delta_start + 1 + i as u64, &blk)?;
         }
         self.sb.bitmap_delta_gen = gen;
-        self.last_bitmap_write_bytes = (1 + entries.chunks(BLOCK_SIZE).len() as u64) * BLOCK_SIZE as u64;
+        self.last_bitmap_write_bytes =
+            (1 + entries.chunks(BLOCK_SIZE).len() as u64) * BLOCK_SIZE as u64;
         // Don't clear dirty: words stay dirty until the next full checkpoint,
         // so the delta always spans from full_gen.
         Ok(())

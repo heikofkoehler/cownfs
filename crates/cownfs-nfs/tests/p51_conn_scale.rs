@@ -12,7 +12,7 @@ fn connection_scale_100_clients() {
     let srv = spawn_server(4096);
     // Create a file via the server's fs? We need a file to read.
     // For simplicity, just test connection establishment and getattr.
-    
+
     let start = Instant::now();
     let mut handles = Vec::new();
     // 100 concurrent clients, each doing 10 getattrs.

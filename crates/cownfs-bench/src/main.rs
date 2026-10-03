@@ -459,7 +459,6 @@ fn b_nfs_write_bw(quick: bool) {
 
 // ---------------------------------------------------------------------------
 
-
 fn b_bitmap_write(quick: bool) {
     // A1 metric: bytes of bitmap written per commit.
     let n: usize = if quick { 20 } else { 100 };

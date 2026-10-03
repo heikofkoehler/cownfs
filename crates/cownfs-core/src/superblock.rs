@@ -32,7 +32,8 @@ const OFF_CHECKSUM: usize = 64;
 pub struct Superblock {
     pub generation: u64,
     pub block_count: u64,
-    pub uuid: [u8; 16],    pub bitmap_start: u64,
+    pub uuid: [u8; 16],
+    pub bitmap_start: u64,
     /// Blocks per bitmap area. Two areas live at
     /// `[bitmap_start, bitmap_start + 2*bitmap_blocks)`; the slot's
     /// `bitmap_area` selects the active one. The inactive area receives the

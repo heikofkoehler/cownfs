@@ -203,7 +203,9 @@ fn do_create_inc(image: &Path, snap_name: &str, backup: &Path) -> Result<(), Str
     let dev = FileDevice::open(image).map_err(|e| format!("open device: {e}"))?;
 
     // Find the snapshot by name.
-    let snaps = fs.snapshot_list().map_err(|e| format!("list snaps: {e:?}"))?;
+    let snaps = fs
+        .snapshot_list()
+        .map_err(|e| format!("list snaps: {e:?}"))?;
     let snap_id = snaps
         .iter()
         .find(|(_, name)| name == snap_name.as_bytes())
@@ -268,11 +270,9 @@ fn main() {
     }
     let result = match args[1].as_str() {
         "create" if args.len() == 4 => do_create(Path::new(&args[2]), Path::new(&args[3])),
-        "create-inc" if args.len() == 5 => do_create_inc(
-            Path::new(&args[2]),
-            &args[3],
-            Path::new(&args[4]),
-        ),
+        "create-inc" if args.len() == 5 => {
+            do_create_inc(Path::new(&args[2]), &args[3], Path::new(&args[4]))
+        }
         "restore" if args.len() == 4 => do_restore(Path::new(&args[2]), Path::new(&args[3])),
         "verify" if args.len() == 3 => do_verify(Path::new(&args[2])),
         "list" if args.len() == 3 => do_list(Path::new(&args[2])),

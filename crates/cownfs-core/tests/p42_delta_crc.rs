@@ -1,7 +1,7 @@
 //! B2: delta CRC — corrupt delta is ignored, base is used.
 
-use cownfs_core::engine::{Fs, ROOT_INO};
 use cownfs_core::block::{BlockDevice, FileDevice};
+use cownfs_core::engine::{Fs, ROOT_INO};
 use cownfs_core::{superblock, BLOCK_SIZE};
 use std::sync::atomic::{AtomicU64, Ordering};
 

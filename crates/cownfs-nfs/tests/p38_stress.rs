@@ -16,8 +16,8 @@ use common::{create_file, establish_client, spawn_server_with_quotas, NfsClient,
 use cownfs_core::engine::{Fs, ROOT_INO};
 use cownfs_nfs::nfs4::*;
 use std::net::SocketAddr;
-use std::sync::{Arc, Barrier};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
 
 static IMG_CTR: AtomicU64 = AtomicU64::new(0);
 
@@ -64,13 +64,7 @@ fn read_file(c: &mut NfsClient, uuid: &[u8; 16], ino: u64, len: usize) -> Vec<u8
     }
 }
 
-fn worker(
-    tid: usize,
-    addr: SocketAddr,
-    uuid: [u8; 16],
-    iters: usize,
-    barrier: Arc<Barrier>,
-) {
+fn worker(tid: usize, addr: SocketAddr, uuid: [u8; 16], iters: usize, barrier: Arc<Barrier>) {
     barrier.wait();
     let mut c = NfsClient::connect(&addr);
     let id = establish_client(&mut c, format!("stress-{tid}").as_bytes());

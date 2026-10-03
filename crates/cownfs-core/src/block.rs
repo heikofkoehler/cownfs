@@ -81,8 +81,7 @@ impl FileDevice {
                 "block range out of range",
             ));
         }
-        self.file
-            .read_exact_at(buf, start * BLOCK_SIZE as u64)
+        self.file.read_exact_at(buf, start * BLOCK_SIZE as u64)
     }
     /// Creates a new image file with `blocks` zeroed blocks.
     pub fn create(path: &Path, blocks: u64) -> io::Result<Self> {
@@ -93,7 +92,11 @@ impl FileDevice {
             .truncate(true)
             .open(path)?;
         file.set_len(blocks * BLOCK_SIZE as u64)?;
-        Ok(Self { file, blocks, faults: None })
+        Ok(Self {
+            file,
+            blocks,
+            faults: None,
+        })
     }
 
     /// Opens an existing image; its size must be a multiple of the block size.
@@ -177,8 +180,7 @@ impl BlockDevice for FileDevice {
                 let buffered = std::mem::take(&mut faults.buffered);
                 // Reverse order: superblock (written last) hits disk first.
                 for (n, buf) in buffered.into_iter().rev() {
-                    self.file
-                        .write_all_at(&buf, n * BLOCK_SIZE as u64)?;
+                    self.file.write_all_at(&buf, n * BLOCK_SIZE as u64)?;
                 }
             }
         }

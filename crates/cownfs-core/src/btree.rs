@@ -559,12 +559,7 @@ impl<K: Ord + Clone, V: Clone, S: NodeStore<K, V>, const T: usize> BTree<K, V, S
 
     /// Range with a limit on the number of entries returned.
     /// For C2: cursor-based readdir without materializing huge dirs.
-    pub fn range_limit(
-        &self,
-        lo: &K,
-        hi: &K,
-        limit: usize,
-    ) -> Result<Vec<(K, V)>, StoreError> {
+    pub fn range_limit(&self, lo: &K, hi: &K, limit: usize) -> Result<Vec<(K, V)>, StoreError> {
         let mut a = self.store.lock().unwrap();
         let mut out = Vec::new();
         collect_range(&mut *a, self.root, lo, hi, &mut out, limit)?;
