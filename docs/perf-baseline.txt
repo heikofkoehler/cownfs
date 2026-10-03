@@ -1,0 +1,9 @@
+# Performance baseline (2026-10-03, --quick, release build)
+# Machine: Linux VM (see docs/benchmark.md for specs)
+# Update after intentional perf changes. Gate fails if p99 regresses >20%.
+
+commit_p99_ns=1890000
+sync_write_iops=2014
+sync_write_p99_ns=2360000
+bitmap_write_bytes_per_commit=4096
+alloc_80pct_p99_ns=748800

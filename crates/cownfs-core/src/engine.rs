@@ -516,6 +516,8 @@ pub struct Fs {
     xattrs: std::collections::HashMap<(u64, Vec<u8>), Vec<u8>>,
     /// Commits since the last full bitmap checkpoint (for delta bitmap).
     commits_since_checkpoint: u64,
+    /// Bytes written by the last persist_bitmap (for benchmarking).
+    last_bitmap_write_bytes: u64,
 }
 
 /// Name of the hidden file backing extended attributes.
@@ -576,6 +578,7 @@ impl Fs {
             quota_usage: std::collections::HashMap::new(),
             xattrs: std::collections::HashMap::new(),
             commits_since_checkpoint: 0,
+            last_bitmap_write_bytes: 0,
         };
 
         let now = now_secs();
@@ -722,6 +725,7 @@ impl Fs {
             quota_usage: std::collections::HashMap::new(),
             xattrs: std::collections::HashMap::new(),
             commits_since_checkpoint: 0,
+            last_bitmap_write_bytes: 0,
         };
         fs.rebuild_pinned()?;
         fs.rebuild_quota_usage()?;
@@ -981,6 +985,7 @@ impl Fs {
         self.sb.bitmap_delta_gen = gen;
         // Swap base and delta areas.
         self.sb.bitmap_base_area = 1 - self.sb.bitmap_base_area;
+        self.last_bitmap_write_bytes = blocks * BLOCK_SIZE as u64;
         sh.bitmap.clear_dirty();
         drop(sh);
         self.commits_since_checkpoint = 0;
@@ -1020,6 +1025,7 @@ impl Fs {
             sh.dev.write_block(delta_start + 1 + i as u64, &blk)?;
         }
         self.sb.bitmap_delta_gen = gen;
+        self.last_bitmap_write_bytes = (1 + entries.chunks(BLOCK_SIZE).len() as u64) * BLOCK_SIZE as u64;
         // Don't clear dirty: words stay dirty until the next full checkpoint,
         // so the delta always spans from full_gen.
         Ok(())
@@ -1114,6 +1120,11 @@ impl Fs {
         drop(t);
         self.txg.cv.notify_all();
         Ok(true)
+    }
+
+    /// Bytes written by the last bitmap persist (for benchmarking).
+    pub fn last_bitmap_write_bytes(&self) -> u64 {
+        self.last_bitmap_write_bytes
     }
 
     /// The transaction group coordinator (for [`TxgCoord::wait`]).

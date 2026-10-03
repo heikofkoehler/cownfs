@@ -459,6 +459,68 @@ fn b_nfs_write_bw(quick: bool) {
 
 // ---------------------------------------------------------------------------
 
+
+fn b_bitmap_write(quick: bool) {
+    // A1 metric: bytes of bitmap written per commit.
+    let n: usize = if quick { 20 } else { 100 };
+    let img = img_path("bmpw");
+    let mut fs = Fs::format(&img, 32768).unwrap();
+    let ino = fs.create(ROOT_INO, b"b", 0o644, 0, 0).unwrap();
+    let data = vec![0xabu8; 4096];
+    let mut total_bytes = 0u64;
+    for i in 0..n {
+        fs.write(ino, (i * 4096) as u64, &data).unwrap();
+        fs.commit().unwrap();
+        total_bytes += fs.last_bitmap_write_bytes();
+    }
+    println!(
+        "bitmap_write avg {:>8.0} bytes/commit   ({n} commits)",
+        total_bytes as f64 / n as f64,
+    );
+    drop(fs);
+    let _ = std::fs::remove_file(&img);
+}
+
+fn b_alloc_latency(quick: bool) {
+    // A2 metric: alloc latency at 80% full.
+    let blocks = 8192u64;
+    let img = img_path("alcl");
+    let mut fs = Fs::format(&img, blocks).unwrap();
+    // Fill to ~80%.
+    let target = (blocks as f64 * 0.8) as u64;
+    let mut allocated = 0u64;
+    let mut ino_ctr = 0;
+    while allocated < target {
+        let ino = fs
+            .create(ROOT_INO, format!("f{ino_ctr}").as_bytes(), 0o644, 0, 0)
+            .unwrap();
+        fs.write(ino, 0, &vec![0u8; 4096 * 4]).unwrap();
+        allocated += 5; // approx
+        ino_ctr += 1;
+    }
+    fs.commit().unwrap();
+    // Time allocs at 80% full.
+    let n: usize = if quick { 100 } else { 1000 };
+    let mut ns = Vec::with_capacity(n);
+    for i in 0..n {
+        let ino = fs
+            .create(ROOT_INO, format!("g{i}").as_bytes(), 0o644, 0, 0)
+            .unwrap();
+        let t = Instant::now();
+        fs.write(ino, 0, &[0u8; 4096]).unwrap();
+        ns.push(t.elapsed().as_nanos());
+    }
+    let (mean, p50, p99) = lat_stats(&mut ns);
+    println!(
+        "alloc_80pct  mean {:>8}  p50 {:>8}  p99 {:>8}   ({n} allocs at 80% full)",
+        fmt_dur(mean),
+        fmt_dur(p50),
+        fmt_dur(p99),
+    );
+    drop(fs);
+    let _ = std::fs::remove_file(&img);
+}
+
 fn main() {
     if cfg!(debug_assertions) {
         eprintln!("WARNING: debug build — numbers are not representative. Use --release.");
@@ -473,6 +535,8 @@ fn main() {
     b_create(quick);
     b_commit_latency(quick);
     b_sync_write(quick);
+    b_bitmap_write(quick);
+    b_alloc_latency(quick);
     b_snapshot(quick);
     println!("--- nfs (loopback) ---");
     b_nfs_write_rt(quick);
