@@ -251,7 +251,10 @@ pub enum Reply {
     Fh(FileHandle),
     /// Decoded (attrnum, raw XDR value) pairs.
     Attrs(Vec<(u32, Vec<u8>)>),
-    Dir(Vec<Dirent>),
+    Dir {
+        entries: Vec<Dirent>,
+        eof: bool,
+    },
     Read {
         eof: bool,
         data: Vec<u8>,
@@ -1032,8 +1035,8 @@ impl NfsClient {
                             attrs,
                         });
                     }
-                    let _ = r.bool().expect("eof");
-                    Reply::Dir(entries)
+                    let eof = r.bool().expect("eof");
+                    Reply::Dir { entries, eof }
                 }
                 nfs4::OP_READ => {
                     let eof = r.bool().expect("eof");
@@ -1252,7 +1255,7 @@ impl NfsClient {
             ops.readdir(cookie, maxcount, attrs);
             let res = self.check_ok(b"readdir_all", ops);
             let entries = match &res[1] {
-                Reply::Dir(e) => e,
+                Reply::Dir { entries, .. } => entries,
                 r => panic!("unexpected readdir reply: {r:?}"),
             };
             if entries.is_empty() {

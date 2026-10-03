@@ -191,7 +191,7 @@ fn readdir_pagination() {
     ops.readdir(999, 65536, &[FATTR4_TYPE]);
     let res = c.check_ok(b"readdir-past-end", ops);
     match &res[1] {
-        Reply::Dir(e) => assert!(e.is_empty()),
+        Reply::Dir { entries: e, .. } => assert!(e.is_empty()),
         r => panic!("{r:?}"),
     }
 }

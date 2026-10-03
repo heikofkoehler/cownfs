@@ -45,7 +45,7 @@ fn snapshots_dir_lists_snapshots() {
     ops.readdir(0, 8192, &[FATTR4_TYPE]);
     let res = c.check_ok(b"snap-list", ops);
     match &res[2] {
-        Reply::Dir(entries) => {
+        Reply::Dir { entries, .. } => {
             let names: Vec<Vec<u8>> = entries.iter().map(|e| e.name.clone()).collect();
             assert!(names.contains(&b"snap1".to_vec()), "names: {names:?}");
         }
@@ -99,7 +99,7 @@ fn snapshot_readdir_lists_snapshot_root() {
     ops.readdir(0, 8192, &[FATTR4_TYPE]);
     let res = c.check_ok(b"snap-readdir", ops);
     match &res[3] {
-        Reply::Dir(entries) => {
+        Reply::Dir { entries, .. } => {
             let names: Vec<Vec<u8>> = entries.iter().map(|e| e.name.clone()).collect();
             assert!(names.contains(&b"data.txt".to_vec()), "names: {names:?}");
         }
@@ -164,7 +164,7 @@ fn snapshot_readdir_filehandles_roundtrip() {
     ops.readdir(0, 8192, &[FATTR4_TYPE, FATTR4_FILEHANDLE]);
     let res = c.check_ok(b"snap-readdir-fh", ops);
     let fhs: Vec<Vec<u8>> = match &res[2] {
-        Reply::Dir(entries) => {
+        Reply::Dir { entries, .. } => {
             assert!(!entries.is_empty());
             entries
                 .iter()
@@ -219,7 +219,7 @@ fn snapshot_getattr_filehandle_roundtrip() {
     ops.readdir(0, 8192, &[FATTR4_TYPE]);
     let res = c.check_ok(b"snap-fh-readdir", ops);
     match &res[1] {
-        Reply::Dir(entries) => {
+        Reply::Dir { entries, .. } => {
             let names: Vec<Vec<u8>> = entries.iter().map(|e| e.name.clone()).collect();
             assert!(names.contains(&b"data.txt".to_vec()), "names: {names:?}");
         }
@@ -283,7 +283,7 @@ fn snapshots_dir_filehandle_roundtrip() {
     ops.readdir(0, 8192, &[FATTR4_TYPE]);
     let res = c.check_ok(b"snapdir-fh-readdir", ops);
     match &res[1] {
-        Reply::Dir(entries) => {
+        Reply::Dir { entries, .. } => {
             let names: Vec<Vec<u8>> = entries.iter().map(|e| e.name.clone()).collect();
             assert!(names.contains(&b"snap1".to_vec()), "names: {names:?}");
         }

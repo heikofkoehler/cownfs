@@ -1340,17 +1340,16 @@ impl Session {
             Live(u64),
             Snap(u32, u64),
         }
+        // For live directories, page through readdir_paged to avoid
+        // materializing huge directories in memory (C2). Cookies are
+        // 3-based indices (1 and 2 reserved); cookie 0 starts at the
+        // beginning. The B-tree ordering is deterministic, so index-based
+        // cookies are stable across calls.
+        if let Fh::Live(ino) = fh {
+            return self.op_readdir_paged(ino, cookie, maxcount, mask);
+        }
         let entries: Vec<(Vec<u8>, EntryFh, u8)> = match fh {
-            Fh::Live(ino) => {
-                let live_entries = match self.fs().readdir(ino) {
-                    Ok(e) => e,
-                    Err(e) => return OpResult::err(OP_READDIR, fs_to_nfs(e)),
-                };
-                live_entries
-                    .into_iter()
-                    .map(|(name, child_ino, typ)| (name, EntryFh::Live(child_ino), typ))
-                    .collect()
-            }
+            Fh::Live(_) => unreachable!("handled above"),
             Fh::SnapshotsDir => {
                 let snaps = match self.fs().snapshot_list() {
                     Ok(s) => s,
@@ -1385,6 +1384,7 @@ impl Session {
         let mut bytes_used: u32 = 16; // cookieverf + eof flag estimate
         let max = maxcount.min(1024 * 1024);
         let mut emitted = 0usize;
+        let mut eof = true;
         for (idx, (name, child_fh, _typ)) in entries.iter().enumerate().skip(start) {
             let (attr_ino, inode, fh_for_attr) = match child_fh {
                 EntryFh::Live(child_ino) => {
@@ -1420,6 +1420,8 @@ impl Session {
             vals.encode_result(&mut ew);
             let entry_bytes = ew.bytes().len() as u32 + 4; // + value_follows
             if bytes_used + entry_bytes > max && emitted > 0 {
+                // Doesn't fit; more entries remain.
+                eof = false;
                 break;
             }
             w.u32(1); // value_follows
@@ -1428,9 +1430,90 @@ impl Session {
             emitted += 1;
         }
         w.u32(0); // no more entries
-        w.bool(true); // eof (we always return everything after `start`)
+        w.bool(eof);
         OpResult::ok(OP_READDIR, w.into_bytes())
     }
+
+    /// Paged READDIR for live directories (C2). Uses `Fs::readdir_paged`
+    /// to stream entries without materializing the whole directory.
+    /// Cookies are 3-based indices, stable across calls.
+    fn op_readdir_paged(&self, ino: u64, cookie: u64, maxcount: u32, mask: &AttrMask) -> OpResult {
+        // cookie 0 starts at the beginning; otherwise resume after the
+        // entry whose cookie matches.
+        let start_idx = if cookie == 0 {
+            0
+        } else {
+            (cookie - 2) as usize
+        };
+        let max = maxcount.min(1024 * 1024);
+        let mut w = Writer::new();
+        w.u64(0); // cookieverf
+        let mut bytes_used: u32 = 16;
+        let mut emitted = 0usize;
+        let mut idx = 0usize; // absolute index in the directory
+        let mut start_after: Option<Vec<u8>> = None;
+        let mut eof = false;
+        // Page size: bounded memory per fetch, amortized syscalls.
+        const PAGE: usize = 128;
+        loop {
+            let (page, has_more) = match self.fs().readdir_paged(ino, start_after.as_deref(), PAGE)
+            {
+                Ok(p) => p,
+                Err(e) => return OpResult::err(OP_READDIR, fs_to_nfs(e)),
+            };
+            if page.is_empty() {
+                eof = true;
+                break;
+            }
+            let mut page_done = false;
+            for (name, child_ino, _typ) in &page {
+                if idx < start_idx {
+                    idx += 1;
+                    continue;
+                }
+                let inode = match self.fs().getattr(*child_ino) {
+                    Ok(i) => i,
+                    Err(_) => {
+                        idx += 1;
+                        continue;
+                    }
+                };
+                let fh_for_attr = Fh::Live(*child_ino);
+                let fh_bytes = self.fh_attr_bytes(&fh_for_attr, &inode);
+                let fa = self.make_file_attrs(*child_ino, &inode, fh_bytes);
+                let vals = AttrValues::encode(mask, &fa);
+                let mut ew = Writer::new();
+                ew.u64((idx + 3) as u64); // 3-based: 1 and 2 are reserved
+                ew.opaque(name);
+                vals.encode_result(&mut ew);
+                let entry_bytes = ew.bytes().len() as u32 + 4; // + value_follows
+                if bytes_used + entry_bytes > max && emitted > 0 {
+                    // Doesn't fit; more entries remain.
+                    eof = false;
+                    page_done = true;
+                    break;
+                }
+                w.u32(1); // value_follows
+                w.raw(ew.bytes());
+                bytes_used += entry_bytes;
+                emitted += 1;
+                idx += 1;
+            }
+            if page_done {
+                break;
+            }
+            // Advance the cursor to the last name in this page.
+            start_after = page.last().map(|(n, _, _)| n.clone());
+            if !has_more {
+                eof = true;
+                break;
+            }
+        }
+        w.u32(0); // no more entries
+        w.bool(eof);
+        OpResult::ok(OP_READDIR, w.into_bytes())
+    }
+
     fn op_read(&self, offset: u64, count: u32) -> OpResult {
         let fh = match self.current(OP_READ) {
             Ok(fh) => fh,

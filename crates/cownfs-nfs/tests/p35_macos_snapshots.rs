@@ -100,7 +100,7 @@ fn macos_ls(c: &mut NfsClient, fh: Option<&[u8]>) -> Vec<(Vec<u8>, Vec<u8>)> {
     ops.readdir(0, 8192, &macos_mask());
     let res = c.check_ok(b"macos-ls", ops);
     match &res[1] {
-        Reply::Dir(entries) => entries
+        Reply::Dir { entries, .. } => entries
             .iter()
             .map(|e| {
                 (
