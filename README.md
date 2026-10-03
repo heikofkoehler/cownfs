@@ -6,11 +6,13 @@ with an NFS client — no local mount, no FUSE, no Ganesha.
 
 ## Status
 
-**Working prototype, not production.** The core engine (P0–P7) is done and
-heavily tested: it formats, serves NFSv4.0, mutates, snapshots, replicates,
-and survives fault injection. 158 tests pass over the wire against the real
-server, including a kernel-tarball workload test, multi-client concurrency
-tests, and real-world client-pattern tests derived from macOS traces.
+**Minimal production readiness** (2026-10-02). 178 tests pass. The core
+engine (P0–P7) is done and heavily tested. Production hardening (P0–P2)
+is complete: data checksums, backup/restore, leader fencing, metrics,
+health checks, structured logging, audit log, graceful shutdown, throttling.
+
+See [docs/production-readiness.md](docs/production-readiness.md) for the
+full assessment.
 
 What works:
 
@@ -19,7 +21,7 @@ What works:
 - **P1** — in-memory generational CoW B-tree (model-tested against `BTreeMap`
   over 135k randomized ops)
 - **P2** — block-backed CoW engine: files, dirs, symlinks, hard links,
-  extents, refcounted blocks
+  extents, refcounted blocks, **parent-stored data checksums**
 - **P3** — snapshots: cheap shared-root copies with CoW divergence and
   snapshot-pinned data blocks
 - **P4** — hand-rolled RPC/XDR and a read-only NFSv4.0 server
@@ -41,10 +43,26 @@ What works:
 - **P16** — read-only server mode (for replicas)
 - **P17–P18** — replication: snapshot diff, `cownfs-replicate` send/receive,
   fault-injection tests, lag metrics
-- **P19** — `cownfs-ds` data server daemon (pNFS building block)
+- **P19** — `cownfs-ds` data server daemon (pNFS building block, experimental)
 - **P20** — NFSv4.1 session semantics (`EXCHANGE_ID`, `CREATE_SESSION`,
-  `SEQUENCE`)
-- **P21** — pNFS file layouts (single data server, layout recall)
+  `SEQUENCE`) — experimental
+- **P21** — pNFS file layouts (single data server, layout recall) — experimental
+- **P22** — NFSv4.0 referrals: `fs_locations`, `NFS4ERR_MOVED`, transparent
+  sharding via `cownfs-server --referrals`
+- **P23** — replication ordering: superblock-last crash safety
+- **P24** — referral protocol tests
+- **P25** — data block checksums (parent-stored CRC32C, verified on read)
+- **P26** — `cownfs-backup`: portable backup/restore with checksums
+- **P27** — leader lease: superblock fencing prevents split-brain
+- **P28** — throttling: per-client and per-file rate limits
+
+**Production features:**
+- **Observability**: Prometheus metrics (`:port+1000/metrics`), health
+  (`:port+1000/healthz`), JSON structured logs (`--log-level`), audit log
+- **Reliability**: graceful shutdown (SIGTERM → drain → commit), connection
+  limits (1000), idle timeouts (300s), leader lease fencing
+- **Data safety**: parent-stored CRC32C on all data blocks, `cownfs-backup`
+  for offline backups, crash-safe replication
 
 The server has been exercised against the real macOS NFS client (xnu), which
 exposed and drove fixes for: `GETATTR` with empty attribute masks (ESTALE),
@@ -53,14 +71,11 @@ exposed and drove fixes for: `GETATTR` with empty attribute masks (ESTALE),
 
 Known gaps (tracked as [GitHub issues](https://github.com/heikofkoehler/cownfs/issues)):
 
-- No full `pynfs` conformance run yet — it's the target standard; the
-  write/state suites haven't been run end-to-end
-- pNFS is single-data-server only; clustered MDS (phase 4 of the
-  [horizontal scaling plan](docs/horizontal-scaling-plan.md)) is deferred —
-  see [docs/phase4-deferred.md](docs/phase4-deferred.md)
-- By design, v1 has no delegations, Kerberos, or full NFSv4.1 feature set
-- Fault injection doesn't yet cover torn/reordered device writes; no
-  multi-hour soak has been run
+- **Security**: AUTH_SYS only (trusted networks only). Kerberos deferred.
+- **Features**: No quotas, ACLs, xattrs, or delegations (P3, not started).
+- pNFS is experimental; v4.0 referrals are the production scale-out path.
+  See [docs/v40-scaleout.md](docs/v40-scaleout.md).
+- Fault injection doesn't yet cover torn/reordered device writes.
 
 ## Quick start
 
@@ -111,10 +126,33 @@ Replicate to a second image:
 Tests and benchmarks:
 
 ```sh
-cargo test --workspace                       # 158 tests
+cargo test --workspace                       # 178 tests
 cargo run --release -p cownfs-bench          # throughput/latency numbers
 COWNFS_STRESS_ITERS=50000 cargo test -p cownfs-core --test stress
 ```
+
+### Production deployment
+
+```sh
+# Primary with leader lease (prevents split-brain)
+./target/release/cownfs-server --node-id primary1 --lease-ttl 30 /data/cow.img 0.0.0.0:2049 &
+
+# Read replica
+./target/release/cownfs-server --read-only /data/replica.img 0.0.0.0:2050 &
+
+# Metrics and health (on port+1000)
+curl http://localhost:3049/metrics
+curl http://localhost:3049/healthz
+
+# Backup (cron daily)
+./target/release/cownfs-backup create /data/cow.img /backups/cow-$(date +%F).bak
+
+# Referral server for transparent sharding
+./target/release/cownfs-server --referrals /etc/cownfs/referrals.conf /data/ns.img 0.0.0.0:2049 &
+```
+
+See [docs/production-readiness.md](docs/production-readiness.md) for the
+full operational guide.
 
 ## Layout
 
@@ -132,7 +170,9 @@ COWNFS_STRESS_ITERS=50000 cargo test -p cownfs-core --test stress
   design, on-disk format, and phase gates),
   [benchmark.md](docs/benchmark.md) (measured numbers),
   [horizontal-scaling-plan.md](docs/horizontal-scaling-plan.md) (replication
-  → sharding → pNFS → clustered MDS),
+  → sharding → referrals; pNFS deprecated),
+  [v40-scaleout.md](docs/v40-scaleout.md) (v4.0-only scale-out architecture),
+  [production-readiness.md](docs/production-readiness.md) (operational guide),
   [sharding.md](docs/sharding.md), [p7-soak-results.md](docs/p7-soak-results.md)
 
 ## Performance snapshot
