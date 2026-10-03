@@ -37,3 +37,17 @@ Workload: create/write/rename/delete/snapshot mix. Verifies the image is
 clean after the run.
 
 Status: RUNNING (started 2026-10-02 ~15:30 PDT, expected done ~18:30 PDT)
+
+## 2026-10-03: 10K validation soak (post A1-A4, B1-B3)
+
+- **Iters:** 10,000 (COWNFS_SOAK_ITERS=10000)
+- **Duration:** 11.29s
+- **Result:** PASS — 96 files, 1692 snapshots, check clean.
+- **Notes:** Validates delta bitmap, allocation cursor, in-place
+  overwrite, vectored reads, txg error propagation, and fault
+  injection harness. Full 100M multi-hour soak still pending.
+
+## fio over NFS
+
+See `docs/fio-guide.md` for the job file and procedure. Requires a
+mounted NFS filesystem (e.g., Heiko's Mac). Not yet run.
