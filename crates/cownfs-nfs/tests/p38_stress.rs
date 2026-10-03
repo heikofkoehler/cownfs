@@ -1,13 +1,13 @@
 //! Stress test: sustained mixed workload across many concurrent NFS clients.
 //!
-//! Exercises the txg batcher, RwLock read concurrency, and xattrs under
-//! load. Each thread runs a loop of: create file, unstable writes,
-//! setattr xattr, reads, readdir, commit, unlink.
+//! Exercises the txg batcher and RwLock read concurrency under load.
+//! Each thread runs a loop of: create file, unstable writes, reads,
+//! readdir, commit, unlink.
 //!
 //! Iteration count per thread is controlled by `COWNFS_STRESS_ITERS`
 //! (default 50). Thread count by `COWNFS_STRESS_THREADS` (default 8).
 //! At the end, a final verification pass checks every surviving file's
-//! content and xattrs.
+//! content.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -106,10 +106,13 @@ fn worker(tid: usize, addr: SocketAddr, uuid: [u8; 16], iters: usize, barrier: A
 
 #[test]
 fn stress_mixed_workload() {
+    run_stress(iters());
+}
+
+fn run_stress(it: usize) {
     let img = test_image();
     let srv = spawn_server_with_quotas(&img, &[]);
     let n = nthreads();
-    let it = iters();
     let barrier = Arc::new(Barrier::new(n));
     let mut handles = Vec::with_capacity(n);
     for tid in 0..n {
@@ -129,8 +132,9 @@ fn stress_mixed_workload() {
     // Final verification: reopen and check surviving files.
     let fs = Fs::open(&img).unwrap();
     let entries = fs.readdir(ROOT_INO).unwrap();
-    // Odd i's survive (i % 2 == 1).
-    let expected = n * it.div_ceil(2);
+    // Odd i's survive (i % 2 == 1). For it iterations (0..it), the count
+    // of odd i's is it / 2 (integer division), NOT div_ceil(2).
+    let expected = n * (it / 2);
     assert_eq!(entries.len(), expected, "surviving file count");
     for (name, ino, _) in entries {
         // Parse "t{tid}-f{i}" to reconstruct expected data.
