@@ -518,6 +518,9 @@ pub struct Fs {
     commits_since_checkpoint: u64,
     /// Bytes written by the last persist_bitmap (for benchmarking).
     last_bitmap_write_bytes: u64,
+    /// Blocks allocated in the current txg (not yet committed).
+    /// In-place overwrites are only safe for these blocks.
+    txg_allocated: std::collections::HashSet<u64>,
 }
 
 /// Name of the hidden file backing extended attributes.
@@ -579,6 +582,7 @@ impl Fs {
             xattrs: std::collections::HashMap::new(),
             commits_since_checkpoint: 0,
             last_bitmap_write_bytes: 0,
+            txg_allocated: std::collections::HashSet::new(),
         };
 
         let now = now_secs();
@@ -726,6 +730,7 @@ impl Fs {
             xattrs: std::collections::HashMap::new(),
             commits_since_checkpoint: 0,
             last_bitmap_write_bytes: 0,
+            txg_allocated: std::collections::HashSet::new(),
         };
         fs.rebuild_pinned()?;
         fs.rebuild_quota_usage()?;
@@ -1091,6 +1096,10 @@ impl Fs {
         self.check_fault(FaultPoint::AfterFlush)?;
         self.persist_bitmap(0)?; // area_start unused (delta bitmap)
         self.check_fault(FaultPoint::AfterBitmap)?;
+        // Blocks are now durable (will be after sync_txg); clear the set.
+        // Actually, clear after sync_txg to be safe. For now, clear here
+        // since commit_async is the persist point.
+        self.txg_allocated.clear();
         let mut t = self.txg.state.lock().unwrap();
         t.dirty = true;
         Ok(t.current)
@@ -1458,22 +1467,30 @@ impl Fs {
     // -- block helpers -----------------------------------------------------
 
     fn alloc_block(&mut self) -> Result<u64, FsError> {
-        self.shared
+        let blk = self
+            .shared
             .lock()
             .unwrap()
             .bitmap
             .alloc()
-            .ok_or(FsError::NoSpace)
+            .ok_or(FsError::NoSpace)?;
+        self.txg_allocated.insert(blk);
+        Ok(blk)
     }
 
     /// Allocate a block, preferring `hint` (for contiguous runs). Falls back
     /// to the cursor-based alloc if the hinted block is taken.
     fn alloc_block_hint(&mut self, hint: u64) -> Result<u64, FsError> {
-        let mut sh = self.shared.lock().unwrap();
-        if sh.bitmap.alloc_at(hint) {
-            return Ok(hint);
-        }
-        sh.bitmap.alloc().ok_or(FsError::NoSpace)
+        let blk = {
+            let mut sh = self.shared.lock().unwrap();
+            if sh.bitmap.alloc_at(hint) {
+                hint
+            } else {
+                sh.bitmap.alloc().ok_or(FsError::NoSpace)?
+            }
+        };
+        self.txg_allocated.insert(blk);
+        Ok(blk)
     }
 
     /// Free a data block. Deferred like metadata frees: the bitmap bit is
@@ -1908,29 +1925,58 @@ impl Fs {
             let n = (BLOCK_SIZE - in_blk).min(data.len() - pos);
             let key = ExtentKey { ino, off: blk_off };
             let old = self.extents.get(&key)?;
-            // Prefer contiguous allocation for sequential writes.
-            let new_blk = match last_blk {
-                Some(lb) => self.alloc_block_hint(lb + 1)?,
-                None => self.alloc_block()?,
+            // A3: in-place overwrite if the block was allocated in the current
+            // txg (not yet committed, so no crash-safety issue) and is not
+            // pinned by a snapshot. Otherwise CoW (allocate new).
+            match old {
+                Some(ext)
+                    if self.txg_allocated.contains(&ext.blk)
+                        && !self.snapshot_pinned.contains(&ext.blk) =>
+                {
+                    // In-place: reuse the block.
+                    let blk = ext.blk;
+                    let mut buf = [0u8; BLOCK_SIZE];
+                    self.read_block(blk, &mut buf)?;
+                    buf[in_blk..in_blk + n].copy_from_slice(&data[pos..pos + n]);
+                    self.write_block(blk, &buf)?;
+                    let cksum = checksum32(&buf);
+                    let new_ext = Extent {
+                        blk,
+                        len: ext.len,
+                        cksum,
+                    };
+                    self.extents.insert(key, new_ext)?;
+                    last_blk = Some(blk);
+                    pos += n;
+                    continue;
+                }
+                _ => {
+                    // CoW path.
+                    let new_blk = match last_blk {
+                        Some(lb) => self.alloc_block_hint(lb + 1)?,
+                        None => self.alloc_block()?,
+                    };
+                    last_blk = Some(new_blk);
+                    let mut buf = [0u8; BLOCK_SIZE];
+                    if let Some(ext) = old {
+                        self.read_block(ext.blk, &mut buf)?;
+                        self.free_block(ext.blk);
+                    }
+                    buf[in_blk..in_blk + n].copy_from_slice(&data[pos..pos + n]);
+                    self.write_block(new_blk, &buf)?;
+                    let cksum = checksum32(&buf);
+                    self.extents.insert(
+                        key,
+                        Extent {
+                            blk: new_blk,
+                            len: 1,
+                            cksum,
+                        },
+                    )?;
+                    pos += n;
+                    continue;
+                }
             };
-            last_blk = Some(new_blk);
-            let mut buf = [0u8; BLOCK_SIZE];
-            if let Some(ext) = old {
-                self.read_block(ext.blk, &mut buf)?;
-                self.free_block(ext.blk);
-            }
-            buf[in_blk..in_blk + n].copy_from_slice(&data[pos..pos + n]);
-            self.write_block(new_blk, &buf)?;
-            let cksum = checksum32(&buf);
-            self.extents.insert(
-                key,
-                Extent {
-                    blk: new_blk,
-                    len: 1,
-                    cksum,
-                },
-            )?;
-            pos += n;
         }
         let end = offset + data.len() as u64;
         let old_size = inode.size;
