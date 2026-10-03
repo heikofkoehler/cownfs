@@ -87,14 +87,14 @@ Some `FsError` variants may not have NFS mapping tests:
 
 ## Recommendations
 
-**P0 (fix now):**
-1. Add throttling integration test (NFS op → DELAY)
-2. Add slow-client regression test (would have caught the socket bug)
-3. Add metrics/health endpoint test
+**P0 (fixed):**
+1. ✅ Throttling integration test (NFS op → DELAY)
+2. ✅ Slow-client regression test (caught the socket bug)
+3. ✅ Metrics/health endpoint test
 
-**P1 (fix soon):**
-4. Add graceful shutdown test (subprocess + SIGTERM)
-5. Add lease renewal thread test
+**P1 (fixed):**
+4. ✅ Graceful shutdown test (subprocess + SIGTERM)
+5. ✅ Lease renewal thread test
 
 **P2 (backlog):**
 6. Audit log format test
