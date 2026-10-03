@@ -7,7 +7,7 @@
 
 ## 1. Overview
 
-`cownfs` provides automated, NetApp-style telescoping snapshot schedules directly within `cownfs-server`. Because snapshots in `cownfs` are $O(1)$ root pointer copies with copy-on-write (CoW) block sharing, creating scheduled snapshots incurs virtually zero I/O overhead and consumes storage only as data blocks diverge.
+`cownfs` provides automated, NetApp-style telescoping snapshot schedules directly within `cownfs-server`. Because snapshots in `cownfs` are O(1) root pointer copies with copy-on-write (CoW) block sharing, creating scheduled snapshots incurs virtually zero I/O overhead and consumes storage only as data blocks diverge.
 
 A **telescoping schedule** (often referred to as Grandfather-Father-Son retention) provides fine-grained recovery for recent hours while maintaining coarse-grained history for days, weeks, or months without linearly growing storage consumption.
 
@@ -30,7 +30,9 @@ cownfs-server --snapshot-policy <spec> <image> [addr]
 
 A policy is a comma-separated list of retention tiers:
 
-$$\text{spec} = \text{tier}[:\text{keep}][,\text{tier}[:\text{keep}]]\dots$$
+```text
+spec = tier[:keep][,tier[:keep]]...
+```
 
 - **`tier`**: One of the standard predefined intervals:
   - `hourly` — 3,600 seconds (1 hour)
@@ -81,7 +83,9 @@ $$\text{spec} = \text{tier}[:\text{keep}][,\text{tier}[:\text{keep}]]\dots$$
 
 Scheduled snapshots are automatically named according to their tier and UTC creation timestamp:
 
-$$\text{Name} = \text{tier}\text{-YYYYMMDD-HHMMSS}$$
+```text
+Name = {tier}-YYYYMMDD-HHMMSS
+```
 
 *Example names:*
 - `hourly-20261003-140000`
@@ -126,7 +130,7 @@ flowchart TD
 
 ### 4.1 Evaluation Algorithm
 1. **Periodic Tick:** Every 60 seconds, the scheduler thread wakes up and acquires the filesystem lock (`sched_shared.fs.lock()`).
-2. **Due Check:** For each configured tier, the scheduler locates the newest snapshot carrying the tier's prefix. If no snapshot exists or the elapsed time since the newest timestamp $\ge \text{interval\_secs}$, a snapshot is created.
+2. **Due Check:** For each configured tier, the scheduler locates the newest snapshot carrying the tier's prefix. If no snapshot exists or the elapsed time since the newest timestamp is at least `interval_secs`, a snapshot is created.
 3. **Collision Handling:** If a snapshot with the exact target timestamp name already exists, the creation is skipped (`SchedEvent::SkippedCollision`).
 4. **Pruning:** Snapshots for each tier are sorted by timestamp and ID. Any snapshot exceeding the configured `keep` count is pruned using `fs.snapshot_delete()`. Unparseable tier-prefixed names sort as oldest and rotate out first.
 5. **Atomic Commit:** If any snapshot was created or deleted, `fs.commit()` is executed immediately, persisting the new generation, updating root metadata, and queuing orphan blocks for space reclamation (see [garbage-collection.md](garbage-collection.md)).
