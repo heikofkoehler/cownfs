@@ -70,7 +70,6 @@ fn readdir_paged_large_dir() {
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     let mut cookie = 0u64;
     let mut pages = 0usize;
-    let mut last_eof = false;
     loop {
         let (entries, eof) = readdir_page(&mut c, &srv.uuid, ROOT_INO, cookie, MAXCOUNT);
         pages += 1;
@@ -78,13 +77,11 @@ fn readdir_paged_large_dir() {
         // maxcount=4096 fits only a handful per page).
         if entries.is_empty() {
             assert!(eof, "empty page must have eof=true");
-            last_eof = eof;
             break;
         }
         // eof must be false when we got entries but haven't seen all.
         // (We can't know it's non-final until we've seen all, so just
-        // record it; the final assertion checks the last page.)
-        last_eof = eof;
+        // continue; the empty-page branch above verifies final eof.)
         for (name, _cookie) in &entries {
             assert!(
                 seen.insert(name.clone()),
@@ -98,7 +95,6 @@ fn readdir_paged_large_dir() {
     }
 
     assert_eq!(seen.len(), NFILES, "missing files in readdir");
-    assert!(last_eof, "final page must have eof=true");
     assert!(
         pages > 1,
         "expected multiple pages with maxcount={MAXCOUNT}"
