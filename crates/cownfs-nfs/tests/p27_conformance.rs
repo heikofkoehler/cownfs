@@ -4,25 +4,28 @@
 mod common;
 
 use cownfs_core::engine::{Fs, ROOT_INO};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-fn test_fs() -> Fs {
+static IMG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn test_fs() -> (Fs, std::path::PathBuf) {
+    let n = IMG_COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir();
-    let img = dir.join(format!("cownfs-conf-{}.img", std::process::id()));
+    let img = dir.join(format!("cownfs-conf-{}-{n}.img", std::process::id()));
     let _ = std::fs::remove_file(&img);
-    Fs::format(&img, 256).unwrap()
+    (Fs::format(&img, 256).unwrap(), img)
 }
 
 #[test]
 fn corrupt_data_maps_to_io_error() {
     // FsError::Corrupt -> NFS4ERR_IO (not SERVERFAULT).
-    let mut fs = test_fs();
+    let (mut fs, img_path) = test_fs();
     let ino = fs.create(ROOT_INO, b"f", 0o644, 1000, 1000).unwrap();
     fs.write(ino, 0, &[0xABu8; 4096]).unwrap(); // full block
     fs.commit().unwrap();
     drop(fs);
 
     // Corrupt and verify via direct read.
-    let img_path = std::env::temp_dir().join(format!("cownfs-conf-{}.img", std::process::id()));
     let mut img_data = std::fs::read(&img_path).unwrap();
     for chunk in img_data.chunks_exact_mut(4096) {
         if chunk.iter().all(|&b| b == 0xAB) {
@@ -51,10 +54,11 @@ fn nospc_maps_correctly() {
 #[test]
 fn readdir_respects_maxcount() {
     // Large directory: READDIR with small maxcount returns partial.
-    let mut fs = test_fs();
+    let (mut fs, _img) = test_fs();
     for i in 0..100 {
         let name = format!("file{i:03}");
-        fs.create(ROOT_INO, name.as_bytes(), 0o644, 1000, 1000).unwrap();
+        fs.create(ROOT_INO, name.as_bytes(), 0o644, 1000, 1000)
+            .unwrap();
     }
     fs.commit().unwrap();
 
@@ -64,7 +68,7 @@ fn readdir_respects_maxcount() {
 
 #[test]
 fn empty_read_returns_empty() {
-    let mut fs = test_fs();
+    let (mut fs, _img) = test_fs();
     let ino = fs.create(ROOT_INO, b"empty", 0o644, 1000, 1000).unwrap();
     fs.commit().unwrap();
 
@@ -80,7 +84,7 @@ fn empty_read_returns_empty() {
 #[test]
 fn write_at_offset_creates_hole() {
     // Writing at an offset beyond EOF creates a sparse hole.
-    let mut fs = test_fs();
+    let (mut fs, _img) = test_fs();
     let ino = fs.create(ROOT_INO, b"sparse", 0o644, 1000, 1000).unwrap();
     fs.write(ino, 8192, b"data").unwrap();
     fs.commit().unwrap();
