@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 cownfs-core = { path = "../cownfs-core" }
+signal-hook = "0.3"

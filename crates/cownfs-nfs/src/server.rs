@@ -1817,19 +1817,77 @@ pub fn serve_listener(listener: TcpListener, shared: &Shared) -> Result<(), Serv
 
 /// Run the server on an already-bound `listener`, spawning one thread per
 /// connection. Filesystem and NFSv4 state are shared across connections.
-/// Returns when the listener errors.
+/// Handles SIGTERM/SIGINT gracefully: stops accepting, drains connections
+/// (30s timeout), commits, then returns.
 pub fn serve_concurrent(listener: TcpListener, shared: Shared) -> Result<(), ServerError> {
-    for stream in listener.incoming() {
-        match stream {
-            Ok(s) => {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let active = std::sync::Arc::new(AtomicUsize::new(0));
+    let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+
+    // Signal handler.
+    unsafe {
+        let shutdown_sig = shutdown.clone();
+        signal_hook::low_level::register(signal_hook::consts::SIGTERM, move || {
+            shutdown_sig.store(true, Ordering::Relaxed);
+        })
+        .unwrap();
+        let shutdown_sig = shutdown.clone();
+        signal_hook::low_level::register(signal_hook::consts::SIGINT, move || {
+            shutdown_sig.store(true, Ordering::Relaxed);
+        })
+        .unwrap();
+    }
+
+    listener.set_nonblocking(true).map_err(ServerError::Io)?;
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            eprintln!("shutdown signal received, draining...");
+            break;
+        }
+        match listener.accept() {
+            Ok((s, _)) => {
                 let shared = shared.clone();
+                let active = active.clone();
+                // Connection limit: refuse if too many active.
+                if active.load(Ordering::Relaxed) >= 1000 {
+                    eprintln!("connection limit reached, refusing");
+                    continue;
+                }
+                active.fetch_add(1, Ordering::Relaxed);
                 std::thread::spawn(move || {
+                    // Set read timeout: idle connections are closed.
+                    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(300)));
                     let _ = serve_connection(s, &shared);
+                    active.fetch_sub(1, Ordering::Relaxed);
                 });
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(e) => return Err(ServerError::Io(e)),
         }
     }
+
+    // Drain active connections (30s timeout).
+    let start = std::time::Instant::now();
+    while active.load(Ordering::Relaxed) > 0 {
+        if start.elapsed().as_secs() > 30 {
+            eprintln!("shutdown: timeout waiting for connections");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Commit before exiting.
+    if let Ok(mut fs) = shared.fs.lock() {
+        if let Err(e) = fs.commit() {
+            eprintln!("shutdown: commit failed: {e:?}");
+        } else {
+            eprintln!("shutdown: committed");
+        }
+    }
+    eprintln!("shutdown complete");
     Ok(())
 }
 
