@@ -5,6 +5,7 @@
 
 pub mod layouts;
 pub mod nfs4;
+pub mod referrals;
 pub mod rpc;
 pub mod server;
 pub mod sessions;

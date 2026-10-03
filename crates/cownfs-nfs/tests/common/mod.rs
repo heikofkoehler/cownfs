@@ -49,6 +49,12 @@ pub struct TestServer {
 /// before the serving thread spawns, so `NfsClient::connect` cannot race the
 /// bind. The image file is removed when the server is dropped.
 pub fn spawn_server(blocks: u64) -> TestServer {
+    spawn_server_with_referrals(blocks, std::path::Path::new("/dev/null"))
+}
+
+/// Spawn a server with a referral table loaded from `conf`.
+/// If `conf` does not exist or is empty, referrals are disabled.
+pub fn spawn_server_with_referrals(blocks: u64, conf: &std::path::Path) -> TestServer {
     let n = IMG_COUNTER.fetch_add(1, Ordering::SeqCst);
     let img = std::env::temp_dir().join(format!("cownfs-it-{}-{n}.img", std::process::id()));
     let _ = std::fs::remove_file(&img);
@@ -57,12 +63,14 @@ pub fn spawn_server(blocks: u64) -> TestServer {
     let uuid = fs.uuid();
     drop(fs);
 
+    let table = cownfs_nfs::referrals::ReferralTable::load(conf).unwrap_or_default();
+
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
     let addr = listener.local_addr().expect("listener local addr");
     let img2 = img.clone();
     std::thread::spawn(move || {
         let fs = Fs::open(&img2).expect("open test image");
-        let shared = cownfs_nfs::server::Shared::new(fs);
+        let shared = cownfs_nfs::server::Shared::new(fs).with_referrals(table);
         let _ = cownfs_nfs::server::serve_listener(listener, &shared);
     });
     TestServer {

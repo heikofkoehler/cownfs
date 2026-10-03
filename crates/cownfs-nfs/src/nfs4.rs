@@ -31,6 +31,7 @@ pub const NFS4ERR_LOCKED: u32 = 10012;
 pub const NFS4ERR_DENIED: u32 = 10010;
 pub const NFS4ERR_BAD_SEQID: u32 = 10026;
 pub const NFS4ERR_STALE: u32 = 70;
+pub const NFS4ERR_MOVED: u32 = 87;
 pub const NFS4ERR_STALE_CLIENTID: u32 = 10022;
 pub const NFS4ERR_OP_ILLEGAL: u32 = 10044;
 // NFSv4.1 session errors (RFC 5661 §18).
@@ -122,6 +123,7 @@ pub const FATTR4_TIME_ACCESS: u32 = 47;
 pub const FATTR4_TIME_METADATA: u32 = 52;
 pub const FATTR4_TIME_MODIFY: u32 = 53;
 pub const FATTR4_MOUNTED_ON_FILEID: u32 = 55;
+pub const FATTR4_FS_LOCATIONS: u32 = 32;
 
 // File types.
 pub const NF4REG: u32 = 1;
@@ -532,6 +534,24 @@ fn skip_attr_value(br: &mut Reader, attr: u32) -> Result<(), NfsError> {
         FATTR4_TIME_ACCESS | FATTR4_TIME_METADATA | FATTR4_TIME_MODIFY => {
             br.i64()?;
             br.u32()?;
+        }
+        FATTR4_FS_LOCATIONS => {
+            // fs_locations4: fl_root (pathname4) + locations<>
+            let ncomps = br.u32()?;
+            for _ in 0..ncomps {
+                br.string()?;
+            }
+            let nlocs = br.u32()?;
+            for _ in 0..nlocs {
+                let nservers = br.u32()?;
+                for _ in 0..nservers {
+                    br.string()?;
+                }
+                let npath = br.u32()?;
+                for _ in 0..npath {
+                    br.string()?;
+                }
+            }
         }
         _ => return Err(NfsError::Xdr(XdrError::Invalid("unsupported attr"))),
     }
@@ -1031,6 +1051,9 @@ pub struct FileAttrs {
     pub space_free: u64,
     pub files_total: u64,
     pub files_free: u64,
+    /// fs_locations for referrals (None = not a referral).
+    /// Encoded as fs_locations4: root (empty) + list of (server, path).
+    pub fs_locations: Option<Vec<(String, String)>>,
 }
 
 impl AttrValues {
@@ -1084,6 +1107,7 @@ impl AttrValues {
             FATTR4_TIME_METADATA,
             FATTR4_TIME_MODIFY,
             FATTR4_MOUNTED_ON_FILEID,
+            FATTR4_FS_LOCATIONS,
         ];
         // Pre-build supported_attrs bitmap4 (2 words covers attrs 0-63).
         let mut sup_words = [0u32; 2];
@@ -1281,6 +1305,27 @@ impl AttrValues {
         if requested.wants(FATTR4_MOUNTED_ON_FILEID) {
             set(FATTR4_MOUNTED_ON_FILEID, &mut |w| w.u64(a.fileid));
         }
+        // 32 — FS_LOCATIONS (referrals)
+        if requested.wants(FATTR4_FS_LOCATIONS) {
+            if let Some(locs) = &a.fs_locations {
+                set(FATTR4_FS_LOCATIONS, &mut |w| {
+                    // fs_locations4: fl_root (pathname4, empty) + locations<>
+                    w.u32(0); // fl_root: empty path
+                    w.u32(locs.len() as u32);
+                    for (server, path) in locs {
+                        // fs_location4: server<> + rootpath<>
+                        w.u32(1);
+                        w.string(server.as_bytes());
+                        // rootpath: pathname4 (list of components)
+                        let comps: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+                        w.u32(comps.len() as u32);
+                        for c in comps {
+                            w.string(c.as_bytes());
+                        }
+                    }
+                });
+            }
+        }
 
         AttrValues {
             mask: out_mask,
@@ -1416,6 +1461,7 @@ mod tests {
             space_free: 32 * 1024 * 1024,
             files_total: 4096,
             files_free: 2048,
+            fs_locations: None,
         }
     }
 

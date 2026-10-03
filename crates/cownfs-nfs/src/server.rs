@@ -14,8 +14,8 @@ use crate::nfs4::{
     ACCESS4_READ, FATTR4_MODE, FATTR4_SIZE, FILE_SYNC4, GUARDED4, LAYOUT4_NFSV4_1_FILES, NF4DIR,
     NF4LNK, NF4REG, NFS4ERR_BADNAME, NFS4ERR_BADSESSION, NFS4ERR_BADSLOT, NFS4ERR_BADTYPE,
     NFS4ERR_BADXDR, NFS4ERR_BAD_COOKIE, NFS4ERR_EXIST, NFS4ERR_EXPIRED, NFS4ERR_INVAL,
-    NFS4ERR_ISDIR, NFS4ERR_NAMETOOLONG, NFS4ERR_NOENT, NFS4ERR_NOFILEHANDLE, NFS4ERR_NOTDIR,
-    NFS4ERR_NOTSUPP, NFS4ERR_OP_ILLEGAL, NFS4ERR_RECALLCONFLICT, NFS4ERR_ROFS,
+    NFS4ERR_ISDIR, NFS4ERR_MOVED, NFS4ERR_NAMETOOLONG, NFS4ERR_NOENT, NFS4ERR_NOFILEHANDLE,
+    NFS4ERR_NOTDIR, NFS4ERR_NOTSUPP, NFS4ERR_OP_ILLEGAL, NFS4ERR_RECALLCONFLICT, NFS4ERR_ROFS,
     NFS4ERR_SEQ_MISORDERED, NFS4ERR_SERVERFAULT, NFS4ERR_STALE, NFS4ERR_STALE_CLIENTID,
     NFS4ERR_TOOSMALL, NFS4_OK, OPEN4_CREATE, OP_ACCESS, OP_CLOSE, OP_COMMIT, OP_CREATE,
     OP_CREATE_SESSION, OP_DESTROY_CLIENTID, OP_DESTROY_SESSION, OP_EXCHANGE_ID, OP_GETATTR,
@@ -109,6 +109,9 @@ pub struct Shared {
     pub ds_addr: Option<String>,
     /// When true, mutating ops return NFS4ERR_ROFS. Used for read replicas.
     pub read_only: bool,
+    /// NFSv4.0 referral table: directory inode -> list of targets.
+    /// Empty disables referrals.
+    pub referrals: Arc<crate::referrals::ReferralTable>,
 }
 
 impl Shared {
@@ -120,6 +123,7 @@ impl Shared {
             layouts: Arc::new(Mutex::new(crate::layouts::LayoutTable::new())),
             ds_addr: None,
             read_only: false,
+            referrals: Arc::new(crate::referrals::ReferralTable::new()),
         }
     }
 
@@ -131,12 +135,19 @@ impl Shared {
             layouts: Arc::new(Mutex::new(crate::layouts::LayoutTable::new())),
             ds_addr: None,
             read_only: true,
+            referrals: Arc::new(crate::referrals::ReferralTable::new()),
         }
     }
 
     /// Attach a data server address, enabling pNFS layouts.
     pub fn with_ds_addr(mut self, addr: String) -> Self {
         self.ds_addr = Some(addr);
+        self
+    }
+
+    /// Attach a referral table, enabling NFSv4.0 referrals.
+    pub fn with_referrals(mut self, table: crate::referrals::ReferralTable) -> Self {
+        self.referrals = Arc::new(table);
         self
     }
 }
@@ -813,6 +824,14 @@ impl Session {
         };
         match result {
             Ok(Some((child, _))) => {
+                // Referral: if the child is a referral directory, return
+                // MOVED. The client will fetch fs_locations via GETATTR
+                // and transparently follow to the target server.
+                if self.shared.referrals.lookup(child).is_some() {
+                    // Set cfh to the referral dir so GETATTR works.
+                    self.cfh = Some(child);
+                    return OpResult::err(opnum, NFS4ERR_MOVED);
+                }
                 self.cfh = Some(child);
                 OpResult::ok(opnum, Vec::new())
             }
@@ -887,6 +906,19 @@ impl Session {
             // Rough inode estimates: 1 inode per 16 KiB (4 blocks) used.
             files_total: total_blocks / 4,
             files_free: free_blocks / 4,
+            fs_locations: self.shared.referrals.lookup(ino).map(|targets| {
+                targets
+                    .iter()
+                    .map(|t| {
+                        let server = if t.port == 2049 {
+                            t.server.clone()
+                        } else {
+                            format!("{}:{}", t.server, t.port)
+                        };
+                        (server, t.path.clone())
+                    })
+                    .collect()
+            }),
         }
     }
 

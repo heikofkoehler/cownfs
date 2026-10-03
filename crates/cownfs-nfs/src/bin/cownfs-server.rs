@@ -7,7 +7,7 @@ use cownfs_nfs::server;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: cownfs-server [--read-only] [--ds-addr <addr>] <image> [addr]");
+        eprintln!("usage: cownfs-server [--read-only] [--ds-addr <addr>] [--referrals <file>] <image> [addr]");
         std::process::exit(1);
     }
     let read_only = args.iter().any(|a| a == "--read-only");
@@ -16,14 +16,19 @@ fn main() {
         .position(|a| a == "--ds-addr")
         .and_then(|i| args.get(i + 1))
         .cloned();
+    let referrals_file = args
+        .iter()
+        .position(|a| a == "--referrals")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
     let positional: Vec<&String> = args[1..]
         .iter()
-        .filter(|a| *a != "--read-only" && *a != "--ds-addr")
+        .filter(|a| *a != "--read-only" && *a != "--ds-addr" && *a != "--referrals")
         .collect();
-    // Remove the ds-addr value from positionals.
+    // Remove the ds-addr and referrals values from positionals.
     let positional: Vec<&String> = positional
         .into_iter()
-        .filter(|a| Some(*a) != ds_addr.as_ref())
+        .filter(|a| Some(*a) != ds_addr.as_ref() && Some(*a) != referrals_file.as_ref())
         .collect();
     let addr = positional
         .get(1)
@@ -47,6 +52,15 @@ fn main() {
     };
     let shared = match ds_addr {
         Some(a) => shared.with_ds_addr(a),
+        None => shared,
+    };
+    let shared = match referrals_file {
+        Some(f) => {
+            let table = cownfs_nfs::referrals::ReferralTable::load(std::path::Path::new(&f))
+                .expect("load referrals");
+            eprintln!("loaded referrals from {f}");
+            shared.with_referrals(table)
+        }
         None => shared,
     };
     if let Err(e) = server::serve(&addr, shared) {
