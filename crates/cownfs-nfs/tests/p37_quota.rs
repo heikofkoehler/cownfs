@@ -3,7 +3,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{create_file, establish_client, spawn_server_with_quotas, NfsClient, Ops, Reply};
+use common::{create_file, establish_client, spawn_server_with_quotas, NfsClient, Ops};
 use cownfs_core::engine::{Fs, ROOT_INO};
 use cownfs_nfs::nfs4::*;
 use std::sync::atomic::{AtomicU64, Ordering};

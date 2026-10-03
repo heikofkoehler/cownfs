@@ -4,7 +4,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use cownfs_core::engine::{Fs, FsError, FTYPE_DIR, FTYPE_SYMLINK, ROOT_INO};
 
@@ -104,7 +104,7 @@ fn fs_to_nfs(e: FsError) -> u32 {
 /// `cfh`/`saved_fh` stay per-connection inside [`Session`].
 #[derive(Clone)]
 pub struct Shared {
-    pub fs: Arc<Mutex<Fs>>,
+    pub fs: Arc<RwLock<Fs>>,
     pub state: Arc<Mutex<StateManager>>,
     /// NFSv4.1 client/session/slot table (exactly-once semantics).
     pub sessions: Arc<Mutex<crate::sessions::SessionTable>>,
@@ -131,7 +131,7 @@ pub struct Shared {
 impl Shared {
     pub fn new(fs: Fs) -> Self {
         let txg = fs.txg();
-        let fs = Arc::new(Mutex::new(fs));
+        let fs = Arc::new(RwLock::new(fs));
         let txg_interval_ms = Arc::new(std::sync::atomic::AtomicU64::new(100));
         // Background txg sync thread. Uses a Weak so it exits when the
         // last Shared clone is dropped. Required: FILE_SYNC4 waits on the
@@ -144,7 +144,7 @@ impl Shared {
             ));
             match weak_fs.upgrade() {
                 Some(fs) => {
-                    if let Ok(mut f) = fs.lock() {
+                    if let Ok(mut f) = fs.write() {
                         let _ = f.sync_txg();
                     }
                 }
@@ -178,7 +178,7 @@ impl Shared {
     pub fn new_read_only(fs: Fs) -> Self {
         let txg = fs.txg();
         Shared {
-            fs: Arc::new(Mutex::new(fs)),
+            fs: Arc::new(RwLock::new(fs)),
             txg,
             txg_interval_ms: Arc::new(std::sync::atomic::AtomicU64::new(100)),
             state: Arc::new(Mutex::new(StateManager::new())),
@@ -250,8 +250,12 @@ impl Session {
     /// temporary `MutexGuard` that is the receiver of a method call lives
     /// until the end of the enclosing expression, so the second `self.fs()`
     /// deadlocks the thread on itself. Bind each call to a local first.
-    fn fs(&self) -> std::sync::MutexGuard<'_, Fs> {
-        self.shared.fs.lock().unwrap()
+    fn fs(&self) -> std::sync::RwLockReadGuard<'_, Fs> {
+        self.shared.fs.read().unwrap()
+    }
+
+    fn fs_mut(&self) -> std::sync::RwLockWriteGuard<'_, Fs> {
+        self.shared.fs.write().unwrap()
     }
 
     /// Validate a filename: must be valid UTF-8 (pynfs expects NFS4ERR_INVAL
@@ -923,7 +927,7 @@ impl Session {
         }
         // Verify each block from the DS and write it into the CoW file.
         // Blocks are in offset order, 4KiB each.
-        let mut fs = self.shared.fs.lock().unwrap();
+        let mut fs = self.shared.fs.write().unwrap();
         for (i, (block_id, expect_sum)) in blocks.iter().enumerate() {
             let (data, ds_sum) = match Self::ds_read_block(&ds_addr, *block_id) {
                 Ok(x) => x,
@@ -1566,7 +1570,7 @@ impl Session {
                     Ok(v) => v,
                     Err(s) => return OpResult::err(OP_OPEN, s),
                 };
-                match self.fs().create(dir_ino, filename, mode, uid, gid) {
+                match self.fs_mut().create(dir_ino, filename, mode, uid, gid) {
                     Ok(ino) => ino,
                     Err(e) => return OpResult::err(OP_OPEN, fs_to_nfs(e)),
                 }
@@ -1638,13 +1642,13 @@ impl Session {
             Err(s) => return OpResult::err(OP_CREATE, s),
         };
         let result = match ftype {
-            NF4DIR => self.fs().mkdir(dir_ino, name, mode, uid, gid).map(|_| ()),
+            NF4DIR => self.fs_mut().mkdir(dir_ino, name, mode, uid, gid).map(|_| ()),
             NF4LNK => {
                 // Empty symlink target is invalid (pynfs CR9a).
                 if linkdata.is_empty() {
                     return OpResult::err(OP_CREATE, NFS4ERR_INVAL);
                 }
-                self.fs()
+                self.fs_mut()
                     .symlink(dir_ino, name, linkdata, uid, gid)
                     .map(|_| ())
             }
@@ -1693,9 +1697,9 @@ impl Session {
             eprintln!("recalled {recalled} layouts for ino {ino} (REMOVE)");
         }
         let result = if ent == FTYPE_DIR {
-            self.fs().rmdir(dir_ino, name)
+            self.fs_mut().rmdir(dir_ino, name)
         } else {
-            self.fs().unlink(dir_ino, name)
+            self.fs_mut().unlink(dir_ino, name)
         };
         match result {
             Ok(()) => {
@@ -1751,7 +1755,7 @@ impl Session {
             Some(_) => return OpResult::err(OP_RENAME, NFS4ERR_ROFS),
             None => src_dir,
         };
-        match self.fs().rename(src_dir, old, dst_dir, new) {
+        match self.fs_mut().rename(src_dir, old, dst_dir, new) {
             Ok(()) => {
                 let mut w = Writer::new();
                 // change_info4 x2: bool(atomic) + u64(before) + u64(after) [RFC 7530 §16.15]
@@ -1784,7 +1788,7 @@ impl Session {
             Some(_) => return OpResult::err(OP_LINK, NFS4ERR_ROFS),
             None => return OpResult::err(OP_LINK, NFS4ERR_NOFILEHANDLE),
         };
-        match self.fs().link(file_ino, dir_ino, name) {
+        match self.fs_mut().link(file_ino, dir_ino, name) {
             Ok(()) => {
                 let mut w = Writer::new();
                 // change_info4: bool(atomic) + u64(before) + u64(after) [RFC 7530 §16.11]
@@ -1859,7 +1863,7 @@ impl Session {
                 _ => return OpResult::err(OP_SETATTR, NFS4ERR_NOTSUPP),
             }
         }
-        match self.fs().setattr(ino, &sa) {
+        match self.fs_mut().setattr(ino, &sa) {
             Ok(()) => {
                 let mut w = Writer::new();
                 // attrset: which attrs were set
@@ -1883,21 +1887,21 @@ impl Session {
             Ok(i) => i,
             Err(r) => return r,
         };
-        if let Err(e) = self.fs().write(ino, offset, data) {
+        if let Err(e) = self.fs_mut().write(ino, offset, data) {
             return OpResult::err(OP_WRITE, fs_to_nfs(e));
         }
         // Transaction groups: stage the write, then handle stability.
         // FILE_SYNC4 waits for the open txg to sync (coalescing many
         // concurrent sync writes onto one fsync); UNSTABLE just stages.
         let committed = if stable == FILE_SYNC4 {
-            let txg = match self.fs().commit_async() {
+            let txg = match self.fs_mut().commit_async() {
                 Ok(t) => t,
                 Err(e) => return OpResult::err(OP_WRITE, fs_to_nfs(e)),
             };
             self.shared.txg.wait(txg);
             FILE_SYNC4
         } else {
-            match self.fs().commit_async() {
+            match self.fs_mut().commit_async() {
                 Ok(_) => stable,
                 Err(e) => return OpResult::err(OP_WRITE, fs_to_nfs(e)),
             }
@@ -1911,7 +1915,7 @@ impl Session {
     }
 
     fn op_commit(&mut self, _offset: u64, _count: u32) -> OpResult {
-        match self.fs().commit() {
+        match self.fs_mut().commit() {
             Ok(()) => {
                 let mut w = Writer::new();
                 w.opaque_fixed(&[0u8; 8]); // verifier
@@ -2376,7 +2380,7 @@ pub fn serve_concurrent(listener: TcpListener, shared: Shared) -> Result<(), Ser
     }
 
     // Commit before exiting.
-    if let Ok(mut fs) = shared.fs.lock() {
+    if let Ok(mut fs) = shared.fs.write() {
         if let Err(e) = fs.commit() {
             eprintln!("shutdown: commit failed: {e:?}");
         } else {

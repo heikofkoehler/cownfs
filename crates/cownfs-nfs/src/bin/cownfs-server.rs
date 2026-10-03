@@ -224,7 +224,7 @@ fn main() {
                             let now = std::time::SystemTime::now();
                             // Hold the fs lock across schedule + commit so no
                             // NFS op interleaves between them.
-                            let mut fs = sched_shared.fs.lock().unwrap();
+                            let mut fs = sched_shared.fs.write().unwrap();
                             let events = match policy.run_once(&mut fs, now) {
                                 Ok(ev) => ev,
                                 Err(e) => {
