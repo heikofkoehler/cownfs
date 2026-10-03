@@ -58,6 +58,11 @@ pub struct Superblock {
     // Allocators.
     pub next_inode: u64,
     pub next_snap: u64,
+    /// Leader lease: node ID of current holder (UTF-8, NUL-padded).
+    /// Empty (all zeros) = no lease.
+    pub lease_holder: [u8; 32],
+    /// Unix timestamp when the lease expires. 0 = no lease.
+    pub lease_expiry: u64,
 }
 
 impl Superblock {
@@ -85,6 +90,8 @@ impl Superblock {
         hdr[160..168].copy_from_slice(&self.snap_len.to_le_bytes());
         hdr[168..176].copy_from_slice(&self.next_inode.to_le_bytes());
         hdr[176..184].copy_from_slice(&self.next_snap.to_le_bytes());
+        hdr[192..224].copy_from_slice(&self.lease_holder);
+        hdr[224..232].copy_from_slice(&self.lease_expiry.to_le_bytes());
         // Checksum covers the header with the checksum field zeroed.
         let sum = checksum(&hdr);
         hdr[OFF_CHECKSUM..OFF_CHECKSUM + 8].copy_from_slice(&sum.to_le_bytes());
@@ -133,6 +140,8 @@ impl Superblock {
             snap_len: u64_at(160)?,
             next_inode: u64_at(168)?,
             next_snap: u64_at(176)?,
+            lease_holder: hdr[192..224].try_into().ok()?,
+            lease_expiry: u64_at(224)?,
         })
     }
 
@@ -163,6 +172,8 @@ impl Superblock {
             snap_len: 0,
             next_inode: 0,
             next_snap: 0,
+            lease_holder: [0u8; 32],
+            lease_expiry: 0,
         }
     }
 }

@@ -1605,6 +1605,80 @@ impl Fs {
         let key = DirKey::new(parent, name)?;
         Ok(dirs.get(&key)?.map(|e| (e.ino, e.typ)))
     }
+
+    // ---- Leader lease (P0: fencing) ----
+    //
+    // Only one node may hold the write lease at a time. The lease is
+    // stored in the superblock (lease_holder + lease_expiry).
+
+    /// Try to acquire the write lease. Returns true if acquired.
+    /// Returns false if another node holds a live lease.
+    pub fn lease_acquire(&mut self, node_id: &str, ttl_secs: u64) -> Result<bool, FsError> {
+        let mut sh = self.shared.lock().unwrap();
+        let (sb, _) = superblock::open(&sh.dev).map_err(|e| FsError::Invalid(format!("{e}")))?;
+        let now = now_secs();
+
+        let holder_empty = sb.lease_holder.iter().all(|&b| b == 0);
+        let expired = sb.lease_expiry <= now;
+        let holder = lease_holder_name(&sb);
+
+        if !holder_empty && !expired && holder != node_id {
+            return Ok(false);
+        }
+
+        let mut sb = sb;
+        sb.lease_holder = lease_node_id_bytes(node_id);
+        sb.lease_expiry = now + ttl_secs;
+        superblock::write_slots(&mut sh.dev, &sb).map_err(|e| FsError::Invalid(format!("{e}")))?;
+        Ok(true)
+    }
+
+    /// Renew the lease. Returns true if renewed, false if we lost it.
+    pub fn lease_renew(&mut self, node_id: &str, ttl_secs: u64) -> Result<bool, FsError> {
+        let mut sh = self.shared.lock().unwrap();
+        let (sb, _) = superblock::open(&sh.dev).map_err(|e| FsError::Invalid(format!("{e}")))?;
+        if lease_holder_name(&sb) != node_id {
+            return Ok(false);
+        }
+        let mut sb = sb;
+        sb.lease_expiry = now_secs() + ttl_secs;
+        superblock::write_slots(&mut sh.dev, &sb).map_err(|e| FsError::Invalid(format!("{e}")))?;
+        Ok(true)
+    }
+
+    /// Check if we still hold the lease (without renewing).
+    pub fn lease_check(&self, node_id: &str) -> Result<bool, FsError> {
+        let sh = self.shared.lock().unwrap();
+        let (sb, _) = superblock::open(&sh.dev).map_err(|e| FsError::Invalid(format!("{e}")))?;
+        Ok(lease_holder_name(&sb) == node_id && sb.lease_expiry > now_secs())
+    }
+
+    /// Voluntarily release the lease.
+    pub fn lease_release(&mut self, node_id: &str) -> Result<(), FsError> {
+        let mut sh = self.shared.lock().unwrap();
+        let (sb, _) = superblock::open(&sh.dev).map_err(|e| FsError::Invalid(format!("{e}")))?;
+        if lease_holder_name(&sb) == node_id {
+            let mut sb = sb;
+            sb.lease_holder = [0u8; 32];
+            sb.lease_expiry = 0;
+            superblock::write_slots(&mut sh.dev, &sb).map_err(|e| FsError::Invalid(format!("{e}")))?;
+        }
+        Ok(())
+    }
+}
+
+fn lease_node_id_bytes(node_id: &str) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    let src = node_id.as_bytes();
+    let n = src.len().min(32);
+    b[..n].copy_from_slice(&src[..n]);
+    b
+}
+
+fn lease_holder_name(sb: &superblock::Superblock) -> String {
+    String::from_utf8_lossy(&sb.lease_holder)
+        .trim_end_matches('\0')
+        .to_string()
 }
 
 #[cfg(test)]

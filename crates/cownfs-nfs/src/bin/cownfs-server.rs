@@ -7,7 +7,7 @@ use cownfs_nfs::server;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: cownfs-server [--read-only] [--ds-addr <addr>] [--referrals <file>] <image> [addr]");
+        eprintln!("usage: cownfs-server [--read-only] [--ds-addr <addr>] [--referrals <file>] [--node-id <id>] [--lease-ttl <secs>] <image> [addr]");
         std::process::exit(1);
     }
     let read_only = args.iter().any(|a| a == "--read-only");
@@ -21,21 +21,94 @@ fn main() {
         .position(|a| a == "--referrals")
         .and_then(|i| args.get(i + 1))
         .cloned();
+    let node_id = args
+        .iter()
+        .position(|a| a == "--node-id")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let lease_ttl: u64 = args
+        .iter()
+        .position(|a| a == "--lease-ttl")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
     let positional: Vec<&String> = args[1..]
         .iter()
-        .filter(|a| *a != "--read-only" && *a != "--ds-addr" && *a != "--referrals")
+        .filter(|a| {
+            *a != "--read-only"
+                && *a != "--ds-addr"
+                && *a != "--referrals"
+                && *a != "--node-id"
+                && *a != "--lease-ttl"
+        })
         .collect();
-    // Remove the ds-addr and referrals values from positionals.
+    // Remove the option values from positionals.
     let positional: Vec<&String> = positional
         .into_iter()
-        .filter(|a| Some(*a) != ds_addr.as_ref() && Some(*a) != referrals_file.as_ref())
+        .filter(|a| {
+            Some(*a) != ds_addr.as_ref()
+                && Some(*a) != referrals_file.as_ref()
+                && Some(*a) != node_id.as_ref()
+                && Some(*a) != args
+                    .iter()
+                    .position(|a| a == "--lease-ttl")
+                    .and_then(|i| args.get(i + 1))
+        })
         .collect();
     let addr = positional
         .get(1)
         .cloned()
         .cloned()
         .unwrap_or_else(|| "127.0.0.1:2049".into());
-    let fs = Fs::open(std::path::Path::new(positional[0])).expect("open image");
+    let mut fs = Fs::open(std::path::Path::new(positional[0])).expect("open image");
+
+    // Leader lease: acquire on startup if --node-id is given (and not read-only).
+    // The lease prevents split-brain: two primaries cannot both hold it.
+    if let Some(ref nid) = node_id {
+        if read_only {
+            eprintln!("warning: --node-id ignored in read-only mode");
+        } else {
+            match fs.lease_acquire(nid, lease_ttl) {
+                Ok(true) => eprintln!("acquired write lease as '{nid}' (ttl {lease_ttl}s)"),
+                Ok(false) => {
+                    eprintln!("error: write lease held by another node; refusing to start");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("error acquiring lease: {e:?}");
+                    std::process::exit(1);
+                }
+            }
+            // Background renewal. If we lose the lease, fence ourselves.
+            let image_path = positional[0].clone();
+            let nid_clone = nid.clone();
+            std::thread::spawn(move || {
+                let renew_interval = std::time::Duration::from_secs((lease_ttl / 3).max(1));
+                loop {
+                    std::thread::sleep(renew_interval);
+                    let mut fs = match Fs::open(std::path::Path::new(&image_path)) {
+                        Ok(fs) => fs,
+                        Err(e) => {
+                            eprintln!("lease renew: failed to open image: {e:?}; fencing");
+                            std::process::exit(1);
+                        }
+                    };
+                    match fs.lease_renew(&nid_clone, lease_ttl) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            eprintln!("lease lost to another node; fencing (exiting)");
+                            std::process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("lease renew failed: {e:?}; fencing");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     eprintln!(
         "serving {} on {addr}{}{}",
         positional[0],
