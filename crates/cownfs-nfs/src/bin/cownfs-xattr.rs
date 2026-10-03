@@ -64,9 +64,7 @@ fn do_get(image: &Path, path: &str, name: &str) -> Result<(), String> {
 fn do_list(image: &Path, path: &str) -> Result<(), String> {
     let fs = Fs::open(image).map_err(|e| format!("open: {e:?}"))?;
     let ino = resolve(&fs, path)?;
-    let names = fs
-        .listxattrs(ino)
-        .map_err(|e| format!("list: {e:?}"))?;
+    let names = fs.listxattrs(ino).map_err(|e| format!("list: {e:?}"))?;
     for n in names {
         println!("{}", String::from_utf8_lossy(&n));
     }

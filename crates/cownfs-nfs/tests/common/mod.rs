@@ -120,8 +120,7 @@ fn spawn_concurrent_server_inner(blocks: u64, read_only: bool) -> TestServer {
         } else {
             cownfs_nfs::server::Shared::new(fs)
         };
-        if !read_only {
-            }
+        if !read_only {}
         let _ = cownfs_nfs::server::serve_concurrent(listener, shared);
     });
     TestServer {
@@ -162,10 +161,7 @@ pub fn spawn_server_on(img: &std::path::Path) -> TestServer {
 
 /// Serve an existing image file with per-UID quotas set.
 /// Quotas are (uid, max_blocks) pairs.
-pub fn spawn_server_with_quotas(
-    img: &std::path::Path,
-    quotas: &[(u32, u64)],
-) -> TestServer {
+pub fn spawn_server_with_quotas(img: &std::path::Path, quotas: &[(u32, u64)]) -> TestServer {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
     let addr = listener.local_addr().expect("listener local addr");
     let img2 = img.to_path_buf();

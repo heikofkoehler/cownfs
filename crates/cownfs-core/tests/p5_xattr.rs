@@ -23,7 +23,10 @@ fn set_get_list_remove() {
 
     // Set and get.
     fs.setxattr(ino, b"user.tag", b"hello").unwrap();
-    assert_eq!(fs.getxattr(ino, b"user.tag").unwrap(), Some(b"hello".to_vec()));
+    assert_eq!(
+        fs.getxattr(ino, b"user.tag").unwrap(),
+        Some(b"hello".to_vec())
+    );
 
     // List.
     fs.setxattr(ino, b"user.other", b"world").unwrap();
@@ -69,6 +72,11 @@ fn xattrs_dropped_on_unlink() {
 fn hidden_from_readdir() {
     let (_img, mut fs) = setup();
     fs.setxattr(ROOT_INO, b"user.r", b"v").unwrap();
-    let names: Vec<Vec<u8>> = fs.readdir(ROOT_INO).unwrap().into_iter().map(|(n, _, _)| n).collect();
+    let names: Vec<Vec<u8>> = fs
+        .readdir(ROOT_INO)
+        .unwrap()
+        .into_iter()
+        .map(|(n, _, _)| n)
+        .collect();
     assert!(!names.iter().any(|n| n == b".xattrs"));
 }
