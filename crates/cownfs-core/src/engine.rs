@@ -612,7 +612,8 @@ impl Fs {
 
     /// Compute and write CRC32C for each bitmap block.
     /// Sidecar layout: [8-byte magic][4-byte CRC per block][padding].
-    fn write_bitmap_crcs(
+    /// Public for use by cownfs-backup restore-inc.
+    pub fn write_bitmap_crcs(
         dev: &mut FileDevice,
         bitmap: &Bitmap,
         bitmap_start: u64,
@@ -1069,6 +1070,218 @@ impl Fs {
             }
         }
         Ok(blocks)
+    }
+
+    /// All block numbers reachable from `roots`: the four trees' node
+    /// blocks, file data blocks referenced by extent-tree leaves (live and
+    /// snapshot-pinned), and blocks pinned by snapshot records.
+    fn reachable_blocks(&self, roots: &FsRoots) -> Result<std::collections::HashSet<u64>, FsError> {
+        use std::collections::HashSet;
+        let mut set: HashSet<u64> = HashSet::new();
+
+        // Tree node blocks.
+        let iv = InodeTree::open(self.inodes.store_handle(), roots.inode, 0);
+        for id in iv.collect_blocks(roots.inode)? {
+            set.insert(id.idx);
+        }
+        let dv = DirTree::open(self.dirs.store_handle(), roots.dir, 0);
+        for id in dv.collect_blocks(roots.dir)? {
+            set.insert(id.idx);
+        }
+        let ev = ExtentTree::open(self.extents.store_handle(), roots.extent, 0);
+        let eids = ev.collect_blocks(roots.extent)?;
+        for id in &eids {
+            set.insert(id.idx);
+        }
+        // Live extent data blocks.
+        for id in &eids {
+            let node = ev.get_node(*id)?;
+            if node.is_leaf() {
+                for v in &node.vals {
+                    for b in v.blk..v.blk + v.len as u64 {
+                        set.insert(b);
+                    }
+                }
+            }
+        }
+        let sv = SnapTree::open(self.snaps.store_handle(), roots.snap, 0);
+        for id in sv.collect_blocks(roots.snap)? {
+            set.insert(id.idx);
+        }
+        // Snapshot-pinned trees and their data blocks.
+        for (_sid, rec) in sv.to_sorted_vec()? {
+            let pinned = [
+                (rec.roots[0], rec.root_gens[0], 0u8),
+                (rec.roots[1], rec.root_gens[1], 1u8),
+                (rec.roots[2], rec.root_gens[2], 2u8),
+            ];
+            for (idx, gen, which) in pinned {
+                let rid = NodeId { idx, gen };
+                match which {
+                    0 => {
+                        let v = InodeTree::open(self.inodes.store_handle(), rid, 0);
+                        for id in v.collect_blocks(rid)? {
+                            set.insert(id.idx);
+                        }
+                    }
+                    1 => {
+                        let v = DirTree::open(self.dirs.store_handle(), rid, 0);
+                        for id in v.collect_blocks(rid)? {
+                            set.insert(id.idx);
+                        }
+                    }
+                    _ => {
+                        let v = ExtentTree::open(self.extents.store_handle(), rid, 0);
+                        let ids = v.collect_blocks(rid)?;
+                        for id in &ids {
+                            set.insert(id.idx);
+                        }
+                        for id in &ids {
+                            let node = v.get_node(*id)?;
+                            if node.is_leaf() {
+                                for ex in &node.vals {
+                                    for b in ex.blk..ex.blk + ex.len as u64 {
+                                        set.insert(b);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(set)
+    }
+
+    /// Blocks reachable from `old` roots but not from the current roots.
+    ///
+    /// Used by incremental restore: after writing the new blocks, the
+    /// bitmap bits for these blocks must be cleared. Snapshot-pinned
+    /// blocks are reachable from both and never reported.
+    pub fn deleted_blocks(&self, old: &FsRoots) -> Result<Vec<u64>, FsError> {
+        let old_set = self.reachable_blocks(old)?;
+        let new_set = self.reachable_blocks(&self.roots())?;
+        let mut deleted: Vec<u64> = old_set.difference(&new_set).copied().collect();
+        deleted.sort_unstable();
+        Ok(deleted)
+    }
+
+    /// All node blocks in the current snapshot tree.
+    ///
+    /// Used by incremental backup: `snapshot_roots()` reports the snap
+    /// tree as the current root (snapshots don't nest), so `diff_roots`
+    /// skips snap-tree changes. But if snapshots were added since the
+    /// base, the target needs the new snap-tree nodes to use the new
+    /// snap root. This ensures they are included in the changed set.
+    pub fn snap_tree_blocks(&self) -> Result<Vec<u64>, FsError> {
+        let ids = self.snaps.collect_blocks(self.snaps.root_id())?;
+        Ok(ids.into_iter().map(|id| id.idx).collect())
+    }
+
+    /// Apply an incremental backup to this image (B5 `restore-inc`).
+    ///
+    /// The Fs must currently be exactly at `base` (the base roots the
+    /// incremental was computed against); otherwise no changes are made
+    /// and an error is returned. On success:
+    /// - `changed` blocks are written to the image,
+    /// - the in-memory roots are adopted to `new`,
+    /// - the bitmap is rebuilt from the new reachable set (full rebuild,
+    ///   so no deleted-block list is needed),
+    /// - the bitmap is fully persisted (with CRC sidecars if the image has them),
+    /// - the superblock advances one generation on the inactive slot.
+    ///
+    /// The caller must `drop` this Fs and reopen to use the new state;
+    /// in-memory caches (e.g. `snapshot_pinned`) are rebuilt on open.
+    pub fn apply_incremental(
+        &mut self,
+        base: &FsRoots,
+        new: &FsRoots,
+        new_lens: [u64; 4],
+        next_inode: u64,
+        next_snap: u64,
+        changed: &[(u64, [u8; crate::BLOCK_SIZE])],
+    ) -> Result<(), FsError> {
+        // Exact-base check: the data-tree roots must match. (The snap-tree
+        // root is excluded: snapshot_roots() reports the current snap root,
+        // which legitimately advances as new snapshots are created. The
+        // caller verifies the snapshot itself separately.)
+        let cur = self.roots();
+        if cur.inode != base.inode || cur.dir != base.dir || cur.extent != base.extent {
+            return Err(FsError::Invalid(
+                "target not at incremental base (roots mismatch)".into(),
+            ));
+        }
+        // Write the changed blocks straight to the device. They are all
+        // CoW-new blocks (never referenced by the base state), so no
+        // in-memory cache entry can be stale for them.
+        {
+            let mut sh = self.shared.lock().unwrap();
+            for (blk, data) in changed {
+                sh.dev
+                    .write_block(*blk, data)
+                    .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+            }
+        }
+        // Adopt the new roots.
+        self.inodes = InodeTree::open(self.inodes.store_handle(), new.inode, new_lens[0] as usize);
+        self.dirs = DirTree::open(self.dirs.store_handle(), new.dir, new_lens[1] as usize);
+        self.extents = ExtentTree::open(
+            self.extents.store_handle(),
+            new.extent,
+            new_lens[2] as usize,
+        );
+        self.snaps = SnapTree::open(self.snaps.store_handle(), new.snap, new_lens[3] as usize);
+        // Rebuild the bitmap from the new reachable set. Reserved blocks
+        // (superblock slots, bitmap areas, CRC sidecars) stay set.
+        let reachable = self.reachable_blocks(new)?;
+        {
+            let mut sh = self.shared.lock().unwrap();
+            let cb = superblock::bitmap_crc_blocks(self.sb.bitmap_blocks);
+            let reserved = if self.has_bitmap_crcs {
+                2 + 2 * self.sb.bitmap_blocks + 2 * cb
+            } else {
+                2 + 2 * self.sb.bitmap_blocks
+            };
+            for b in reserved..self.sb.block_count {
+                if reachable.contains(&b) {
+                    sh.bitmap.set(b);
+                } else {
+                    sh.bitmap.clear(b);
+                }
+            }
+        }
+        // Update allocator state and superblock roots.
+        self.next_inode = next_inode;
+        self.next_snap = next_snap;
+        self.sb.next_inode = next_inode;
+        self.sb.next_snap = next_snap;
+        self.sb.inode_root = new.inode.idx;
+        self.sb.inode_root_gen = new.inode.gen;
+        self.sb.inode_len = new_lens[0];
+        self.sb.dir_root = new.dir.idx;
+        self.sb.dir_root_gen = new.dir.gen;
+        self.sb.dir_len = new_lens[1];
+        self.sb.extent_root = new.extent.idx;
+        self.sb.extent_root_gen = new.extent.gen;
+        self.sb.extent_len = new_lens[2];
+        self.sb.snap_root = new.snap.idx;
+        self.sb.snap_root_gen = new.snap.gen;
+        self.sb.snap_len = new_lens[3];
+        // Persist the full bitmap (updates sb.bitmap_* for generation+1).
+        self.persist_bitmap_full()?;
+        // Advance the generation on the inactive slot.
+        self.sb.generation += 1;
+        {
+            let mut sh = self.shared.lock().unwrap();
+            let slot = 1 - self.active_slot;
+            superblock::write_slot(&mut sh.dev, slot, &self.sb)
+                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+            sh.dev
+                .sync()
+                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+        }
+        self.active_slot = 1 - self.active_slot;
+        Ok(())
     }
 
     // -- transactions ------------------------------------------------------

@@ -476,6 +476,30 @@ impl<K: Ord + Clone, V: Clone, S: NodeStore<K, V>, const T: usize> BTree<K, V, S
         Ok(changed)
     }
 
+    /// Collect all node ids reachable from `root` (deduped).
+    ///
+    /// Unlike [`BTree::verify`], this does no ordering checks — it is a
+    /// pure reachability walk used by incremental backup/restore to
+    /// enumerate the blocks belonging to a tree at an arbitrary root.
+    /// The root may differ from `self.root`; the caller opens a view
+    /// with [`BTree::open`] for the desired root.
+    pub fn collect_blocks(&self, root: NodeId) -> Result<Vec<NodeId>, StoreError> {
+        let mut ids = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![root];
+        let mut store = self.store.lock().unwrap();
+        while let Some(id) = stack.pop() {
+            if !seen.insert((id.idx, id.gen)) {
+                continue;
+            }
+            ids.push(id);
+            // Clone children to end the borrow before continuing.
+            let children = store.get(id)?.children.clone();
+            stack.extend(children);
+        }
+        Ok(ids)
+    }
+
     pub fn get(&self, k: &K) -> Result<Option<V>, StoreError> {
         let mut a = self.store.lock().unwrap();
         let mut id = self.root;

@@ -211,7 +211,9 @@ impl Superblock {
     }
 }
 
-fn write_slot(dev: &mut impl BlockDevice, slot: usize, sb: &Superblock) -> io::Result<()> {
+/// Write a single superblock slot. Public for incremental restore,
+/// which advances the generation outside the normal commit path.
+pub fn write_slot(dev: &mut impl BlockDevice, slot: usize, sb: &Superblock) -> io::Result<()> {
     let mut blk = [0u8; BLOCK_SIZE];
     blk[..HDR_LEN].copy_from_slice(&sb.encode());
     dev.write_block(SLOT_BLOCKS[slot], &blk)
