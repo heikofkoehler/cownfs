@@ -88,7 +88,7 @@ fn worker(tid: usize, addr: SocketAddr, uuid: [u8; 16], iters: usize, barrier: A
         ops.readdir(0, 8192, &[]);
         c.check_ok(b"stress-readdir", ops);
 
-        // Commit to force txg durability.
+        // Commit to force txg durability (before unlink).
         let mut ops = Ops::new();
         ops.putfh(&uuid, ino);
         ops.commit();
@@ -100,6 +100,12 @@ fn worker(tid: usize, addr: SocketAddr, uuid: [u8; 16], iters: usize, barrier: A
             ops.putrootfh();
             ops.remove(name.as_bytes());
             c.check_ok(b"stress-remove", ops);
+            // Commit the unlink too, so it's durable before the test
+            // reopens the image directly.
+            let mut ops = Ops::new();
+            ops.putrootfh();
+            ops.commit();
+            c.check_ok(b"stress-commit-unlink", ops);
         }
     }
 }

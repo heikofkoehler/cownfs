@@ -85,6 +85,9 @@ pub enum FsError {
     InjectedFault(FaultPoint),
     /// Per-UID block quota exceeded.
     QuotaExceeded,
+    /// Full bitmap block failed CRC32C verification (bit rot detected).
+    /// `Fs::open` falls back to the older superblock generation.
+    BitmapCorrupt,
 }
 
 impl std::fmt::Display for FsError {
@@ -98,6 +101,7 @@ impl std::fmt::Display for FsError {
             FsError::NotEmpty => write!(f, "directory not empty"),
             FsError::InjectedFault(p) => write!(f, "injected fault at {p:?}"),
             FsError::QuotaExceeded => write!(f, "disk quota exceeded"),
+            FsError::BitmapCorrupt => write!(f, "bitmap CRC mismatch"),
             FsError::BadName => write!(f, "invalid file name"),
             FsError::NoSpace => write!(f, "no space left on device"),
             FsError::Invalid(s) => write!(f, "invalid: {s}"),
@@ -568,6 +572,9 @@ pub struct Fs {
     /// Blocks allocated in the current txg (not yet committed).
     /// In-place overwrites are only safe for these blocks.
     txg_allocated: std::collections::HashSet<u64>,
+    /// True if the image has bitmap CRC sidecar areas (magic present).
+    /// v3 images lack them → CRC verification skipped.
+    has_bitmap_crcs: bool,
 }
 
 /// Name of the hidden file backing extended attributes.
@@ -587,11 +594,136 @@ pub struct SetAttrs {
 impl Fs {
     // -- lifecycle ---------------------------------------------------------
 
+    /// Write the CRC sidecar magic to the given area (cb blocks).
+    fn write_crc_magic(dev: &mut FileDevice, sidecar_start: u64, cb: u64) -> Result<(), FsError> {
+        if cb == 0 {
+            return Ok(());
+        }
+        let mut blk = [0u8; crate::BLOCK_SIZE];
+        blk[0..8].copy_from_slice(&superblock::BITMAP_CRC_MAGIC.to_le_bytes());
+        dev.write_block(sidecar_start, &blk)?;
+        // Zero the remaining sidecar blocks.
+        let zero = [0u8; crate::BLOCK_SIZE];
+        for i in 1..cb {
+            dev.write_block(sidecar_start + i, &zero)?;
+        }
+        Ok(())
+    }
+
+    /// Compute and write CRC32C for each bitmap block.
+    /// Sidecar layout: [8-byte magic][4-byte CRC per block][padding].
+    fn write_bitmap_crcs(
+        dev: &mut FileDevice,
+        bitmap: &Bitmap,
+        bitmap_start: u64,
+        bblocks: u64,
+        sidecar_start: u64,
+    ) -> Result<(), FsError> {
+        use crate::BLOCK_SIZE;
+        let cb = superblock::bitmap_crc_blocks(bblocks);
+        if cb == 0 {
+            return Ok(());
+        }
+        let raw = bitmap.to_bytes();
+        let mut sidecar = vec![0u8; (cb as usize) * BLOCK_SIZE];
+        sidecar[0..8].copy_from_slice(&superblock::BITMAP_CRC_MAGIC.to_le_bytes());
+        for i in 0..bblocks {
+            let start = (i as usize) * BLOCK_SIZE;
+            let end = start + BLOCK_SIZE;
+            // Pad to full block with zeros to match the on-disk representation
+            // that verify_bitmap_crcs reads.
+            let mut block_data = [0u8; BLOCK_SIZE];
+            if start < raw.len() {
+                let copy_end = end.min(raw.len());
+                block_data[..copy_end - start].copy_from_slice(&raw[start..copy_end]);
+            }
+            let crc = crate::checksum::checksum32(&block_data);
+            let off = 8 + (i as usize) * 4;
+            sidecar[off..off + 4].copy_from_slice(&crc.to_le_bytes());
+        }
+        for (i, chunk) in sidecar.chunks(BLOCK_SIZE).enumerate() {
+            let mut blk = [0u8; BLOCK_SIZE];
+            blk[..chunk.len()].copy_from_slice(chunk);
+            dev.write_block(sidecar_start + i as u64, &blk)?;
+        }
+        let _ = bitmap_start; // reserved for future use
+        Ok(())
+    }
+
+    /// Check if the CRC sidecar at the given location has the magic.
+    /// Returns false for legacy v3 images (no magic) or if cb is 0.
+    fn has_crc_magic(dev: &mut FileDevice, sidecar_start: u64, cb: u64) -> bool {
+        use crate::BLOCK_SIZE;
+        if cb == 0 {
+            return false;
+        }
+        let mut blk = [0u8; BLOCK_SIZE];
+        if dev.read_block(sidecar_start, &mut blk).is_err() {
+            return false;
+        }
+        let magic = u64::from_le_bytes(blk[0..8].try_into().unwrap_or([0u8; 8]));
+        magic == superblock::BITMAP_CRC_MAGIC
+    }
+
+    /// Verify bitmap CRCs against the sidecar. Returns Ok(()) if valid or
+    /// if the image lacks CRC sidecars (legacy v3). Returns
+    /// Err(FsError::BitmapCorrupt) on mismatch.
+    fn verify_bitmap_crcs(
+        dev: &mut FileDevice,
+        bitmap_start: u64,
+        bblocks: u64,
+        sidecar_start: u64,
+    ) -> Result<(), FsError> {
+        use crate::BLOCK_SIZE;
+        let cb = superblock::bitmap_crc_blocks(bblocks);
+        if cb == 0 {
+            return Ok(());
+        }
+        // Check magic.
+        let mut blk = [0u8; BLOCK_SIZE];
+        dev.read_block(sidecar_start, &mut blk)?;
+        let magic = u64::from_le_bytes(blk[0..8].try_into().unwrap());
+        if magic != superblock::BITMAP_CRC_MAGIC {
+            // Legacy v3 image: no CRCs, skip verification.
+            return Ok(());
+        }
+        // Read full sidecar.
+        let mut sidecar = vec![0u8; (cb as usize) * BLOCK_SIZE];
+        for i in 0..cb {
+            dev.read_block(sidecar_start + i, &mut blk)?;
+            let dst_start = (i as usize) * BLOCK_SIZE;
+            sidecar[dst_start..dst_start + BLOCK_SIZE].copy_from_slice(&blk);
+        }
+        // Read bitmap and verify each block's CRC.
+        let mut bitmap_raw = vec![0u8; (bblocks as usize) * BLOCK_SIZE];
+        for i in 0..bblocks {
+            dev.read_block(bitmap_start + i, &mut blk)?;
+            let dst_start = (i as usize) * BLOCK_SIZE;
+            bitmap_raw[dst_start..dst_start + BLOCK_SIZE].copy_from_slice(&blk);
+        }
+        for i in 0..bblocks {
+            let start = (i as usize) * BLOCK_SIZE;
+            let block_data = &bitmap_raw[start..start + BLOCK_SIZE];
+            let expected = u32::from_le_bytes(
+                sidecar[8 + (i as usize) * 4..8 + (i as usize) * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            let actual = crate::checksum::checksum32(block_data);
+            if expected != actual {
+                return Err(FsError::BitmapCorrupt);
+            }
+        }
+        Ok(())
+    }
+
     /// Format a fresh filesystem image with an empty root directory.
     pub fn format(path: &Path, blocks: u64) -> Result<Self, FsError> {
         let mut dev = FileDevice::create(path, blocks)?;
         let bblocks = store::bitmap_blocks_for(blocks);
-        let reserved = 2 + 2 * bblocks; // slots + two alternating bitmap areas
+        // slots + two alternating bitmap areas + two CRC sidecar areas
+        let cb = superblock::bitmap_crc_blocks(bblocks);
+        let reserved = 2 + 2 * bblocks + 2 * cb;
         if blocks < reserved + 64 {
             return Err(FsError::Invalid("image too small to format".into()));
         }
@@ -600,6 +732,12 @@ impl Fs {
             bitmap.set(b);
         }
         store::write_bitmap(&mut dev, &bitmap, 2, bblocks)?;
+        // Mark the CRC sidecar areas with magic so open() knows this image
+        // has bitmap CRCs (v3 images lack the magic → skip verification).
+        Self::write_crc_magic(&mut dev, 2 + 2 * bblocks, cb)?;
+        Self::write_crc_magic(&mut dev, 2 + 2 * bblocks + cb, cb)?;
+        // Write initial CRCs for the bitmap.
+        Self::write_bitmap_crcs(&mut dev, &bitmap, 2, bblocks, 2 + 2 * bblocks)?;
         let shared = Arc::new(Mutex::new(Shared {
             dev,
             bitmap,
@@ -630,6 +768,7 @@ impl Fs {
             commits_since_checkpoint: 0,
             last_bitmap_write_bytes: 0,
             txg_allocated: std::collections::HashSet::new(),
+            has_bitmap_crcs: true, // fresh format always has CRC sidecars
         };
 
         let now = now_secs();
@@ -676,7 +815,55 @@ impl Fs {
     /// Open an existing image, locating all trees from the superblock.
     pub fn open(path: &Path) -> Result<Self, FsError> {
         let mut dev = FileDevice::open(path)?;
-        let (sb, active_slot) = superblock::open(&dev)?;
+        // Collect valid superblock slots, newest generation first.
+        let mut slots: Vec<(superblock::Superblock, usize)> = Vec::new();
+        for i in 0..superblock::SLOT_BLOCKS.len() {
+            if let Some(sb) = superblock::read_slot(&dev, i) {
+                slots.push((sb, i));
+            }
+        }
+        if slots.is_empty() {
+            return Err(FsError::Store(crate::store::StoreError::Io(
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "no valid superblock slot"),
+            )));
+        }
+        slots.sort_by(|a, b| b.0.generation.cmp(&a.0.generation));
+
+        // Try each slot newest-first; fall back to the older generation if
+        // the bitmap CRCs don't verify.
+        let mut last_err: Option<FsError> = None;
+        for (sb, slot) in slots {
+            let bblocks = sb.bitmap_blocks;
+            let cb = superblock::bitmap_crc_blocks(bblocks);
+            // Bitmap area for CRC verification: use the base area (full bitmap).
+            let bitmap_start = sb.bitmap_start + sb.bitmap_base_area * bblocks;
+            let sidecar_start = sb.bitmap_start + 2 * bblocks + sb.bitmap_base_area * cb;
+            let has_crcs = Self::has_crc_magic(&mut dev, sidecar_start, cb);
+            match Self::verify_bitmap_crcs(&mut dev, bitmap_start, bblocks, sidecar_start) {
+                Ok(()) => {
+                    return Self::open_with_sb(dev, sb, slot, has_crcs);
+                }
+                Err(FsError::BitmapCorrupt) => {
+                    eprintln!(
+                        "bitmap CRC mismatch in slot {} (gen {}), trying older generation",
+                        slot, sb.generation
+                    );
+                    last_err = Some(FsError::BitmapCorrupt);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.unwrap_or(FsError::BitmapCorrupt))
+    }
+
+    /// Open with a specific superblock slot already chosen (after CRC verification).
+    fn open_with_sb(
+        mut dev: FileDevice,
+        sb: superblock::Superblock,
+        active_slot: usize,
+        has_bitmap_crcs: bool,
+    ) -> Result<Self, FsError> {
         let next_inode = sb.next_inode;
         let next_snap = sb.next_snap;
         let bitmap = Self::load_bitmap(&mut dev, &sb)?;
@@ -778,6 +965,7 @@ impl Fs {
             commits_since_checkpoint: 0,
             last_bitmap_write_bytes: 0,
             txg_allocated: std::collections::HashSet::new(),
+            has_bitmap_crcs,
         };
         fs.rebuild_pinned()?;
         fs.rebuild_quota_usage()?;
@@ -1040,6 +1228,21 @@ impl Fs {
         sh.bitmap.clear_dirty();
         drop(sh);
         self.commits_since_checkpoint = 0;
+        // Update the CRC sidecar for the new base area (if this image has CRCs).
+        if self.has_bitmap_crcs {
+            let cb = superblock::bitmap_crc_blocks(blocks);
+            if cb > 0 {
+                let bitmap_start = self.sb.bitmap_start + self.sb.bitmap_base_area * blocks;
+                let sidecar_start =
+                    self.sb.bitmap_start + 2 * blocks + self.sb.bitmap_base_area * cb;
+                let bitmap = {
+                    let sh = self.shared.lock().unwrap();
+                    sh.bitmap.clone()
+                };
+                let mut sh = self.shared.lock().unwrap();
+                Self::write_bitmap_crcs(&mut sh.dev, &bitmap, bitmap_start, blocks, sidecar_start)?;
+            }
+        }
         Ok(())
     }
 
@@ -1450,7 +1653,12 @@ impl Fs {
 
         // Reconcile against the active bitmap area.
         let sh = self.shared.lock().unwrap();
-        let reserved = 2 + 2 * self.sb.bitmap_blocks;
+        let cb = superblock::bitmap_crc_blocks(self.sb.bitmap_blocks);
+        let reserved = if self.has_bitmap_crcs {
+            2 + 2 * self.sb.bitmap_blocks + 2 * cb
+        } else {
+            2 + 2 * self.sb.bitmap_blocks
+        };
         let mut allocated_blocks = 0u64;
         for b in 0..self.sb.block_count {
             if !sh.bitmap.test(b) {
@@ -1513,7 +1721,12 @@ impl Fs {
             }
         }
 
-        let reserved = 2 + 2 * self.sb.bitmap_blocks;
+        let cb = superblock::bitmap_crc_blocks(self.sb.bitmap_blocks);
+        let reserved = if self.has_bitmap_crcs {
+            2 + 2 * self.sb.bitmap_blocks + 2 * cb
+        } else {
+            2 + 2 * self.sb.bitmap_blocks
+        };
         let mut reclaimed = 0u64;
         {
             let mut sh = self.shared.lock().unwrap();
@@ -3322,6 +3535,28 @@ mod tests {
         dev.read_block(sb.bitmap_area_start(), &mut blk).unwrap();
         blk[500 / 8] |= 1 << (500 % 8);
         dev.write_block(sb.bitmap_area_start(), &blk).unwrap();
+        // Update the CRC sidecar so open() doesn't fail with BitmapCorrupt
+        // (we're testing check(), not the CRC verification).
+        {
+            use crate::bitmap::Bitmap;
+            let bblocks = sb.bitmap_blocks;
+            let cb = superblock::bitmap_crc_blocks(bblocks);
+            if cb > 0 {
+                // Read the modified bitmap area.
+                let mut raw = vec![0u8; (bblocks as usize) * BLOCK_SIZE];
+                for i in 0..bblocks {
+                    dev.read_block(sb.bitmap_area_start() + i, &mut blk)
+                        .unwrap();
+                    let dst = (i as usize) * BLOCK_SIZE;
+                    raw[dst..dst + BLOCK_SIZE].copy_from_slice(&blk);
+                }
+                let bitmap = Bitmap::from_bytes(sb.block_count, &raw);
+                let bitmap_start = sb.bitmap_start + sb.bitmap_base_area * bblocks;
+                let sidecar_start = sb.bitmap_start + 2 * bblocks + sb.bitmap_base_area * cb;
+                Fs::write_bitmap_crcs(&mut dev, &bitmap, bitmap_start, bblocks, sidecar_start)
+                    .unwrap();
+            }
+        }
         dev.sync().unwrap();
         drop(dev);
 

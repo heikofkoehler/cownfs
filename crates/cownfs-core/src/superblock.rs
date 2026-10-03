@@ -20,8 +20,23 @@ use crate::{Block, BLOCK_SIZE};
 pub const MAGIC: u64 = u64::from_le_bytes(*b"cownfs01");
 pub const VERSION: u32 = 3;
 
+/// Magic identifying a bitmap CRC sidecar area. v3 images lack this magic
+/// in the reserved sidecar blocks → CRC verification is skipped (legacy).
+pub const BITMAP_CRC_MAGIC: u64 = u64::from_le_bytes(*b"cowbmcrc");
+
 /// Block numbers of the two superblock slots.
 pub const SLOT_BLOCKS: [u64; 2] = [0, 1];
+
+/// Number of blocks needed for the CRC32C sidecar of one bitmap area.
+/// Format: 8-byte magic + 4-byte CRC32C per bitmap block, rounded up to
+/// whole 4KiB blocks. Returns 0 if bitmap_blocks is 0.
+pub fn bitmap_crc_blocks(bitmap_blocks: u64) -> u64 {
+    if bitmap_blocks == 0 {
+        return 0;
+    }
+    let bytes = 8 + bitmap_blocks * 4;
+    bytes.div_ceil(crate::BLOCK_SIZE as u64)
+}
 
 const HDR_LEN: usize = 256;
 const OFF_CHECKSUM: usize = 64;
