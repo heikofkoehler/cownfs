@@ -371,35 +371,84 @@ fn read_from(
         return Ok(Vec::new());
     }
     let mut out = Vec::with_capacity((end - offset) as usize);
-    let mut buf = [0u8; BLOCK_SIZE];
 
     // Hold the lock across the entire read to avoid per-block mutex overhead.
     let sh = shared.lock().unwrap();
-    let mut foff = offset;
-    while foff < end {
-        let blk_off = foff / BLOCK_SIZE as u64;
-        let in_blk = (foff % BLOCK_SIZE as u64) as usize;
-        let n = ((BLOCK_SIZE - in_blk) as u64).min(end - foff) as usize;
+
+    // A4: gather extents, group contiguous physical blocks, read each run
+    // in a single syscall.
+    let start_blk = offset / BLOCK_SIZE as u64;
+    let end_blk = (end - 1) / BLOCK_SIZE as u64;
+    // Collect (file_blk, phys_blk, cksum) for the range.
+    let mut mappings = Vec::new();
+    for blk_off in start_blk..=end_blk {
         match extents.get(&ExtentKey { ino, off: blk_off })? {
-            Some(ext) => {
-                sh.dev
-                    .read_block(ext.blk, &mut buf)
-                    .map_err(StoreError::Io)?;
-                // Verify parent-stored checksum (if present).
-                if ext.cksum != 0 {
-                    let actual = checksum32(&buf);
-                    if actual != ext.cksum {
-                        return Err(FsError::Corrupt(format!(
-                            "data block {} checksum mismatch: expected {:08x}, got {:08x}",
-                            ext.blk, ext.cksum, actual
-                        )));
-                    }
-                }
-                out.extend_from_slice(&buf[in_blk..in_blk + n]);
-            }
-            None => out.extend(std::iter::repeat(0).take(n)),
+            Some(ext) => mappings.push((blk_off, ext.blk, ext.cksum)),
+            None => mappings.push((blk_off, u64::MAX, 0)), // hole
         }
-        foff += n as u64;
+    }
+    // Group contiguous physical blocks (skip holes).
+    let mut i = 0;
+    while i < mappings.len() {
+        let (fblk, pblk, cksum) = mappings[i];
+        if pblk == u64::MAX {
+            // Hole: emit zeros.
+            let in_blk = if fblk == start_blk {
+                (offset % BLOCK_SIZE as u64) as usize
+            } else {
+                0
+            };
+            let n = if fblk == end_blk {
+                ((end - 1) % BLOCK_SIZE as u64) as usize + 1 - in_blk
+            } else {
+                BLOCK_SIZE - in_blk
+            };
+            out.extend(std::iter::repeat(0).take(n));
+            i += 1;
+            continue;
+        }
+        // Find contiguous run.
+        let mut run_len = 1;
+        while i + run_len < mappings.len() {
+            let (_, npblk, _) = mappings[i + run_len];
+            let (_, pblk_prev, _) = mappings[i + run_len - 1];
+            if npblk == u64::MAX || npblk != pblk_prev + 1 {
+                break;
+            }
+            run_len += 1;
+        }
+        // Read the run in one syscall.
+        let mut buf = vec![0u8; run_len * BLOCK_SIZE];
+        sh.dev
+            .read_blocks(pblk, &mut buf)
+            .map_err(StoreError::Io)?;
+        // Verify checksums and copy out.
+        for j in 0..run_len {
+            let (fblk_j, _, cksum_j) = mappings[i + j];
+            let blk_data = &buf[j * BLOCK_SIZE..(j + 1) * BLOCK_SIZE];
+            if cksum_j != 0 {
+                let actual = checksum32(blk_data);
+                if actual != cksum_j {
+                    let (_, pblk_j, _) = mappings[i + j];
+                    return Err(FsError::Corrupt(format!(
+                        "data block {} checksum mismatch: expected {:08x}, got {:08x}",
+                        pblk_j, cksum_j, actual
+                    )));
+                }
+            }
+            let in_blk = if fblk_j == start_blk {
+                (offset % BLOCK_SIZE as u64) as usize
+            } else {
+                0
+            };
+            let n = if fblk_j == end_blk {
+                ((end - 1) % BLOCK_SIZE as u64) as usize + 1 - in_blk
+            } else {
+                BLOCK_SIZE - in_blk
+            };
+            out.extend_from_slice(&blk_data[in_blk..in_blk + n]);
+        }
+        i += run_len;
     }
     Ok(out)
 }

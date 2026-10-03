@@ -24,6 +24,20 @@ pub struct FileDevice {
 }
 
 impl FileDevice {
+    /// Reads `buf.len() / BLOCK_SIZE` contiguous blocks starting at `start`
+    /// in a single syscall. `buf.len()` must be a multiple of BLOCK_SIZE.
+    pub fn read_blocks(&self, start: u64, buf: &mut [u8]) -> io::Result<()> {
+        assert!(buf.len() % BLOCK_SIZE == 0);
+        let count = buf.len() / BLOCK_SIZE;
+        if start + count as u64 > self.blocks {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "block range out of range",
+            ));
+        }
+        self.file
+            .read_exact_at(buf, start * BLOCK_SIZE as u64)
+    }
     /// Creates a new image file with `blocks` zeroed blocks.
     pub fn create(path: &Path, blocks: u64) -> io::Result<Self> {
         let file = OpenOptions::new()
