@@ -1595,12 +1595,11 @@ impl Fs {
         // a successful sync_txg() call resets the error state.
         self.txg.clear_error();
         if !self.txg.state.lock().unwrap().dirty {
-            // Nothing to persist, but still advance the txg numbers so
-            // waiters on commit_async() IDs don't hang. No superblock
-            // flip (avoids spurious generation advances).
+            // Nothing to persist. Wake waiters by advancing synced to
+            // current, but do NOT increment current — no new transaction
+            // was created, and incrementing would skew block generations.
             let mut t = self.txg.state.lock().unwrap();
             t.synced = t.current;
-            t.current += 1;
             drop(t);
             self.txg.cv.notify_all();
             return Ok(false);
