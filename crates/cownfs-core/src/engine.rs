@@ -821,25 +821,34 @@ impl Fs {
 
     /// Open an existing image, locating all trees from the superblock.
     pub fn open(path: &Path) -> Result<Self, FsError> {
-        let mut dev = FileDevice::open(path)?;
         // Collect valid superblock slots, newest generation first.
-        let mut slots: Vec<(superblock::Superblock, usize)> = Vec::new();
-        for i in 0..superblock::SLOT_BLOCKS.len() {
-            if let Some(sb) = superblock::read_slot(&dev, i) {
-                slots.push((sb, i));
+        // We read the slots with a temporary device; each fallback attempt
+        // reopens the device fresh.
+        let slots: Vec<(superblock::Superblock, usize)> = {
+            let mut dev = FileDevice::open(path)?;
+            let mut slots = Vec::new();
+            for i in 0..superblock::SLOT_BLOCKS.len() {
+                if let Some(sb) = superblock::read_slot(&dev, i) {
+                    slots.push((sb, i));
+                }
             }
-        }
+            slots
+        };
         if slots.is_empty() {
             return Err(FsError::Store(crate::store::StoreError::Io(
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "no valid superblock slot"),
             )));
         }
+        let mut slots = slots;
         slots.sort_by(|a, b| b.0.generation.cmp(&a.0.generation));
 
         // Try each slot newest-first; fall back to the older generation if
-        // the bitmap CRCs don't verify.
+        // the bitmap CRCs don't verify OR if the tree blocks are corrupt
+        // (torn write from a crash). A corrupt newer generation must not
+        // prevent opening the older, consistent generation.
         let mut last_err: Option<FsError> = None;
         for (sb, slot) in slots {
+            let mut dev = FileDevice::open(path)?;
             let bblocks = sb.bitmap_blocks;
             let cb = superblock::bitmap_crc_blocks(bblocks);
             // Bitmap area for CRC verification: use the base area (full bitmap).
@@ -847,15 +856,36 @@ impl Fs {
             let sidecar_start = sb.bitmap_start + 2 * bblocks + sb.bitmap_base_area * cb;
             let has_crcs = Self::has_crc_magic(&mut dev, sidecar_start, cb);
             match Self::verify_bitmap_crcs(&mut dev, bitmap_start, bblocks, sidecar_start) {
-                Ok(()) => {
-                    return Self::open_with_sb(dev, sb, slot, has_crcs);
-                }
+                Ok(()) => {},
                 Err(FsError::BitmapCorrupt) => {
                     eprintln!(
                         "bitmap CRC mismatch in slot {} (gen {}), trying older generation",
                         slot, sb.generation
                     );
                     last_err = Some(FsError::BitmapCorrupt);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+            // Bitmap CRCs pass; try to open the trees. If the tree blocks
+            // are corrupt (torn write), fall back to the older generation.
+            let gen = sb.generation;
+            match Self::open_with_sb(dev, sb, slot, has_crcs) {
+                Ok(fs) => return Ok(fs),
+                Err(FsError::Corrupt(what)) => {
+                    eprintln!(
+                        "corrupt tree block in slot {} (gen {}): {}, trying older generation",
+                        slot, gen, what
+                    );
+                    last_err = Some(FsError::Corrupt(what));
+                    continue;
+                }
+                Err(FsError::Store(StoreError::Corrupt { block, what })) => {
+                    eprintln!(
+                        "corrupt tree block {} in slot {} (gen {}): {}, trying older generation",
+                        block, slot, gen, what
+                    );
+                    last_err = Some(FsError::Store(StoreError::Corrupt { block, what }));
                     continue;
                 }
                 Err(e) => return Err(e),
