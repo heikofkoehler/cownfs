@@ -1,8 +1,14 @@
-# Performance baseline (2026-10-03, --quick, release build)
+# Performance baseline (2026-10-04, --quick, release build)
 # Machine: Linux VM (see docs/benchmark.md for specs)
 # Update after intentional perf changes. Gate fails if p99 regresses >20%.
+#
+# 2026-10-04: commit_p99 baseline updated from 1.89ms to 2.37ms (+25%).
+# Rationale: P0.1 bitmap CRC32C sidecars add ~0.5ms per commit for crash-
+# safety (detects bitmap corruption, enables generation fallback).
+# This is the cost of the correctness guarantee; the feature is not optional.
+# The 25% overhead is accepted as the new baseline.
 
-commit_p99_ns=1890000
+commit_p99_ns=2370000
 sync_write_iops=2014
 sync_write_p99_ns=2360000
 bitmap_write_bytes_per_commit=4096
