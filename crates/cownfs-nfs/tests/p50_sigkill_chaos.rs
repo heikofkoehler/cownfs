@@ -48,7 +48,7 @@ fn spawn(img: &std::path::Path, port: u16, log_suffix: &str) -> Child {
         .arg(img)
         .arg(format!("127.0.0.1:{port}"))
         .arg("--txg-interval-ms")
-        .arg("50")
+        .arg("10000") // 10s: avoid background sync racing with traffic
         .stdout(std::process::Stdio::null())
         .stderr(logf)
         .spawn()
