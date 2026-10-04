@@ -150,7 +150,16 @@ impl Shared {
                         // the error (they'd block forever otherwise).
                         let mut last_err = None;
                         for _ in 0..3 {
-                            match f.sync_txg() {
+                            // Stage dirty in-memory trees (flush, persist
+                            // bitmap), then sync (fsync, flip superblock).
+                            // UNSTABLE writes leave trees dirty in memory;
+                            // the background thread stages them here.
+                            let stage = f.commit_async();
+                            let sync = match stage {
+                                Ok(_) => f.sync_txg(),
+                                Err(e) => Err(e),
+                            };
+                            match sync {
                                 Ok(_) => {
                                     last_err = None;
                                     break;
@@ -1992,7 +2001,8 @@ impl Session {
         }
         // Transaction groups: stage the write, then handle stability.
         // FILE_SYNC4 waits for the open txg to sync (coalescing many
-        // concurrent sync writes onto one fsync); UNSTABLE just stages.
+        // concurrent sync writes onto one fsync); UNSTABLE just dirties
+        // the in-memory trees (no disk I/O).
         let committed = if stable == FILE_SYNC4 {
             let txg = match self.fs_mut().commit_async() {
                 Ok(t) => t,
@@ -2005,10 +2015,10 @@ impl Session {
             }
             FILE_SYNC4
         } else {
-            match self.fs_mut().commit_async() {
-                Ok(_) => stable,
-                Err(e) => return OpResult::err(OP_WRITE, fs_to_nfs(e)),
-            }
+            // UNSTABLE: do not call commit_async() (which would flush to
+            // disk). Just leave the trees dirty in memory; the background
+            // thread will stage and sync them later.
+            stable
         };
         let mut w = Writer::new();
         w.u32(data.len() as u32);

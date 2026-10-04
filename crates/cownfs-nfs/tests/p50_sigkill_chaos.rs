@@ -21,7 +21,10 @@ fn mkfs_bin() -> String {
         .parent()
         .and_then(|p| p.parent())
         .expect("target dir");
-    target_debug.join("cownfs-mkfs").to_string_lossy().to_string()
+    target_debug
+        .join("cownfs-mkfs")
+        .to_string_lossy()
+        .to_string()
 }
 
 fn fsck_bin() -> String {
@@ -31,7 +34,10 @@ fn fsck_bin() -> String {
         .parent()
         .and_then(|p| p.parent())
         .expect("target dir");
-    target_debug.join("cownfs-fsck").to_string_lossy().to_string()
+    target_debug
+        .join("cownfs-fsck")
+        .to_string_lossy()
+        .to_string()
 }
 
 fn free_port() -> u16 {

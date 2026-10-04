@@ -825,7 +825,7 @@ impl Fs {
         // We read the slots with a temporary device; each fallback attempt
         // reopens the device fresh.
         let slots: Vec<(superblock::Superblock, usize)> = {
-            let mut dev = FileDevice::open(path)?;
+            let dev = FileDevice::open(path)?;
             let mut slots = Vec::new();
             for i in 0..superblock::SLOT_BLOCKS.len() {
                 if let Some(sb) = superblock::read_slot(&dev, i) {
@@ -856,7 +856,7 @@ impl Fs {
             let sidecar_start = sb.bitmap_start + 2 * bblocks + sb.bitmap_base_area * cb;
             let has_crcs = Self::has_crc_magic(&mut dev, sidecar_start, cb);
             match Self::verify_bitmap_crcs(&mut dev, bitmap_start, bblocks, sidecar_start) {
-                Ok(()) => {},
+                Ok(()) => {}
                 Err(FsError::BitmapCorrupt) => {
                     eprintln!(
                         "bitmap CRC mismatch in slot {} (gen {}), trying older generation",
