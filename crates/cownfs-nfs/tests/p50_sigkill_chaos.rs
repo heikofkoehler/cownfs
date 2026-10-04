@@ -200,13 +200,28 @@ fn sigkill_mid_traffic_recovers() {
     sigkill(&mut child2);
 
     // External fsck with checked status (not library Fs::check).
+    // Use --reclaim: after SIGKILL, the in-memory pending_free is lost,
+    // leaving blocks marked allocated but unreachable (space leak, not
+    // corruption). Reclaim cleans them up; a second fsck verifies clean.
+    let out = Command::new(fsck_bin())
+        .arg("--reclaim")
+        .arg(&img)
+        .output()
+        .expect("run cownfs-fsck --reclaim");
+    assert!(
+        out.status.success(),
+        "fsck --reclaim failed after SIGKILL:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     let out = Command::new(fsck_bin())
         .arg(&img)
         .output()
         .expect("run cownfs-fsck");
     assert!(
         out.status.success(),
-        "fsck failed after SIGKILL: {}",
+        "fsck failed after reclaim:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
 
