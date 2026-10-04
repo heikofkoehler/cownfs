@@ -29,14 +29,18 @@ fn bin() -> PathBuf {
 }
 
 fn start_receiver(image: &PathBuf, port: u16) -> Child {
-    Command::new(bin())
+    let child = Command::new(bin())
         .args([
             "receive",
             image.to_str().unwrap(),
             &format!("127.0.0.1:{port}"),
         ])
         .spawn()
-        .expect("spawn receive")
+        .expect("spawn receive");
+    // Give the receiver time to bind. macOS is slower than Linux;
+    // 200ms raced on macOS (connection refused). 1s is safe.
+    std::thread::sleep(Duration::from_millis(1000));
+    child
 }
 
 fn run_sender(primary: &PathBuf, port: u16, state: &PathBuf) {
@@ -96,7 +100,7 @@ fn replicate_incremental() {
     // Round 1: full send (no state file yet).
     let port = free_port();
     let rx = start_receiver(&replica, port);
-    std::thread::sleep(Duration::from_millis(200));
+
     run_sender(&primary, port, &state);
     wait_for_exit(rx);
 
@@ -117,7 +121,7 @@ fn replicate_incremental() {
     // Round 2: incremental send.
     let port = free_port();
     let rx = start_receiver(&replica, port);
-    std::thread::sleep(Duration::from_millis(200));
+
     run_sender(&primary, port, &state);
     wait_for_exit(rx);
 
@@ -154,14 +158,14 @@ fn replicate_empty_diff_is_noop() {
     // Full send.
     let port = free_port();
     let rx = start_receiver(&replica, port);
-    std::thread::sleep(Duration::from_millis(200));
+
     run_sender(&primary, port, &state);
     wait_for_exit(rx);
 
     // Incremental with no changes — should send ~0 data blocks.
     let port = free_port();
     let rx = start_receiver(&replica, port);
-    std::thread::sleep(Duration::from_millis(200));
+
     run_sender(&primary, port, &state);
     wait_for_exit(rx);
 
@@ -189,7 +193,6 @@ fn replicate_drive_writes_status() {
     // it fail after the first successful replication.
     let port = free_port();
     let rx = start_receiver(&replica, port);
-    std::thread::sleep(Duration::from_millis(200));
 
     let mut drive = Command::new(bin())
         .args([
