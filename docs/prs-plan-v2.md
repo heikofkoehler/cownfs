@@ -238,7 +238,9 @@ flowchart LR
 ## 7. Decisions needed
 
 1. **Format v4 appetite.** Are you OK with an offline migration (v3 → v4 via `cownfs-migrate`) to unlock S1/P5/S5/S6? The alternative is in-place compat layers, which is much more code.
+   - **DECIDED 2026-10-05:** Format v4 is implemented. Current `VERSION = 4` with per-slot bitmap areas. No migration needed (v3 was never deployed).
 2. **Pure-CoW purity vs. P7.** Allow in-place overwrite of unshared, ≥ 2-gen-old blocks (faster, ext4-like), or stay strictly CoW and rely on P5 run allocation?
+   - **DECIDED 2026-10-05:** Pure CoW is NOT desired. P7 (in-place overwrite for unshared blocks) is approved. The A3 txg-local in-place overwrite stays; extend to ≥2-gen-old unshared blocks per P7 spec.
 3. **Perf gate.** Rebaseline the +25% `commit_p99` now (it buys bitmap CRCs), or hold the gate red until P1/P2 recover it?
 4. **CI substrate.** GitHub Actions hosted runners (no NFS mounts, so T5 needs a self-hosted or privileged runner or VM), or a self-hosted Linux box from day one?
 5. **Execution mode.** Phase 0 is small and urgent. I can start with T0 (repro tests that should fail on `main`) and then R1/R2/R3, one commit each.
