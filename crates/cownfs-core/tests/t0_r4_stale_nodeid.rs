@@ -20,7 +20,7 @@ fn r4_stale_nodeid_returns_corrupt_not_panic() {
     // The actual behavioral test: if a stale NodeId occurs, the operation
     // returns Err(Corrupt) instead of panicking. This is verified by code
     // inspection and by the fact that `cargo test` completes without panics.
-    
+
     // Basic smoke test: create and use a filesystem.
     let img = std::env::temp_dir().join("t0-r4-smoke.img");
     let _ = std::fs::remove_file(&img);
@@ -29,12 +29,12 @@ fn r4_stale_nodeid_returns_corrupt_not_panic() {
     fs.write(ino, 0, b"data").unwrap();
     fs.commit().unwrap();
     drop(fs);
-    
+
     // Reopen and verify it works (no panics).
     let _fs = Fs::open(&img).unwrap();
     // Note: check() may report a deferred-free leak (R3), which is expected.
     // The R4 property is that we don't panic.
-    
+
     let _ = std::fs::remove_file(&img);
     // If we got here without panicking, the R4 fix is in place.
     // (The specific stale-NodeId path is tested by code review: assert_eq!

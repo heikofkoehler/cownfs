@@ -44,9 +44,15 @@ fn r3_fallback_after_reuse_is_consistent() {
     let fs = Fs::open(&img).unwrap();
     assert_eq!(fs.generation(), gen2, "should have fallen back to gen 2");
     // f1 must still exist with intact data.
-    let (ino, _) = fs.lookup(ROOT_INO, b"f1").unwrap().expect("f1 should exist in gen 2");
+    let (ino, _) = fs
+        .lookup(ROOT_INO, b"f1")
+        .unwrap()
+        .expect("f1 should exist in gen 2");
     let read_back = fs.read(ino, 0, 8192).unwrap();
-    assert_eq!(read_back, data1, "R3: fallback generation data corrupted by premature reuse");
+    assert_eq!(
+        read_back, data1,
+        "R3: fallback generation data corrupted by premature reuse"
+    );
     // Note: check() may report a leak (block marked allocated but unreachable)
     // due to the deferred-free queues. This is expected and safe: the blocks
     // will be reclaimed on the next commit. The critical property is that
