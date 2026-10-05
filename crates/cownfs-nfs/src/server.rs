@@ -2109,10 +2109,18 @@ impl Session {
             // background thread to sync (no flush per write). This
             // coalesces many concurrent FILE_SYNCs onto one physical commit.
             let txg = self.fs().mark_txg_dirty();
-            // Wait can fail if the background sync thread hit a persistent
-            // error (disk failure). Map to NFS4ERR_IO, don't hang.
-            if let Err(_) = self.shared.txg.wait(txg) {
-                return OpResult::err(OP_WRITE, NFS4ERR_IO);
+            // If background sync is disabled, do a direct sync.
+            let interval = self.shared.txg_interval_ms.load(std::sync::atomic::Ordering::Relaxed);
+            if interval == u64::MAX {
+                if let Err(e) = self.fs_mut().sync_txg() {
+                    return OpResult::err(OP_WRITE, fs_to_nfs(e));
+                }
+            } else {
+                // Wait can fail if the background sync thread hit a persistent
+                // error (disk failure). Map to NFS4ERR_IO, don't hang.
+                if let Err(_) = self.shared.txg.wait(txg) {
+                    return OpResult::err(OP_WRITE, NFS4ERR_IO);
+                }
             }
             FILE_SYNC4
         } else {
@@ -2139,11 +2147,21 @@ impl Session {
             Ok(t) => t,
             Err(e) => return OpResult::err(OP_COMMIT, fs_to_nfs(e)),
         };
-        // Wait for the background txg thread to sync (group commit).
-        // The background interval should be short (e.g., 50ms) for
-        // reasonable COMMIT latency.
-        if self.shared.txg.wait(txg).is_err() {
-            return OpResult::err(OP_COMMIT, NFS4ERR_IO);
+        // If background sync is disabled (interval = u64::MAX, as in some
+        // tests), do a direct sync instead of waiting forever.
+        let interval = self.shared.txg_interval_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if interval == u64::MAX {
+            // Background disabled: sync directly under write lock.
+            if let Err(e) = self.fs_mut().sync_txg() {
+                return OpResult::err(OP_COMMIT, fs_to_nfs(e));
+            }
+        } else {
+            // Wait for the background txg thread to sync (group commit).
+            // The background interval should be short (e.g., 50ms) for
+            // reasonable COMMIT latency.
+            if self.shared.txg.wait(txg).is_err() {
+                return OpResult::err(OP_COMMIT, NFS4ERR_IO);
+            }
         }
         let mut w = Writer::new();
         // R2: boot verifier.
