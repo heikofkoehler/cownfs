@@ -11,7 +11,7 @@ use cownfs_core::engine::{Fs, FsError, FTYPE_DIR, FTYPE_SYMLINK, ROOT_INO};
 use crate::nfs4::{
     encode_compound, AnyFileHandle, AttrMask, AttrValues, Compound, FileAttrs, FileHandle,
     NfsError, Op, OpResult, SnapFileHandle, StateId, ACCESS4_DELETE, ACCESS4_EXECUTE,
-    ACCESS4_EXTEND, ACCESS4_LOOKUP, ACCESS4_MODIFY, ACCESS4_READ, FATTR4_MODE, FATTR4_SIZE,
+    ACCESS4_EXTEND, ACCESS4_LOOKUP, ACCESS4_MODIFY, ACCESS4_READ, DATA_SYNC4, FATTR4_MODE, FATTR4_SIZE,
     FILE_SYNC4, GUARDED4, LAYOUT4_NFSV4_1_FILES, NF4DIR, NF4LNK, NF4REG, NFS4ERR_BADNAME,
     NFS4ERR_BADSESSION, NFS4ERR_BADSLOT, NFS4ERR_BADTYPE, NFS4ERR_BADXDR, NFS4ERR_BAD_COOKIE,
     NFS4ERR_DELAY, NFS4ERR_DQUOT, NFS4ERR_EXIST, NFS4ERR_EXPIRED, NFS4ERR_INVAL, NFS4ERR_IO,
@@ -126,6 +126,11 @@ pub struct Shared {
     pub txg: Arc<cownfs_core::engine::TxgCoord>,
     /// txg sync interval in milliseconds (atomic so the sync thread sees updates).
     txg_interval_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// R2 fix: server boot verifier (RFC 7530 §16.8.3). Generated randomly
+    /// on startup; returned in WRITE and COMMIT responses. Clients compare
+    /// the WRITE verifier with the COMMIT verifier to detect server restart
+    /// (which loses UNSTABLE writes).
+    pub boot_verifier: [u8; 8],
 }
 
 impl Shared {
@@ -190,6 +195,14 @@ impl Shared {
             throttle: Arc::new(crate::throttle::Throttle::new(
                 crate::throttle::ThrottleConfig::default(),
             )),
+            // R2: random boot verifier from OS entropy.
+            boot_verifier: {
+                let mut v = [0u8; 8];
+                std::fs::File::open("/dev/urandom")
+                    .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut v))
+                    .expect("/dev/urandom readable");
+                v
+            },
         }
     }
 
@@ -216,6 +229,13 @@ impl Shared {
             throttle: Arc::new(crate::throttle::Throttle::new(
                 crate::throttle::ThrottleConfig::default(),
             )),
+            boot_verifier: {
+                let mut v = [0u8; 8];
+                std::fs::File::open("/dev/urandom")
+                    .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut v))
+                    .expect("/dev/urandom readable");
+                v
+            },
         }
     }
 
@@ -2003,7 +2023,10 @@ impl Session {
         // FILE_SYNC4 waits for the open txg to sync (coalescing many
         // concurrent sync writes onto one fsync); UNSTABLE just dirties
         // the in-memory trees (no disk I/O).
-        let committed = if stable == FILE_SYNC4 {
+        // R2: DATA_SYNC4 must also be durable (RFC 7530 §16.8.3). We treat
+        // it as FILE_SYNC4 (full sync); this is stronger than required
+        // (data-only) but correct.
+        let committed = if stable == FILE_SYNC4 || stable == DATA_SYNC4 {
             let txg = match self.fs_mut().commit_async() {
                 Ok(t) => t,
                 Err(e) => return OpResult::err(OP_WRITE, fs_to_nfs(e)),
@@ -2023,8 +2046,9 @@ impl Session {
         let mut w = Writer::new();
         w.u32(data.len() as u32);
         w.u32(committed);
-        // verifier (only meaningful for UNSTABLE)
-        w.opaque_fixed(&[0u8; 8]);
+        // R2: return the server boot verifier (RFC 7530 §16.8.3). Clients
+        // compare WRITE and COMMIT verifiers to detect server restart.
+        w.opaque_fixed(&self.shared.boot_verifier);
         OpResult::ok(OP_WRITE, w.into_bytes())
     }
 
@@ -2032,7 +2056,8 @@ impl Session {
         match self.fs_mut().commit() {
             Ok(()) => {
                 let mut w = Writer::new();
-                w.opaque_fixed(&[0u8; 8]); // verifier
+                // R2: boot verifier.
+                w.opaque_fixed(&self.shared.boot_verifier);
                 OpResult::ok(OP_COMMIT, w.into_bytes())
             }
             Err(e) => OpResult::err(OP_COMMIT, fs_to_nfs(e)),
