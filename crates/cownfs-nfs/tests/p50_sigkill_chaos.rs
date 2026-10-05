@@ -105,6 +105,15 @@ fn get_uuid(c: &mut NfsClient) -> [u8; 16] {
 
 #[test]
 fn sigkill_mid_traffic_recovers() {
+    // Ensure the helper binaries are fresh (cargo test -p cownfs-nfs does not
+    // build cownfs-mkfs/cownfs-fsck; a stale mkfs writes an old format that
+    // the server rejects with "no valid superblock slot").
+    let build = std::process::Command::new("cargo")
+        .args(["build", "-p", "cownfs-mkfs", "-p", "cownfs-fsck"])
+        .status()
+        .expect("cargo build helpers");
+    assert!(build.success(), "cargo build -p cownfs-mkfs -p cownfs-fsck failed");
+
     // Simple unique name (distinct from p50_minimal test).
     let img = std::env::temp_dir().join(format!("p50-chaos-{}.img", std::process::id()));
     let _ = std::fs::remove_file(&img);
