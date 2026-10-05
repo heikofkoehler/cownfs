@@ -2067,8 +2067,15 @@ impl Fs {
         let mut reclaimed = 0u64;
         {
             let mut sh = self.shared.lock().unwrap();
+            // Don't reclaim blocks in the deferred-free queue — they're
+            // intentionally unreachable (will be freed on next commit).
+            let deferred: std::collections::HashSet<u64> = sh.pending_free[0]
+                .iter()
+                .chain(sh.pending_free[1].iter())
+                .copied()
+                .collect();
             for b in reserved..self.sb.block_count {
-                if sh.bitmap.test(b) && !reachable.contains(&b) {
+                if sh.bitmap.test(b) && !reachable.contains(&b) && !deferred.contains(&b) {
                     sh.bitmap.clear(b);
                     reclaimed += 1;
                 }
