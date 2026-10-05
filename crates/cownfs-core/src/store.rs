@@ -430,13 +430,14 @@ impl<K, V> BlockArena<K, V> {
                 .read_block(id.idx, &mut buf)?;
             let (node, gen) = decode_node::<K, V>(id.idx, &buf)?;
             // A stale id (wrong generation) means a use-after-free bug: the
-            // block was recycled for another node. Always fatal, like a
-            // checksum failure.
-            assert_eq!(
-                gen, id.gen,
-                "stale NodeId {:?}: block has generation {gen}",
-                id
-            );
+            // block was recycled for another node. R4: return Corrupt instead
+            // of panicking (like a checksum failure).
+            if gen != id.gen {
+                return Err(StoreError::Corrupt {
+                    block: id.idx,
+                    what: "stale NodeId generation",
+                });
+            }
             // A5: LRU eviction if cache is full. Only evict clean nodes;
             // dirty nodes must be flushed first. If all nodes are dirty,
             // we skip eviction (cache grows temporarily; flush will clean
@@ -458,12 +459,15 @@ impl<K, V> BlockArena<K, V> {
             // The generation check applies on cache hits too: the block may
             // have been freed and reallocated since `id` was issued, in which
             // case the cached entry belongs to a different node generation.
+            // R4: return Corrupt instead of panicking. A panic while holding
+            // RwLock<Fs> would poison the lock, taking down the server.
             let gen = self.cache[&id.idx].gen;
-            assert_eq!(
-                gen, id.gen,
-                "stale NodeId {:?}: cached block has generation {gen}",
-                id
-            );
+            if gen != id.gen {
+                return Err(StoreError::Corrupt {
+                    block: id.idx,
+                    what: "stale NodeId generation",
+                });
+            }
             // A5: move to most-recent on hit. O(1) via the position index
             // (the old VecDeque `position()` scan was O(n)).
             self.lru_touch(id.idx);
