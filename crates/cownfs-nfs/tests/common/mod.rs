@@ -42,7 +42,20 @@ static IMG_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct TestServer {
     pub addr: SocketAddr,
     pub uuid: [u8; 16],
+    pub shared: cownfs_nfs::server::Shared,
     img: Option<PathBuf>,
+}
+
+impl TestServer {
+    /// Arm a deterministic fault point on the running server (T9/P7).
+    /// The fault fires once on the next commit_async, then disarms.
+    pub fn arm_fault(&self, point: cownfs_core::engine::FaultPoint) {
+        self.shared
+            .fs
+            .write()
+            .expect("fs lock")
+            .set_fault_point(point);
+    }
 }
 
 /// Format a fresh image and serve it on 127.0.0.1:0. The listener is bound
@@ -68,22 +81,24 @@ pub fn spawn_server_with_referrals(blocks: u64, conf: &std::path::Path) -> TestS
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
     let addr = listener.local_addr().expect("listener local addr");
-    let img2 = img.clone();
     // Metrics on port+1000.
     let metrics_addr = format!("127.0.0.1:{}", addr.port() + 1000);
+    // Create Shared here so tests can arm faults / tweak config (T9, P9).
+    let fs2 = Fs::open(&img).expect("open test image for shared");
+    let shared = cownfs_nfs::server::Shared::new(fs2).with_referrals(table);
+    let shared_srv = shared.clone();
+    let shared_metrics = shared.clone();
     std::thread::spawn(move || {
-        let fs = Fs::open(&img2).expect("open test image");
-        let shared = cownfs_nfs::server::Shared::new(fs).with_referrals(table);
-        let shared2 = shared.clone();
         let metrics_addr2 = metrics_addr.clone();
         std::thread::spawn(move || {
-            let _ = cownfs_nfs::server::serve_metrics(&metrics_addr2, &shared2);
+            let _ = cownfs_nfs::server::serve_metrics(&metrics_addr2, &shared_metrics);
         });
-        let _ = cownfs_nfs::server::serve_listener(listener, &shared);
+        let _ = cownfs_nfs::server::serve_listener(listener, &shared_srv);
     });
     TestServer {
         addr,
         uuid,
+        shared,
         img: Some(img),
     }
 }
@@ -112,20 +127,21 @@ fn spawn_concurrent_server_inner(blocks: u64, read_only: bool) -> TestServer {
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
     let addr = listener.local_addr().expect("listener local addr");
-    let img2 = img.clone();
+    // Create Shared here so tests can arm faults / tweak config (T9, P9).
+    let fs2 = Fs::open(&img).expect("open test image for shared");
+    let shared = if read_only {
+        cownfs_nfs::server::Shared::new_read_only(fs2)
+    } else {
+        cownfs_nfs::server::Shared::new(fs2)
+    };
+    let shared_srv = shared.clone();
     std::thread::spawn(move || {
-        let fs = Fs::open(&img2).expect("open test image");
-        let shared = if read_only {
-            cownfs_nfs::server::Shared::new_read_only(fs)
-        } else {
-            cownfs_nfs::server::Shared::new(fs)
-        };
-        if !read_only {}
-        let _ = cownfs_nfs::server::serve_concurrent(listener, shared);
+        let _ = cownfs_nfs::server::serve_concurrent(listener, shared_srv);
     });
     TestServer {
         addr,
         uuid,
+        shared,
         img: Some(img),
     }
 }
@@ -143,18 +159,17 @@ impl Drop for TestServer {
 pub fn spawn_server_on(img: &std::path::Path) -> TestServer {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
     let addr = listener.local_addr().expect("listener local addr");
-    let img2 = img.to_path_buf();
-    let fs = Fs::open(&img2).expect("open test image");
+    let fs = Fs::open(img).expect("open test image");
     let uuid = fs.uuid();
-    drop(fs);
+    let shared = cownfs_nfs::server::Shared::new(fs);
+    let shared_srv = shared.clone();
     std::thread::spawn(move || {
-        let fs = Fs::open(&img2).expect("open test image");
-        let shared = cownfs_nfs::server::Shared::new(fs);
-        let _ = cownfs_nfs::server::serve_concurrent(listener, shared);
+        let _ = cownfs_nfs::server::serve_concurrent(listener, shared_srv);
     });
     TestServer {
         addr,
         uuid,
+        shared,
         img: None,
     }
 }
@@ -164,22 +179,20 @@ pub fn spawn_server_on(img: &std::path::Path) -> TestServer {
 pub fn spawn_server_with_quotas(img: &std::path::Path, quotas: &[(u32, u64)]) -> TestServer {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
     let addr = listener.local_addr().expect("listener local addr");
-    let img2 = img.to_path_buf();
-    let fs = Fs::open(&img2).expect("open test image");
+    let mut fs = Fs::open(img).expect("open test image");
     let uuid = fs.uuid();
-    drop(fs);
-    let quotas = quotas.to_vec();
+    for (uid, blocks) in quotas {
+        fs.set_quota(*uid, *blocks);
+    }
+    let shared = cownfs_nfs::server::Shared::new(fs);
+    let shared_srv = shared.clone();
     std::thread::spawn(move || {
-        let mut fs = Fs::open(&img2).expect("open test image");
-        for (uid, blocks) in &quotas {
-            fs.set_quota(*uid, *blocks);
-        }
-        let shared = cownfs_nfs::server::Shared::new(fs);
-        let _ = cownfs_nfs::server::serve_concurrent(listener, shared);
+        let _ = cownfs_nfs::server::serve_concurrent(listener, shared_srv);
     });
     TestServer {
         addr,
         uuid,
+        shared,
         img: None,
     }
 }
@@ -189,18 +202,17 @@ pub fn spawn_server_with_quotas(img: &std::path::Path, quotas: &[(u32, u64)]) ->
 pub fn spawn_read_only_server_on(img: &std::path::Path) -> TestServer {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
     let addr = listener.local_addr().expect("listener local addr");
-    let img2 = img.to_path_buf();
-    let fs = Fs::open(&img2).expect("open test image");
+    let fs = Fs::open(img).expect("open test image");
     let uuid = fs.uuid();
-    drop(fs);
+    let shared = cownfs_nfs::server::Shared::new_read_only(fs);
+    let shared_srv = shared.clone();
     std::thread::spawn(move || {
-        let fs = Fs::open(&img2).expect("open test image");
-        let shared = cownfs_nfs::server::Shared::new_read_only(fs);
-        let _ = cownfs_nfs::server::serve_concurrent(listener, shared);
+        let _ = cownfs_nfs::server::serve_concurrent(listener, shared_srv);
     });
     TestServer {
         addr,
         uuid,
+        shared,
         img: None,
     }
 }
@@ -218,16 +230,17 @@ pub fn spawn_layout_server(blocks: u64, ds_addr: &str) -> TestServer {
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
     let addr = listener.local_addr().expect("listener local addr");
-    let img2 = img.clone();
     let ds = ds_addr.to_string();
+    let fs2 = Fs::open(&img).expect("open test image for shared");
+    let shared = cownfs_nfs::server::Shared::new(fs2).with_ds_addr(ds);
+    let shared_srv = shared.clone();
     std::thread::spawn(move || {
-        let fs = Fs::open(&img2).expect("open test image");
-        let shared = cownfs_nfs::server::Shared::new(fs).with_ds_addr(ds);
-        let _ = cownfs_nfs::server::serve_concurrent(listener, shared);
+        let _ = cownfs_nfs::server::serve_concurrent(listener, shared_srv);
     });
     TestServer {
         addr,
         uuid,
+        shared,
         img: Some(img),
     }
 }

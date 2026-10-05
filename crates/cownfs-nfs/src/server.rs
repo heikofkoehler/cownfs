@@ -92,9 +92,9 @@ fn fs_to_nfs(e: FsError) -> u32 {
         // Corrupt data: I/O error.
         FsError::Corrupt(_) => NFS4ERR_IO,
         FsError::BitmapCorrupt => NFS4ERR_IO,
-        // Injected faults (P7) never reach the wire in production;
-        // map to SERVERFAULT if they do.
-        FsError::InjectedFault(_) => NFS4ERR_SERVERFAULT,
+        // Injected faults (P7/T9) simulate disk I/O failures; map to IO
+        // so fault-injection tests observe the production error path.
+        FsError::InjectedFault(_) => NFS4ERR_IO,
         FsError::QuotaExceeded => NFS4ERR_DQUOT,
     }
 }
