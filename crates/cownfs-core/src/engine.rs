@@ -1048,10 +1048,8 @@ impl Fs {
 
     /// Number of free (unallocated) 4 KiB blocks. Scans the in-memory bitmap.
     pub fn free_block_count(&self) -> u64 {
-        let sh = self.shared.lock().unwrap();
-        let total = self.sb.block_count;
-        let used: u64 = (0..total).filter(|&b| sh.bitmap.test(b)).count() as u64;
-        total.saturating_sub(used)
+        // P3: O(1) via the bitmap's maintained free counter.
+        self.shared.lock().unwrap().bitmap.free_count()
     }
 
     /// All allocated block numbers. Used for full replication sends.

@@ -21,6 +21,9 @@ pub struct Bitmap {
     /// Allocation cursor: word index where the last alloc succeeded.
     /// Next alloc starts here (wraps around) instead of scanning from 0.
     cursor: u64,
+    /// P3: O(1) free-space counter. Number of clear bits (free blocks).
+    /// Maintained incrementally on set/clear/alloc; recomputed on load.
+    free_count: u64,
 }
 
 impl Bitmap {
@@ -30,6 +33,7 @@ impl Bitmap {
             nbits,
             dirty: std::collections::HashSet::new(),
             cursor: 0,
+            free_count: nbits, // all free initially
         }
     }
 
@@ -40,14 +44,24 @@ impl Bitmap {
     pub fn set(&mut self, i: u64) {
         debug_assert!(i < self.nbits);
         let wi = i / 64;
-        self.words[wi as usize] |= 1u64 << (i % 64);
+        let bit = 1u64 << (i % 64);
+        if self.words[wi as usize] & bit == 0 {
+            // Was free, now allocated.
+            self.free_count -= 1;
+        }
+        self.words[wi as usize] |= bit;
         self.dirty.insert(wi);
     }
 
     pub fn clear(&mut self, i: u64) {
         debug_assert!(i < self.nbits);
         let wi = i / 64;
-        self.words[wi as usize] &= !(1u64 << (i % 64));
+        let bit = 1u64 << (i % 64);
+        if self.words[wi as usize] & bit != 0 {
+            // Was allocated, now free.
+            self.free_count += 1;
+        }
+        self.words[wi as usize] &= !bit;
         self.dirty.insert(wi);
     }
 
@@ -74,6 +88,7 @@ impl Bitmap {
                     *w |= 1u64 << bit;
                     self.dirty.insert(wi as u64);
                     self.cursor = wi as u64;
+                    self.free_count -= 1; // P3: maintain counter
                     return Some(idx);
                 }
             }
@@ -93,6 +108,7 @@ impl Bitmap {
             self.words[wi] |= 1u64 << bit;
             self.dirty.insert(wi as u64);
             self.cursor = wi as u64;
+            self.free_count -= 1; // P3: maintain counter
             true
         } else {
             false
@@ -119,7 +135,26 @@ impl Bitmap {
     /// Set a word value directly (for delta application on open).
     /// Does not mark dirty.
     pub fn set_word(&mut self, wi: u64, val: u64) {
+        let old = self.words[wi as usize];
         self.words[wi as usize] = val;
+        // P3: update free count for the changed word.
+        // Only count bits within nbits (last word may have padding).
+        let idx = wi as usize;
+        let is_last = idx == self.words.len() - 1;
+        let valid_bits = if is_last {
+            let excess = self.words.len() as u64 * 64 - self.nbits;
+            64 - excess
+        } else {
+            64
+        };
+        let mask = if valid_bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << valid_bits) - 1
+        };
+        let old_free = (!old & mask).count_ones() as u64;
+        let new_free = (!val & mask).count_ones() as u64;
+        self.free_count = self.free_count + new_free - old_free;
     }
 
     /// Number of words.
@@ -153,7 +188,15 @@ impl Bitmap {
             }
         }
         b.dirty.clear();
+        // P3: recompute free count from the loaded bits.
+        let allocated: u64 = b.words.iter().map(|w| w.count_ones() as u64).sum();
+        b.free_count = nbits.saturating_sub(allocated);
         b
+    }
+
+    /// P3: O(1) free block count.
+    pub fn free_count(&self) -> u64 {
+        self.free_count
     }
 }
 
