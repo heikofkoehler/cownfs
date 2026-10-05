@@ -41,6 +41,7 @@ fn disc(e: &FsError) -> &'static str {
         FsError::InjectedFault(_) => "InjectedFault",
         FsError::QuotaExceeded => "QuotaExceeded",
         FsError::BitmapCorrupt => "BitmapCorrupt",
+        FsError::Fenced => "Fenced",
     }
 }
 

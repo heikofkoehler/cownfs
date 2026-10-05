@@ -117,6 +117,10 @@ fn fs_to_nfs(e: FsError) -> u32 {
         // so fault-injection tests observe the production error path.
         FsError::InjectedFault(_) => NFS4ERR_IO,
         FsError::QuotaExceeded => NFS4ERR_DQUOT,
+        // R6: fenced (lease lost) — the server is no longer the primary.
+        // The renewal thread exits on lease loss; a commit hitting this
+        // is a server fault from the client's perspective.
+        FsError::Fenced => NFS4ERR_SERVERFAULT,
     }
 }
 

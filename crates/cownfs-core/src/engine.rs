@@ -88,6 +88,9 @@ pub enum FsError {
     /// Full bitmap block failed CRC32C verification (bit rot detected).
     /// `Fs::open` falls back to the older superblock generation.
     BitmapCorrupt,
+    /// R6: commit refused — the lease epoch changed, meaning another node
+    /// took the write lease (fencing). The caller must re-acquire or exit.
+    Fenced,
 }
 
 impl std::fmt::Display for FsError {
@@ -102,6 +105,7 @@ impl std::fmt::Display for FsError {
             FsError::InjectedFault(p) => write!(f, "injected fault at {p:?}"),
             FsError::QuotaExceeded => write!(f, "disk quota exceeded"),
             FsError::BitmapCorrupt => write!(f, "bitmap CRC mismatch"),
+            FsError::Fenced => write!(f, "fenced: lease lost to another node"),
             FsError::BadName => write!(f, "invalid file name"),
             FsError::NoSpace => write!(f, "no space left on device"),
             FsError::Invalid(s) => write!(f, "invalid: {s}"),
@@ -565,6 +569,14 @@ pub struct Fs {
     /// P4: direct device handle for reads, bypassing the Shared mutex.
     /// Same Arc as `shared.dev`.
     dev: Arc<FileDevice>,
+    /// R6: image path, for lease-block I/O (separate O_DIRECT fd).
+    image_path: std::path::PathBuf,
+    /// R6: lease block number, if this image has one (R6+ formats).
+    /// None on legacy images (detected by missing lease magic).
+    lease_block: Option<u64>,
+    /// R6: fencing epoch from our last `lease_acquire`. Commits refuse
+    /// to run if the on-disk epoch changed (another node took the lease).
+    lease_epoch: Option<u64>,
     sb: Superblock,
     active_slot: usize,
     inodes: InodeTree,
@@ -778,7 +790,9 @@ impl Fs {
         let bblocks = store::bitmap_blocks_for(blocks);
         // slots + two alternating bitmap areas + two CRC sidecar areas
         let cb = superblock::bitmap_crc_blocks(bblocks);
-        let reserved = 2 + 2 * bblocks + 2 * cb;
+        // R6: block 2 is the dedicated lease block; the bitmap starts at 3.
+        let bitmap_start = 3;
+        let reserved = bitmap_start + 2 * bblocks + 2 * cb;
         if blocks < reserved + 64 {
             return Err(FsError::Invalid("image too small to format".into()));
         }
@@ -788,16 +802,35 @@ impl Fs {
         }
         // R1 fix: each slot owns its bitmap area (slot s → area s).
         // Initialize both areas so either slot is readable.
-        store::write_bitmap(&dev, &bitmap, 2, bblocks)?;
-        store::write_bitmap(&dev, &bitmap, 2 + bblocks, bblocks)?;
+        store::write_bitmap(&dev, &bitmap, bitmap_start, bblocks)?;
+        store::write_bitmap(&dev, &bitmap, bitmap_start + bblocks, bblocks)?;
         // Mark the CRC sidecar areas with magic so open() knows this image
         // has bitmap CRCs (v3 images lack the magic → skip verification).
-        Self::write_crc_magic(&dev, 2 + 2 * bblocks, cb)?;
-        Self::write_crc_magic(&dev, 2 + 2 * bblocks + cb, cb)?;
+        Self::write_crc_magic(&dev, bitmap_start + 2 * bblocks, cb)?;
+        Self::write_crc_magic(&dev, bitmap_start + 2 * bblocks + cb, cb)?;
         // Write initial CRCs for both bitmap areas.
         let raw = bitmap.to_bytes();
-        Self::write_bitmap_crcs(&dev, &raw, 2, bblocks, 2 + 2 * bblocks)?;
-        Self::write_bitmap_crcs(&dev, &raw, 2 + bblocks, bblocks, 2 + 2 * bblocks + cb)?;
+        Self::write_bitmap_crcs(
+            &dev,
+            &raw,
+            bitmap_start,
+            bblocks,
+            bitmap_start + 2 * bblocks,
+        )?;
+        Self::write_bitmap_crcs(
+            &dev,
+            &raw,
+            bitmap_start + bblocks,
+            bblocks,
+            bitmap_start + 2 * bblocks + cb,
+        )?;
+        // R6: initialize the lease block (empty holder, epoch 0).
+        crate::lease::write_lease(
+            path,
+            crate::lease::LEASE_BLOCK,
+            &crate::lease::LeaseState::empty(),
+        )
+        .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
         let shared = Arc::new(Mutex::new(Shared {
             dev: Arc::clone(&dev),
             bitmap,
@@ -813,7 +846,10 @@ impl Fs {
         let mut fs = Fs {
             shared: Arc::clone(&shared),
             dev: Arc::clone(&dev),
-            sb: Superblock::blank(blocks, 2, bblocks),
+            image_path: path.to_path_buf(),
+            lease_block: Some(crate::lease::LEASE_BLOCK),
+            lease_epoch: None,
+            sb: Superblock::blank(blocks, bitmap_start, bblocks),
             active_slot: 0,
             inodes: InodeTree::open(ia, iroot, 0),
             dirs: DirTree::open(da, droot, 0),
@@ -944,7 +980,7 @@ impl Fs {
             // Bitmap CRCs pass; try to open the trees. If the tree blocks
             // are corrupt (torn write), fall back to the older generation.
             let gen = sb.generation;
-            match Self::open_with_sb(dev, sb, slot, has_crcs) {
+            match Self::open_with_sb(dev, path, sb, slot, has_crcs) {
                 Ok(fs) => return Ok(fs),
                 Err(FsError::Corrupt(what)) => {
                     eprintln!(
@@ -971,6 +1007,7 @@ impl Fs {
     /// Open with a specific superblock slot already chosen (after CRC verification).
     fn open_with_sb(
         dev: FileDevice,
+        path: &Path,
         sb: superblock::Superblock,
         active_slot: usize,
         has_bitmap_crcs: bool,
@@ -1070,6 +1107,15 @@ impl Fs {
         let mut fs = Fs {
             shared,
             dev: Arc::clone(&dev),
+            image_path: path.to_path_buf(),
+            // R6: detect the lease block by its magic. Legacy images
+            // (block 2 = bitmap) have no magic → lease ops are unsupported.
+            lease_block: match crate::lease::read_lease(path, crate::lease::LEASE_BLOCK) {
+                Ok(Some(_)) => Some(crate::lease::LEASE_BLOCK),
+                Ok(None) => None,
+                Err(e) => return Err(FsError::Store(crate::store::StoreError::Io(e))),
+            },
+            lease_epoch: None,
             sb,
             active_slot,
             inodes,
@@ -1360,10 +1406,12 @@ impl Fs {
         {
             let mut sh = self.shared.lock().unwrap();
             let cb = superblock::bitmap_crc_blocks(self.sb.bitmap_blocks);
+            // R6: the lease block sits at 2 and the bitmap starts at
+            // `bitmap_start` (3 on R6+ images, 2 on legacy images).
             let reserved = if self.has_bitmap_crcs {
-                2 + 2 * self.sb.bitmap_blocks + 2 * cb
+                self.sb.bitmap_start + 2 * self.sb.bitmap_blocks + 2 * cb
             } else {
-                2 + 2 * self.sb.bitmap_blocks
+                self.sb.bitmap_start + 2 * self.sb.bitmap_blocks
             };
             for b in reserved..self.sb.block_count {
                 if reachable.contains(&b) {
@@ -1678,6 +1726,10 @@ impl Fs {
     /// leaves the previous slot pointing at the previous bitmap area: the
     /// previous generation stays fully consistent.
     pub fn commit(&mut self) -> Result<(), FsError> {
+        // R6: fencing — refuse the durable commit if another node took the
+        // lease since our acquire. Checked before staging so a fenced node
+        // cannot advance the generation.
+        self.check_fenced()?;
         self.commit_async()?;
         self.sync_txg()?;
         Ok(())
@@ -2125,10 +2177,12 @@ impl Fs {
         // Reconcile against the active bitmap area.
         let sh = self.shared.lock().unwrap();
         let cb = superblock::bitmap_crc_blocks(self.sb.bitmap_blocks);
+        // R6: the lease block sits at 2 and the bitmap starts at
+        // `bitmap_start` (3 on R6+ images, 2 on legacy images).
         let reserved = if self.has_bitmap_crcs {
-            2 + 2 * self.sb.bitmap_blocks + 2 * cb
+            self.sb.bitmap_start + 2 * self.sb.bitmap_blocks + 2 * cb
         } else {
-            2 + 2 * self.sb.bitmap_blocks
+            self.sb.bitmap_start + 2 * self.sb.bitmap_blocks
         };
         let mut allocated_blocks = 0u64;
         // R3: blocks in the deferred-free queues are marked allocated but
@@ -2198,10 +2252,12 @@ impl Fs {
         }
 
         let cb = superblock::bitmap_crc_blocks(self.sb.bitmap_blocks);
+        // R6: the lease block sits at 2 and the bitmap starts at
+        // `bitmap_start` (3 on R6+ images, 2 on legacy images).
         let reserved = if self.has_bitmap_crcs {
-            2 + 2 * self.sb.bitmap_blocks + 2 * cb
+            self.sb.bitmap_start + 2 * self.sb.bitmap_blocks + 2 * cb
         } else {
-            2 + 2 * self.sb.bitmap_blocks
+            self.sb.bitmap_start + 2 * self.sb.bitmap_blocks
         };
         let mut reclaimed = 0u64;
         {
@@ -3167,38 +3223,54 @@ impl Fs {
         Ok(out)
     }
 
-    // ---- Leader lease (P0: fencing) ----
+    // ---- Leader lease (R6: robust fencing) ----
     //
-    // Only one node may hold the write lease at a time. The lease is
-    // stored in the superblock (lease_holder + lease_expiry).
+    // Only one node may hold the write lease at a time. The lease lives on
+    // a dedicated block (R6), not in the superblock, so acquire/renew/
+    // release never rewrite the superblock slots (the fallback generation
+    // stays intact). Lease I/O uses O_DIRECT where supported to bypass the
+    // page cache on shared SAN devices.
+
+    /// Lease block number, or an error if this is a legacy image.
+    fn lease_blk(&self) -> Result<u64, FsError> {
+        self.lease_block.ok_or_else(|| {
+            FsError::Invalid("leases not supported on pre-R6 images (no lease block)".into())
+        })
+    }
 
     /// Try to acquire the write lease. Returns true if acquired.
     /// Returns false if another node holds a live lease.
     pub fn lease_acquire(&mut self, node_id: &str, ttl_secs: u64) -> Result<bool, FsError> {
-        // Serialize the read-modify-write against other processes via an
-        // exclusive file lock; without it two racers can both see an empty
-        // holder and both "win" (split-brain).
+        let blk = self.lease_blk()?;
+        // Serialize the read-modify-write against other processes on this
+        // host via an exclusive file lock; without it two racers can both
+        // see an empty holder and both "win" (split-brain). (On shared SAN
+        // without flock, the fencing epoch is the backstop.)
         let sh = self.shared.lock().unwrap();
         sh.dev
             .lock_exclusive()
             .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
         let res = (|| -> Result<bool, FsError> {
-            let (sb, _) =
-                superblock::open(&sh.dev).map_err(|e| FsError::Invalid(format!("{e}")))?;
             let now = now_secs();
+            let mut st = crate::lease::read_lease(&self.image_path, blk)
+                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?
+                .unwrap_or_else(crate::lease::LeaseState::empty);
 
-            let holder_empty = sb.lease_holder.iter().all(|&b| b == 0);
-            let expired = sb.lease_expiry <= now;
-            let holder = lease_holder_name(&sb);
-
-            if !holder_empty && !expired && holder != node_id {
+            if st.is_live(now) && st.holder_name() != node_id {
                 return Ok(false);
             }
 
-            let mut sb = sb;
-            sb.lease_holder = lease_node_id_bytes(node_id);
-            sb.lease_expiry = now + ttl_secs;
-            superblock::write_slots(&sh.dev, &sb).map_err(|e| FsError::Invalid(format!("{e}")))?;
+            let holder_changed = st.holder_name() != node_id;
+            st.holder = crate::lease::node_id_bytes(node_id);
+            st.expiry = now + ttl_secs;
+            if holder_changed {
+                // New holder (or first acquire): bump the fencing epoch so
+                // any previous holder's in-flight commits are rejected.
+                st.epoch = st.epoch.wrapping_add(1);
+            }
+            crate::lease::write_lease(&self.image_path, blk, &st)
+                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+            self.lease_epoch = Some(st.epoch);
             Ok(true)
         })();
         sh.dev
@@ -3208,20 +3280,24 @@ impl Fs {
     }
 
     /// Renew the lease. Returns true if renewed, false if we lost it.
+    /// Renewal extends the expiry; the fencing epoch is unchanged.
     pub fn lease_renew(&mut self, node_id: &str, ttl_secs: u64) -> Result<bool, FsError> {
+        let blk = self.lease_blk()?;
         let sh = self.shared.lock().unwrap();
         sh.dev
             .lock_exclusive()
             .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
         let res = (|| -> Result<bool, FsError> {
-            let (sb, _) =
-                superblock::open(&sh.dev).map_err(|e| FsError::Invalid(format!("{e}")))?;
-            if lease_holder_name(&sb) != node_id {
+            let mut st = crate::lease::read_lease(&self.image_path, blk)
+                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?
+                .unwrap_or_else(crate::lease::LeaseState::empty);
+            if st.holder_name() != node_id {
                 return Ok(false);
             }
-            let mut sb = sb;
-            sb.lease_expiry = now_secs() + ttl_secs;
-            superblock::write_slots(&sh.dev, &sb).map_err(|e| FsError::Invalid(format!("{e}")))?;
+            st.expiry = now_secs() + ttl_secs;
+            crate::lease::write_lease(&self.image_path, blk, &st)
+                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+            self.lease_epoch = Some(st.epoch);
             Ok(true)
         })();
         sh.dev
@@ -3232,27 +3308,33 @@ impl Fs {
 
     /// Check if we still hold the lease (without renewing).
     pub fn lease_check(&self, node_id: &str) -> Result<bool, FsError> {
-        let sh = self.shared.lock().unwrap();
-        let (sb, _) = superblock::open(&sh.dev).map_err(|e| FsError::Invalid(format!("{e}")))?;
-        Ok(lease_holder_name(&sb) == node_id && sb.lease_expiry > now_secs())
+        let blk = self.lease_blk()?;
+        let st = crate::lease::read_lease(&self.image_path, blk)
+            .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?
+            .unwrap_or_else(crate::lease::LeaseState::empty);
+        Ok(st.holder_name() == node_id && st.expiry > now_secs())
     }
 
     /// Voluntarily release the lease.
     pub fn lease_release(&mut self, node_id: &str) -> Result<(), FsError> {
+        let blk = self.lease_blk()?;
         let sh = self.shared.lock().unwrap();
         sh.dev
             .lock_exclusive()
             .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
         let res = (|| -> Result<(), FsError> {
-            let (sb, _) =
-                superblock::open(&sh.dev).map_err(|e| FsError::Invalid(format!("{e}")))?;
-            if lease_holder_name(&sb) == node_id {
-                let mut sb = sb;
-                sb.lease_holder = [0u8; 32];
-                sb.lease_expiry = 0;
-                superblock::write_slots(&sh.dev, &sb)
-                    .map_err(|e| FsError::Invalid(format!("{e}")))?;
+            let mut st = crate::lease::read_lease(&self.image_path, blk)
+                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?
+                .unwrap_or_else(crate::lease::LeaseState::empty);
+            if st.holder_name() == node_id {
+                let epoch = st.epoch;
+                st = crate::lease::LeaseState::empty();
+                // Keep the epoch: a release is not a new holder.
+                st.epoch = epoch;
+                crate::lease::write_lease(&self.image_path, blk, &st)
+                    .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
             }
+            self.lease_epoch = None;
             Ok(())
         })();
         sh.dev
@@ -3260,20 +3342,22 @@ impl Fs {
             .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
         res
     }
-}
 
-fn lease_node_id_bytes(node_id: &str) -> [u8; 32] {
-    let mut b = [0u8; 32];
-    let src = node_id.as_bytes();
-    let n = src.len().min(32);
-    b[..n].copy_from_slice(&src[..n]);
-    b
-}
-
-fn lease_holder_name(sb: &superblock::Superblock) -> String {
-    String::from_utf8_lossy(&sb.lease_holder)
-        .trim_end_matches('\0')
-        .to_string()
+    /// R6: fencing check. If we hold a lease, the on-disk epoch must match
+    /// the epoch from our acquire; otherwise another node took the lease
+    /// and our commit is rejected.
+    fn check_fenced(&self) -> Result<(), FsError> {
+        if let Some(our_epoch) = self.lease_epoch {
+            let blk = self.lease_blk()?;
+            let st = crate::lease::read_lease(&self.image_path, blk)
+                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?
+                .unwrap_or_else(crate::lease::LeaseState::empty);
+            if st.epoch != our_epoch {
+                return Err(FsError::Fenced);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

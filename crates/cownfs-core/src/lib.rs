@@ -14,5 +14,6 @@ pub mod btree;
 pub mod checksum;
 pub mod crash_enum;
 pub mod engine;
+pub mod lease;
 pub mod store;
 pub mod superblock;
