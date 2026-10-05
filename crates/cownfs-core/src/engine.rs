@@ -1389,7 +1389,9 @@ impl Fs {
         slot: usize,
     ) -> Result<Vec<u64>, FsError> {
         let base_start = sb.bitmap_start + slot as u64 * sb.bitmap_blocks;
-        let bitmap_bytes = ((sb.block_count + 7) / 8) as usize;
+        // Must match Bitmap::to_bytes(): words.len() * 8, where words covers
+        // ceil(block_count / 64) u64s.
+        let bitmap_bytes = ((sb.block_count + 63) / 64) as usize * 8;
         let area_bytes = sb.bitmap_blocks as usize * BLOCK_SIZE;
         if bitmap_bytes + 8 > area_bytes {
             return Ok(Vec::new());
