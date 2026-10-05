@@ -757,7 +757,7 @@ impl Fs {
         let shared = Arc::new(Mutex::new(Shared {
             dev,
             bitmap,
-            pending_free: Vec::new(),
+            pending_free: [Vec::new(), Vec::new()],
             fault_point: None,
         }));
 
@@ -917,7 +917,7 @@ impl Fs {
         let shared = Arc::new(Mutex::new(Shared {
             dev,
             bitmap,
-            pending_free: Vec::new(),
+            pending_free: [Vec::new(), Vec::new()],
             fault_point: None,
         }));
 
@@ -1368,10 +1368,17 @@ impl Fs {
     fn persist_bitmap(&mut self, _area_start: u64) -> Result<(), FsError> {
         {
             let mut sh = self.shared.lock().unwrap();
-            let freed = std::mem::take(&mut sh.pending_free);
-            for b in freed {
+            // R3 fix: two-generation deferred free.
+            // - [1] holds blocks freed in the previous generation (N-1).
+            //   They are safe to mark free now: after this commit (N+1),
+            //   the fallback will be N, and N-1 will be unreachable.
+            // - [0] holds blocks freed in the current generation (N).
+            //   They move to [1]; they become free when N+1 commits.
+            let prev_freed = std::mem::take(&mut sh.pending_free[1]);
+            for b in prev_freed {
                 sh.bitmap.clear(b);
             }
+            sh.pending_free[1] = std::mem::take(&mut sh.pending_free[0]);
         }
         // R1 fix: always write a full checkpoint, never a delta.
         //
@@ -1466,8 +1473,10 @@ impl Fs {
         self.flush_all()?;
         {
             let mut sh = self.shared.lock().unwrap();
-            let freed = std::mem::take(&mut sh.pending_free);
-            for b in freed {
+            // mkfs path: no fallback to protect, drain both queues.
+            let freed0 = std::mem::take(&mut sh.pending_free[0]);
+            let freed1 = std::mem::take(&mut sh.pending_free[1]);
+            for b in freed0.into_iter().chain(freed1) {
                 sh.bitmap.clear(b);
             }
         }
@@ -1956,7 +1965,7 @@ impl Fs {
             // reclaimed in `snapshot_delete` when the last pinning
             // snapshot goes away.
         } else {
-            self.shared.lock().unwrap().pending_free.push(blk);
+            self.shared.lock().unwrap().pending_free[0].push(blk);
         }
     }
 
@@ -2704,7 +2713,7 @@ impl Fs {
         }
         for blk in deleted_blocks {
             if !self.snapshot_pinned.contains(&blk) && !live.contains(&blk) {
-                self.shared.lock().unwrap().pending_free.push(blk);
+                self.shared.lock().unwrap().pending_free[0].push(blk);
             }
         }
         Ok(())
