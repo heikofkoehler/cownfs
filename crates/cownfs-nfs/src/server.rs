@@ -235,8 +235,7 @@ impl Shared {
                                 // silently succeed and defeat the test's
                                 // error-mapping check. Real transient errors
                                 // (EIO) still retry.
-                                let injected =
-                                    matches!(e, FsError::InjectedFault(_));
+                                let injected = matches!(e, FsError::InjectedFault(_));
                                 last_err = Some(format!("{e:?}"));
                                 if injected {
                                     break;

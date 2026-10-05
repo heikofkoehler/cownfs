@@ -2355,6 +2355,20 @@ impl Fs {
         uid: u32,
         gid: u32,
     ) -> Result<u64, FsError> {
+        // T2: validate in mknode's order (parent, name, existence) first
+        // to preserve error precedence, then pre-check the total quota
+        // charge (mknode's 1 block plus the target write's growth) so a
+        // QuotaExceeded on the target write cannot leave a vestigial empty
+        // symlink behind.
+        let p = self.getattr(parent)?;
+        if p.ftype != FTYPE_DIR {
+            return Err(FsError::NotDir);
+        }
+        let key = DirKey::new(parent, name)?;
+        if self.dirs.get(&key)?.is_some() {
+            return Err(FsError::AlreadyExists);
+        }
+        self.check_quota(uid, Self::blocks_for_size(target.len() as u64))?;
         let ino = self.mknode(parent, name, FTYPE_SYMLINK, 0o777, uid, gid)?;
         self.write(ino, 0, target)?;
         Ok(ino)
@@ -2515,6 +2529,12 @@ impl Fs {
                 }
                 self.dirs.remove(&DirKey::new(existing.ino, b".")?)?;
                 self.dirs.remove(&DirKey::new(existing.ino, b"..")?)?;
+                // T2: release the victim dir's quota (rmdir does this;
+                // rename-overwrite was leaking the block).
+                if let Ok(victim) = self.getattr(existing.ino) {
+                    let blocks = Self::blocks_for_size(victim.size);
+                    self.sub_usage(victim.uid, blocks);
+                }
                 self.inodes.remove(&existing.ino)?;
             } else {
                 self.dirs.remove(&dkey)?;
@@ -2638,11 +2658,12 @@ impl Fs {
         }
         if let Some(u) = attrs.uid {
             if u != inode.uid {
-                // Transfer quota usage to the new owner.
+                // Transfer quota usage to the new owner. T2: check the new
+                // owner's quota BEFORE debiting the old owner, so a
+                // QuotaExceeded leaves accounting unchanged (atomic).
                 let blocks = Self::blocks_for_size(inode.size);
-                self.sub_usage(inode.uid, blocks);
-                // Check new owner's quota before transferring.
                 self.check_quota(u, blocks)?;
+                self.sub_usage(inode.uid, blocks);
                 self.add_usage(u, blocks);
                 inode.uid = u;
             }
@@ -3082,6 +3103,10 @@ impl Fs {
         for (k, e) in dirs.range(&lo, &hi)? {
             let name = k.name_bytes();
             if name == b"." || name == b".." {
+                continue;
+            }
+            // T2: hide the xattr backing file, mirroring readdir().
+            if dir_ino == ROOT_INO && name == XATTR_FILE {
                 continue;
             }
             out.push((name.to_vec(), e.ino, e.typ));
