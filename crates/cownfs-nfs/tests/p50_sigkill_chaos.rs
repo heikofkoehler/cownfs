@@ -112,7 +112,10 @@ fn sigkill_mid_traffic_recovers() {
         .args(["build", "-p", "cownfs-mkfs", "-p", "cownfs-fsck"])
         .status()
         .expect("cargo build helpers");
-    assert!(build.success(), "cargo build -p cownfs-mkfs -p cownfs-fsck failed");
+    assert!(
+        build.success(),
+        "cargo build -p cownfs-mkfs -p cownfs-fsck failed"
+    );
 
     // Simple unique name (distinct from p50_minimal test).
     let img = std::env::temp_dir().join(format!("p50-chaos-{}.img", std::process::id()));

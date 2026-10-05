@@ -23,7 +23,6 @@ fn write_file(c: &mut NfsClient, uuid: &[u8; 16], clientid: u64, name: &[u8], da
     overall
 }
 
-
 #[test]
 fn fault_after_flush_returns_io_and_server_survives() {
     let srv = common::spawn_server(4096);
@@ -32,7 +31,10 @@ fn fault_after_flush_returns_io_and_server_survives() {
 
     srv.arm_fault(FaultPoint::AfterFlush);
     let overall = write_file(&mut c, &srv.uuid, clientid, b"f", b"hello");
-    assert_eq!(overall, NFS4ERR_IO, "faulted WRITE should return NFS4ERR_IO");
+    assert_eq!(
+        overall, NFS4ERR_IO,
+        "faulted WRITE should return NFS4ERR_IO"
+    );
 
     // Server still alive: GETATTR works.
     let mut ops = Ops::new();
@@ -63,7 +65,10 @@ fn fault_after_bitmap_returns_io() {
 
     srv.arm_fault(FaultPoint::AfterBitmap);
     let overall = write_file(&mut c, &srv.uuid, clientid, b"f", b"world");
-    assert_eq!(overall, NFS4ERR_IO, "faulted WRITE should return NFS4ERR_IO");
+    assert_eq!(
+        overall, NFS4ERR_IO,
+        "faulted WRITE should return NFS4ERR_IO"
+    );
 
     // Server still alive and retry succeeds.
     let mut ops = Ops::new();

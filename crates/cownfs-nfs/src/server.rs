@@ -210,7 +210,9 @@ impl Shared {
                                                 if let Ok(mut f) = fs.write() {
                                                     f.finish_sync(p)
                                                 } else {
-                                                    Err(FsError::Invalid("lock poisoned".to_string()))
+                                                    Err(FsError::Invalid(
+                                                        "lock poisoned".to_string(),
+                                                    ))
                                                 }
                                             }
                                             Err(e) => Err(e),
@@ -2110,7 +2112,10 @@ impl Session {
             // coalesces many concurrent FILE_SYNCs onto one physical commit.
             let txg = self.fs().mark_txg_dirty();
             // If background sync is disabled, do a direct sync.
-            let interval = self.shared.txg_interval_ms.load(std::sync::atomic::Ordering::Relaxed);
+            let interval = self
+                .shared
+                .txg_interval_ms
+                .load(std::sync::atomic::Ordering::Relaxed);
             if interval == u64::MAX {
                 if let Err(e) = self.fs_mut().sync_txg() {
                     return OpResult::err(OP_WRITE, fs_to_nfs(e));
@@ -2149,7 +2154,10 @@ impl Session {
         };
         // If background sync is disabled (interval = u64::MAX, as in some
         // tests), do a direct sync instead of waiting forever.
-        let interval = self.shared.txg_interval_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let interval = self
+            .shared
+            .txg_interval_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
         if interval == u64::MAX {
             // Background disabled: sync directly under write lock.
             if let Err(e) = self.fs_mut().sync_txg() {

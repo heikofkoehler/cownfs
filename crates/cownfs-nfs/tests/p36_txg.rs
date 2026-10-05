@@ -132,7 +132,6 @@ fn concurrent_sync_writes_all_succeed() {
     }
 }
 
-
 #[test]
 fn p2_group_commit_coalesces() {
     // P2 exit criteria: 64 concurrent FILE_SYNC writes → ≤ 2 physical commits.

@@ -533,7 +533,7 @@ mod tests {
         // Set a word to all ones (0 free in that word).
         bm.set_word(0, u64::MAX);
         assert_eq!(bm.free_count(), 64); // 128 - 64 = 64 free
-        // Set to all zeros.
+                                         // Set to all zeros.
         bm.set_word(0, 0);
         assert_eq!(bm.free_count(), 128);
         // Set to half.

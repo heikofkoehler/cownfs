@@ -9,8 +9,8 @@
 use std::cmp::Ordering;
 use std::sync::{Arc, Mutex};
 
-use crate::store::StoreError;
 use crate::block::BlockDevice;
+use crate::store::StoreError;
 
 /// Generational node reference.
 ///
