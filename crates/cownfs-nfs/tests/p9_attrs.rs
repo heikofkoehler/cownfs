@@ -289,3 +289,55 @@ fn unsupported_attr_is_silently_omitted() {
     assert_eq!(attr_u32(&attrs, FATTR4_TYPE), NF4DIR);
     assert!(!has_attr(&attrs, 11));
 }
+
+#[test]
+fn p3_space_attrs_reflect_allocations() {
+    // P3: GETATTR space attributes must reflect the O(1) free counter.
+    // Allocate blocks by writing a file, verify SPACE_FREE decreases.
+    let srv = spawn_server(8192);
+    let mut c = NfsClient::connect(&srv.addr);
+    let id = establish_client(&mut c, b"p3-space");
+
+    // Get initial free space.
+    let attrs_before = c
+        .getattr(
+            &srv.uuid,
+            ROOT_INO,
+            &[FATTR4_SPACE_FREE, FATTR4_SPACE_TOTAL],
+        )
+        .unwrap();
+    let free_before = attr_u64(&attrs_before, FATTR4_SPACE_FREE);
+    let total = attr_u64(&attrs_before, FATTR4_SPACE_TOTAL);
+    assert!(total > 0, "SPACE_TOTAL should be positive");
+    assert!(free_before > 0, "SPACE_FREE should be positive initially");
+    assert!(
+        free_before <= total,
+        "SPACE_FREE ({free_before}) should not exceed SPACE_TOTAL ({total})"
+    );
+
+    // Write 1 MiB (256 blocks) to a new file.
+    let ino = common::create_file(&mut c, &srv.uuid, id, ROOT_INO, b"p3-big", 0o644);
+    let mut ops = Ops::new();
+    ops.putfh(&srv.uuid, ino);
+    // 256 * 4KiB = 1 MiB
+    let data = vec![0xABu8; 1024 * 1024];
+    ops.write(0, FILE_SYNC4, &data);
+    c.check_ok(b"p3-write", ops);
+
+    // Free space should have decreased by ~1 MiB (256 blocks).
+    let attrs_after = c
+        .getattr(&srv.uuid, ROOT_INO, &[FATTR4_SPACE_FREE])
+        .unwrap();
+    let free_after = attr_u64(&attrs_after, FATTR4_SPACE_FREE);
+    let delta = free_before - free_after;
+    // Allow some slack for metadata blocks (b-tree nodes, etc.).
+    // 256 data blocks = 1 MiB; metadata should be << 1 MiB.
+    assert!(
+        delta >= 1024 * 1024,
+        "SPACE_FREE should decrease by at least 1 MiB after writing 1 MiB, got delta={delta}"
+    );
+    assert!(
+        delta < 2 * 1024 * 1024,
+        "SPACE_FREE decrease ({delta}) seems too large for 1 MiB write"
+    );
+}

@@ -541,4 +541,41 @@ mod tests {
         // 32 bits set in the word, so 128 - 32 = 96 free.
         assert_eq!(bm.free_count(), 96);
     }
+
+    #[test]
+    fn p3_idempotence() {
+        // Setting an already-set bit / clearing an already-clear bit
+        // must not change the counter.
+        let mut bm = Bitmap::new(100);
+        assert_eq!(bm.free_count(), 100);
+        bm.set(5);
+        assert_eq!(bm.free_count(), 99);
+        bm.set(5); // idempotent
+        assert_eq!(bm.free_count(), 99);
+        bm.clear(5);
+        assert_eq!(bm.free_count(), 100);
+        bm.clear(5); // idempotent
+        assert_eq!(bm.free_count(), 100);
+        // alloc_at on already-allocated bit should fail and not change count.
+        bm.set(10);
+        assert_eq!(bm.free_count(), 99);
+        assert!(!bm.alloc_at(10));
+        assert_eq!(bm.free_count(), 99);
+    }
+
+    #[test]
+    fn p3_padding_bits() {
+        // Bits beyond block_count are padding; they must not affect
+        // free_count, and set_word must not count them.
+        let mut bm = Bitmap::new(100); // 100 bits, 28 padding bits in word 1
+        assert_eq!(bm.free_count(), 100);
+        // Set word 1 (bits 64..128) to all ones. Only bits 64..100 are
+        // real; padding bits 100..128 must not reduce free_count below 0.
+        bm.set_word(1, u64::MAX);
+        // Bits 0..64 free (64), bits 64..100 used (36), padding ignored.
+        assert_eq!(bm.free_count(), 64);
+        // Clear word 1.
+        bm.set_word(1, 0);
+        assert_eq!(bm.free_count(), 100);
+    }
 }
