@@ -1651,6 +1651,17 @@ impl Fs {
     /// area, but does NOT fsync and does NOT flip the superblock slot: a
     /// crash before [`Fs::sync_txg`] loses the open txg, leaving the
     /// previous generation intact.
+    /// P2: Mark the current txg dirty without flushing.
+    /// Used by FILE_SYNC writes: they just need to ensure the txg will be
+    /// synced, not flush per-write. The background txg thread does the
+    /// actual flush + sync, coalescing many FILE_SYNCs onto one physical
+    /// commit.
+    pub fn mark_txg_dirty(&self) -> u64 {
+        let mut t = self.txg.state.lock().unwrap();
+        t.dirty = true;
+        t.current
+    }
+
     pub fn commit_async(&self) -> Result<u64, FsError> {
         let flushed = self.flush_all()?;
         self.check_fault(FaultPoint::AfterFlush)?;

@@ -143,16 +143,20 @@ fn p2_group_commit_coalesces() {
     // Use a short background txg interval so the FILE_SYNC wait() has a
     // syncer to wake it. The 64 concurrent writes should coalesce into
     // very few physical syncs.
-    srv.shared.set_txg_interval_ms(50);
+    srv.shared.set_txg_interval_ms(200);
 
     let uuid = srv.uuid;
     let baseline = srv.shared.fs.read().unwrap().sync_count();
 
     // 64 threads, each doing a FILE_SYNC write to its own file.
-    let handles: Vec<_> = (0..8)
+    // Use a barrier so all threads hit commit_async simultaneously,
+    // maximizing coalescing into a single txg.
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(64));
+    let handles: Vec<_> = (0..64)
         .map(|i| {
             let addr = srv.addr;
             let uuid = uuid;
+            let barrier = barrier.clone();
             std::thread::spawn(move || {
                 let mut c = NfsClient::connect(&addr);
                 let id = establish_client(&mut c, format!("p2-{i}").as_bytes());
@@ -164,6 +168,8 @@ fn p2_group_commit_coalesces() {
                     format!("p2-f{i}").as_bytes(),
                     0o644,
                 );
+                // Barrier: all threads hit the FILE_SYNC write simultaneously.
+                barrier.wait();
                 let mut ops = Ops::new();
                 ops.putfh(&uuid, ino);
                 ops.write(0, FILE_SYNC4, b"data");
@@ -184,5 +190,69 @@ fn p2_group_commit_coalesces() {
     assert!(
         physical_commits <= 2,
         "P2: 64 concurrent FILE_SYNC writes should coalesce to ≤ 2 physical commits, got {physical_commits}"
+    );
+}
+
+#[test]
+fn p2_commit_coalesces() {
+    // P2 exit criteria: 64 concurrent COMMITs → ≤ 2 physical commits.
+    // This test FAILS before the P2 fix (op_commit called sync_txg directly,
+    // bypassing group commit, so 64 COMMITs = 64 physical commits).
+    let img = test_image();
+    let srv = spawn_server_on(&img);
+    // Short background interval for reasonable COMMIT latency.
+    srv.shared.set_txg_interval_ms(200);
+
+    let uuid = srv.uuid;
+    let baseline = srv.shared.fs.read().unwrap().sync_count();
+
+    // 64 threads, each doing an UNSTABLE write followed by COMMIT.
+    // The UNSTABLE writes dirty the trees; the COMMITs should coalesce.
+    // Use a barrier for maximum coalescing.
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(64));
+    let handles: Vec<_> = (0..64)
+        .map(|i| {
+            let addr = srv.addr;
+            let uuid = uuid;
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut c = NfsClient::connect(&addr);
+                let id = establish_client(&mut c, format!("p2c-{i}").as_bytes());
+                let ino = common::create_file(
+                    &mut c,
+                    &uuid,
+                    id,
+                    ROOT_INO,
+                    format!("p2c-f{i}").as_bytes(),
+                    0o644,
+                );
+                // UNSTABLE write (does not sync).
+                let mut ops = Ops::new();
+                ops.putfh(&uuid, ino);
+                ops.write(0, UNSTABLE4, b"data");
+                c.check_ok(b"unstable", ops);
+                // Barrier: all threads hit COMMIT simultaneously.
+                barrier.wait();
+                // COMMIT (should coalesce via txg).
+                let mut ops = Ops::new();
+                ops.putfh(&uuid, ino);
+                ops.commit();
+                c.check_ok(b"commit", ops);
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let final_count = srv.shared.fs.read().unwrap().sync_count();
+    let physical_commits = final_count - baseline;
+
+    drop(srv);
+    let _ = std::fs::remove_file(&img);
+
+    assert!(
+        physical_commits <= 2,
+        "P2: 64 concurrent COMMITs should coalesce to ≤ 2 physical commits, got {physical_commits}"
     );
 }

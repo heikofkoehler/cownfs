@@ -2077,12 +2077,10 @@ impl Session {
         // it as FILE_SYNC4 (full sync); this is stronger than required
         // (data-only) but correct.
         let committed = if stable == FILE_SYNC4 || stable == DATA_SYNC4 {
-            // P1: commit_async takes &self, so we use the read lock (not
-            // write). The I/O is done without blocking other writers.
-            let txg = match self.fs().commit_async() {
-                Ok(t) => t,
-                Err(e) => return OpResult::err(OP_WRITE, fs_to_nfs(e)),
-            };
+            // P2: FILE_SYNC only marks the txg dirty and waits for the
+            // background thread to sync (no flush per write). This
+            // coalesces many concurrent FILE_SYNCs onto one physical commit.
+            let txg = self.fs().mark_txg_dirty();
             // Wait can fail if the background sync thread hit a persistent
             // error (disk failure). Map to NFS4ERR_IO, don't hang.
             if let Err(_) = self.shared.txg.wait(txg) {
@@ -2105,22 +2103,24 @@ impl Session {
     }
 
     fn op_commit(&mut self, _offset: u64, _count: u32) -> OpResult {
-        // P1: commit_async (I/O) runs under the read lock; sync_txg (fast
-        // superblock flip) runs under the write lock.
-        let async_res = self.fs().commit_async();
-        let sync_res = match async_res {
-            Ok(_) => self.fs_mut().sync_txg().map(|_| ()),
-            Err(e) => Err(e),
+        // P2: COMMIT goes through the txg for group commit. commit_async
+        // (I/O) runs under the read lock; then wait for the txg to sync
+        // (coalescing concurrent COMMITs onto one physical sync). Do NOT
+        // call sync_txg() directly -- that bypasses group commit.
+        let txg = match self.fs().commit_async() {
+            Ok(t) => t,
+            Err(e) => return OpResult::err(OP_COMMIT, fs_to_nfs(e)),
         };
-        match sync_res {
-            Ok(()) => {
-                let mut w = Writer::new();
-                // R2: boot verifier.
-                w.opaque_fixed(&self.shared.boot_verifier);
-                OpResult::ok(OP_COMMIT, w.into_bytes())
-            }
-            Err(e) => OpResult::err(OP_COMMIT, fs_to_nfs(e)),
+        // Wait for the background txg thread to sync (group commit).
+        // The background interval should be short (e.g., 50ms) for
+        // reasonable COMMIT latency.
+        if self.shared.txg.wait(txg).is_err() {
+            return OpResult::err(OP_COMMIT, NFS4ERR_IO);
         }
+        let mut w = Writer::new();
+        // R2: boot verifier.
+        w.opaque_fixed(&self.shared.boot_verifier);
+        OpResult::ok(OP_COMMIT, w.into_bytes())
     }
 
     fn op_setclientid(&mut self, verifier: [u8; 8], name: &[u8]) -> OpResult {
