@@ -1470,23 +1470,35 @@ impl Fs {
     fn persist_bitmap_full(&self, target_slot: usize) -> Result<(), FsError> {
         let blocks = self.sb.bitmap_blocks;
         let mut sh = self.shared.lock().unwrap();
-        // R3: if the deferred queue exceeds the bitmap area padding, free the
-        // excess [1] blocks now (safe: 2 gens old, writing to new slot
-        // pre-flip) rather than leaking them. Do this before capturing raw.
+        // R3: the deferred queue is persisted in bitmap area padding. If the
+        // queue exceeds padding (or there's no padding), free [1] blocks now
+        // (safe: 2 gens old, writing to new slot pre-flip) rather than
+        // leaking them on reopen. Do this before capturing raw.
         {
             let bitmap_bytes = ((self.sb.block_count + 63) / 64) as usize * 8;
             let area_bytes = blocks as usize * BLOCK_SIZE;
-            if bitmap_bytes + 8 <= area_bytes {
-                let avail = (area_bytes - (bitmap_bytes + 8)) / 8;
-                let total = sh.pending_free[0].len() + sh.pending_free[1].len();
-                if total > avail {
-                    let excess = total - avail;
-                    let free_now = excess.min(sh.pending_free[1].len());
-                    for _ in 0..free_now {
-                        if let Some(b) = sh.pending_free[1].pop() {
-                            sh.bitmap.clear(b);
-                        }
-                    }
+            let avail = if bitmap_bytes + 8 <= area_bytes {
+                (area_bytes - (bitmap_bytes + 8)) / 8
+            } else {
+                0
+            };
+            let total = sh.pending_free[0].len() + sh.pending_free[1].len();
+            if total > avail {
+                // Free from [1] (older) first; if still over, free from [0].
+                // [0] blocks are 1 gen old, but we're committing now and
+                // writing to the new slot pre-flip, so freeing is safe
+                // (crash before flip falls back to old slot's bitmap).
+                let mut to_free = total - avail;
+                while to_free > 0 {
+                    let b = if !sh.pending_free[1].is_empty() {
+                        sh.pending_free[1].pop().unwrap()
+                    } else if !sh.pending_free[0].is_empty() {
+                        sh.pending_free[0].pop().unwrap()
+                    } else {
+                        break;
+                    };
+                    sh.bitmap.clear(b);
+                    to_free -= 1;
                 }
             }
         }
@@ -1627,6 +1639,9 @@ impl Fs {
         // future generation number that is never committed to the
         // superblock, leaving the image in a state that fails fsck.
         if flushed {
+            {
+                let sh = self.shared.lock().unwrap();
+            }
             self.persist_bitmap(0)?; // area_start unused (delta bitmap)
             self.check_fault(FaultPoint::AfterBitmap)?;
         }
@@ -1978,17 +1993,16 @@ impl Fs {
         // R3: blocks in the deferred-free queues are marked allocated but
         // intentionally unreachable (they'll be freed on the next commit).
         // Exclude them from the unreachable check.
-        let deferred: std::collections::HashSet<u64> = sh.pending_free[0]
-            .iter()
-            .chain(sh.pending_free[1].iter())
-            .copied()
-            .collect();
+        static CHK_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let chk_n = CHK_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         for b in 0..self.sb.block_count {
             if !sh.bitmap.test(b) {
                 continue;
             }
             allocated_blocks += 1;
-            if b >= reserved && !reachable.contains(&b) && !deferred.contains(&b) {
+            let in_q0 = sh.pending_free[0].contains(&b);
+            let in_q1 = sh.pending_free[1].contains(&b);
+            if b >= reserved && !reachable.contains(&b) && !in_q0 && !in_q1 {
                 return Err(FsError::Invalid(format!(
                     "block {b} marked allocated but unreachable"
                 )));

@@ -488,6 +488,8 @@ impl<K, V> BlockArena<K, V> {
 
     fn free_block(&mut self, block: u64) {
         self.cache.remove(&block);
+        if block == 12875 {
+        }
         // Deferred: the bit is cleared at commit, after the new bitmap
         // area is written. See `Shared::pending_free`.
         self.shared.lock().unwrap().pending_free[0].push(block);
@@ -547,6 +549,9 @@ impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
             .bitmap
             .alloc()
             .ok_or(StoreError::NoSpace)?;
+        if block == 12875 {
+            eprintln!("{}", std::backtrace::Backtrace::capture());
+        }
         // Fresh blocks start a new generation. Reused blocks keep bumping it
         // so stale in-memory ids can never alias the new node.
         let gen = {
