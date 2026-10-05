@@ -852,6 +852,21 @@ impl Fs {
                     slots.push((sb, i));
                 }
             }
+            // R1: detect v3 images and give a clear migration error.
+            if slots.is_empty() {
+                for i in 0..superblock::SLOT_BLOCKS.len() {
+                    if superblock::is_v3_slot(&dev, i) {
+                        return Err(FsError::Store(crate::store::StoreError::Io(
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "v3 image detected (format version 3). v4 requires migration: \
+                                 back up data with a v3 build, reformat with v4 mkfs, and restore. \
+                                 See docs/production-readiness-plan.md R1.",
+                            ),
+                        )));
+                    }
+                }
+            }
             slots
         };
         if slots.is_empty() {

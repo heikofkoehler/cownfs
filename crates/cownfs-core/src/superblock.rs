@@ -243,6 +243,21 @@ pub fn read_slot(dev: &impl BlockDevice, slot: usize) -> Option<Superblock> {
     Superblock::decode(&hdr)
 }
 
+/// Check if a slot contains a v3 superblock (for R1 migration error).
+/// Returns true if the magic matches but the version is 3.
+pub fn is_v3_slot(dev: &impl BlockDevice, slot: usize) -> bool {
+    let mut blk: Block = [0; BLOCK_SIZE];
+    if dev.read_block(SLOT_BLOCKS[slot], &mut blk).is_err() {
+        return false;
+    }
+    let magic = u64::from_le_bytes(blk[0..8].try_into().unwrap_or([0u8; 8]));
+    if magic != MAGIC {
+        return false;
+    }
+    let version = u32::from_le_bytes(blk[8..12].try_into().unwrap_or([0u8; 4]));
+    version == 3
+}
+
 /// Formats a fresh P0-style image: writes the bitmap and both superblock
 /// slots at generation 1 (no filesystem trees; roots are zero).
 /// The engine's `format_fs` builds on this for full P2 images.
