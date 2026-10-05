@@ -149,31 +149,41 @@ impl Shared {
             ));
             match weak_fs.upgrade() {
                 Some(fs) => {
-                    if let Ok(mut f) = fs.write() {
-                        // Retry sync up to 3 times before reporting failure.
-                        // On persistent failure, wake FILE_SYNC4 waiters with
-                        // the error (they'd block forever otherwise).
-                        let mut last_err = None;
-                        for _ in 0..3 {
-                            // Stage dirty in-memory trees (flush, persist
-                            // bitmap), then sync (fsync, flip superblock).
-                            // UNSTABLE writes leave trees dirty in memory;
-                            // the background thread stages them here.
-                            let stage = f.commit_async();
-                            let sync = match stage {
-                                Ok(_) => f.sync_txg(),
-                                Err(e) => Err(e),
-                            };
-                            match sync {
-                                Ok(_) => {
-                                    last_err = None;
-                                    break;
+                    // P1: commit_async (I/O) runs under read lock; sync_txg
+                    // (fast) runs under write lock. Retry up to 3 times.
+                    let mut last_err = None;
+                    for _ in 0..3 {
+                        // Stage dirty in-memory trees (flush, persist bitmap)
+                        // without holding the write lock.
+                        // UNSTABLE writes leave trees dirty in memory;
+                        // the background thread stages them here.
+                        let stage = if let Ok(f) = fs.read() {
+                            f.commit_async()
+                        } else {
+                            Err(FsError::Invalid("lock poisoned".to_string()))
+                        };
+                        // Sync (fsync, flip superblock) under write lock.
+                        let sync = match stage {
+                            Ok(_) => {
+                                if let Ok(mut f) = fs.write() {
+                                    f.sync_txg()
+                                } else {
+                                    Err(FsError::Invalid("lock poisoned".to_string()))
                                 }
-                                Err(e) => last_err = Some(format!("{e:?}")),
                             }
-                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            Err(e) => Err(e),
+                        };
+                        match sync {
+                            Ok(_) => {
+                                last_err = None;
+                                break;
+                            }
+                            Err(e) => last_err = Some(format!("{e:?}")),
                         }
-                        if let Some(e) = last_err {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    if let Some(e) = last_err {
+                        if let Ok(f) = fs.read() {
                             f.txg().set_error(e);
                         }
                     }
@@ -2027,7 +2037,9 @@ impl Session {
         // it as FILE_SYNC4 (full sync); this is stronger than required
         // (data-only) but correct.
         let committed = if stable == FILE_SYNC4 || stable == DATA_SYNC4 {
-            let txg = match self.fs_mut().commit_async() {
+            // P1: commit_async takes &self, so we use the read lock (not
+            // write). The I/O is done without blocking other writers.
+            let txg = match self.fs().commit_async() {
                 Ok(t) => t,
                 Err(e) => return OpResult::err(OP_WRITE, fs_to_nfs(e)),
             };
@@ -2053,7 +2065,14 @@ impl Session {
     }
 
     fn op_commit(&mut self, _offset: u64, _count: u32) -> OpResult {
-        match self.fs_mut().commit() {
+        // P1: commit_async (I/O) runs under the read lock; sync_txg (fast
+        // superblock flip) runs under the write lock.
+        let async_res = self.fs().commit_async();
+        let sync_res = match async_res {
+            Ok(_) => self.fs_mut().sync_txg().map(|_| ()),
+            Err(e) => Err(e),
+        };
+        match sync_res {
             Ok(()) => {
                 let mut w = Writer::new();
                 // R2: boot verifier.

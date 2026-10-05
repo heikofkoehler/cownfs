@@ -566,12 +566,15 @@ pub struct Fs {
     /// `.xattrs` file in the root directory; loaded on open.
     xattrs: std::collections::HashMap<(u64, Vec<u8>), Vec<u8>>,
     /// Commits since the last full bitmap checkpoint (for delta bitmap).
-    commits_since_checkpoint: u64,
+    /// P1: Mutex for commit_async(&self).
+    commits_since_checkpoint: std::sync::Mutex<u64>,
     /// Bytes written by the last persist_bitmap (for benchmarking).
-    last_bitmap_write_bytes: u64,
+    /// P1: Mutex for commit_async(&self).
+    last_bitmap_write_bytes: std::sync::Mutex<u64>,
     /// Blocks allocated in the current txg (not yet committed).
     /// In-place overwrites are only safe for these blocks.
-    txg_allocated: std::collections::HashSet<u64>,
+    /// P1: Mutex for commit_async(&self).
+    txg_allocated: std::sync::Mutex<std::collections::HashSet<u64>>,
     /// True if the image has bitmap CRC sidecar areas (magic present).
     /// v3 images lack them → CRC verification skipped.
     has_bitmap_crcs: bool,
@@ -781,9 +784,9 @@ impl Fs {
             quotas: std::collections::HashMap::new(),
             quota_usage: std::collections::HashMap::new(),
             xattrs: std::collections::HashMap::new(),
-            commits_since_checkpoint: 0,
-            last_bitmap_write_bytes: 0,
-            txg_allocated: std::collections::HashSet::new(),
+            commits_since_checkpoint: std::sync::Mutex::new(0),
+            last_bitmap_write_bytes: std::sync::Mutex::new(0),
+            txg_allocated: std::sync::Mutex::new(std::collections::HashSet::new()),
             has_bitmap_crcs: true, // fresh format always has CRC sidecars
             readahead: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
@@ -1009,9 +1012,9 @@ impl Fs {
             quotas: std::collections::HashMap::new(),
             quota_usage: std::collections::HashMap::new(),
             xattrs: std::collections::HashMap::new(),
-            commits_since_checkpoint: 0,
-            last_bitmap_write_bytes: 0,
-            txg_allocated: std::collections::HashSet::new(),
+            commits_since_checkpoint: std::sync::Mutex::new(0),
+            last_bitmap_write_bytes: std::sync::Mutex::new(0),
+            txg_allocated: std::sync::Mutex::new(std::collections::HashSet::new()),
             has_bitmap_crcs,
             readahead: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
@@ -1363,7 +1366,7 @@ impl Fs {
     /// Apply deferred frees, then persist the bitmap: a delta if few words
     /// changed, else a full write (checkpoint). Updates the superblock's
     /// delta fields; the caller writes the superblock.
-    fn persist_bitmap(&mut self, _area_start: u64) -> Result<(), FsError> {
+    fn persist_bitmap(&self, _area_start: u64) -> Result<(), FsError> {
         {
             let mut sh = self.shared.lock().unwrap();
             // R3 fix: two-generation deferred free.
@@ -1397,7 +1400,7 @@ impl Fs {
     }
 
     /// Write the full bitmap to area 0 and reset delta state.
-    fn persist_bitmap_full(&mut self, target_slot: usize) -> Result<(), FsError> {
+    fn persist_bitmap_full(&self, target_slot: usize) -> Result<(), FsError> {
         let blocks = self.sb.bitmap_blocks;
         let raw = self.shared.lock().unwrap().bitmap.to_bytes();
         let mut sh = self.shared.lock().unwrap();
@@ -1416,16 +1419,16 @@ impl Fs {
             blk.copy_from_slice(chunk);
             sh.dev.write_block(write_start + i as u64, &blk)?;
         }
-        let gen = self.sb.generation + 1; // the generation we're committing
-        self.sb.bitmap_full_gen = gen;
-        self.sb.bitmap_delta_gen = gen;
+        // P1: sb.bitmap_full_gen/delta_gen no longer updated here (they're
+        // legacy from the delta scheme; with per-slot areas and no deltas,
+        // they're not needed for correctness).
         // No base_area flip: each slot has its own dedicated area.
         // (bitmap_base_area is retained in the struct for format compat
         // but is no longer used for area selection.)
-        self.last_bitmap_write_bytes = blocks * BLOCK_SIZE as u64;
+        *self.last_bitmap_write_bytes.lock().unwrap() = blocks * BLOCK_SIZE as u64;
         sh.bitmap.clear_dirty();
         drop(sh);
-        self.commits_since_checkpoint = 0;
+        *self.commits_since_checkpoint.lock().unwrap() = 0;
         // Update the CRC sidecar for the target slot's area (if CRCs present).
         if self.has_bitmap_crcs {
             let cb = superblock::bitmap_crc_blocks(blocks);
@@ -1508,7 +1511,7 @@ impl Fs {
     /// area, but does NOT fsync and does NOT flip the superblock slot: a
     /// crash before [`Fs::sync_txg`] loses the open txg, leaving the
     /// previous generation intact.
-    pub fn commit_async(&mut self) -> Result<u64, FsError> {
+    pub fn commit_async(&self) -> Result<u64, FsError> {
         let flushed = self.flush_all()?;
         self.check_fault(FaultPoint::AfterFlush)?;
         // Only persist the bitmap if something was actually flushed.
@@ -1522,7 +1525,7 @@ impl Fs {
         // Blocks are now durable (will be after sync_txg); clear the set.
         // Actually, clear after sync_txg to be safe. For now, clear here
         // since commit_async is the persist point.
-        self.txg_allocated.clear();
+        self.txg_allocated.lock().unwrap().clear();
         let mut t = self.txg.state.lock().unwrap();
         // Only mark dirty if we actually wrote something. The old
         // unconditional dirty=true caused spurious generation advances
@@ -1572,7 +1575,7 @@ impl Fs {
 
     /// Bytes written by the last bitmap persist (for benchmarking).
     pub fn last_bitmap_write_bytes(&self) -> u64 {
-        self.last_bitmap_write_bytes
+        *self.last_bitmap_write_bytes.lock().unwrap()
     }
 
     /// The transaction group coordinator (for [`TxgCoord::wait`]).
@@ -1755,7 +1758,7 @@ impl Fs {
     }
 
     /// Check for an armed fault point; if matched, disarm and abort.
-    fn check_fault(&mut self, point: FaultPoint) -> Result<(), FsError> {
+    fn check_fault(&self, point: FaultPoint) -> Result<(), FsError> {
         let armed = self.shared.lock().unwrap().fault_point;
         if armed == Some(point) {
             self.shared.lock().unwrap().fault_point = None;
@@ -1941,7 +1944,7 @@ impl Fs {
             .bitmap
             .alloc()
             .ok_or(FsError::NoSpace)?;
-        self.txg_allocated.insert(blk);
+        self.txg_allocated.lock().unwrap().insert(blk);
         Ok(blk)
     }
 
@@ -1956,7 +1959,7 @@ impl Fs {
                 sh.bitmap.alloc().ok_or(FsError::NoSpace)?
             }
         };
-        self.txg_allocated.insert(blk);
+        self.txg_allocated.lock().unwrap().insert(blk);
         Ok(blk)
     }
 
@@ -2488,7 +2491,7 @@ impl Fs {
             // pinned by a snapshot. Otherwise CoW (allocate new).
             match old {
                 Some(ext)
-                    if self.txg_allocated.contains(&ext.blk)
+                    if self.txg_allocated.lock().unwrap().contains(&ext.blk)
                         && !self.snapshot_pinned.contains(&ext.blk) =>
                 {
                     // In-place: reuse the block.
