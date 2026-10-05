@@ -183,13 +183,41 @@ impl Shared {
                         } else {
                             Err(FsError::Invalid("lock poisoned".to_string()))
                         };
-                        // Sync (fsync, flip superblock) under write lock.
+                        // P1: Three-phase sync to avoid holding the write lock
+                        // across fsync. Phase 1 (prepare) under write lock,
+                        // Phase 2 (write) with NO Fs lock held, Phase 3
+                        // (finish) under write lock (brief).
                         let sync = match stage {
                             Ok(_) => {
-                                if let Ok(mut f) = fs.write() {
-                                    f.sync_txg()
+                                // Phase 1: prepare (write lock, brief).
+                                let prepared = if let Ok(mut f) = fs.write() {
+                                    f.prepare_sync()
                                 } else {
                                     Err(FsError::Invalid("lock poisoned".to_string()))
+                                };
+                                match prepared {
+                                    Ok(Some(p)) => {
+                                        // Phase 2: write (NO Fs lock held).
+                                        // Readers can proceed during fsync.
+                                        let write_res = if let Ok(f) = fs.read() {
+                                            f.write_sync(&p)
+                                        } else {
+                                            Err(FsError::Invalid("lock poisoned".to_string()))
+                                        };
+                                        match write_res {
+                                            Ok(()) => {
+                                                // Phase 3: finish (write lock, brief).
+                                                if let Ok(mut f) = fs.write() {
+                                                    f.finish_sync(p)
+                                                } else {
+                                                    Err(FsError::Invalid("lock poisoned".to_string()))
+                                                }
+                                            }
+                                            Err(e) => Err(e),
+                                        }
+                                    }
+                                    Ok(None) => Ok(false),
+                                    Err(e) => Err(e),
                                 }
                             }
                             Err(e) => Err(e),

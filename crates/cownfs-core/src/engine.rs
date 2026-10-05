@@ -592,6 +592,10 @@ pub struct Fs {
     /// P2: count of physical sync_txg() calls (for group-commit testing).
     /// Incremented when sync_txg() does actual work (returns Ok(true)).
     sync_count: std::sync::atomic::AtomicU64,
+    /// P1: Serializes the Phase 2 (disk write) of three-phase commit.
+    /// The Fs write lock is NOT held during Phase 2, allowing readers
+    /// to proceed during fsync.
+    commit_mutex: std::sync::Mutex<()>,
 }
 
 /// Name of the hidden file backing extended attributes.
@@ -606,6 +610,13 @@ pub struct SetAttrs {
     pub size: Option<u64>,
     pub atime: Option<u64>,
     pub mtime: Option<u64>,
+}
+
+/// P1: Staged commit data for three-phase sync.
+/// Prepared under the write lock, written without it, then finished.
+pub struct PreparedCommit {
+    pub(crate) new_sb: superblock::Superblock,
+    pub(crate) slot: usize,
 }
 
 impl Fs {
@@ -800,6 +811,7 @@ impl Fs {
             has_bitmap_crcs: true, // fresh format always has CRC sidecars
             readahead: std::sync::Mutex::new(std::collections::HashMap::new()),
             sync_count: std::sync::atomic::AtomicU64::new(0),
+            commit_mutex: std::sync::Mutex::new(()),
         };
 
         let now = now_secs();
@@ -1053,6 +1065,7 @@ impl Fs {
             has_bitmap_crcs,
             readahead: std::sync::Mutex::new(std::collections::HashMap::new()),
             sync_count: std::sync::atomic::AtomicU64::new(0),
+            commit_mutex: std::sync::Mutex::new(()),
         };
         fs.rebuild_pinned()?;
         fs.rebuild_quota_usage()?;
@@ -1691,32 +1704,51 @@ impl Fs {
         Ok(t.current)
     }
 
-    /// Make the staged transaction group durable: fsync, then flip the
-    /// superblock slot. Called by the background sync thread; returns true
-    /// if a txg was synced. Wakes all [`TxgCoord::wait`] waiters.
-    pub fn sync_txg(&mut self) -> Result<bool, FsError> {
-        // Clear any previous error even if there's nothing to sync —
-        // a successful sync_txg() call resets the error state.
+    /// P1 Phase 1: Prepare the commit (under write lock).
+    /// Returns None if nothing to sync. Does NOT do I/O.
+    pub fn prepare_sync(&mut self) -> Result<Option<PreparedCommit>, FsError> {
         self.txg.clear_error();
         if !self.txg.state.lock().unwrap().dirty {
-            // Nothing to persist. Wake waiters by advancing synced to
-            // current, but do NOT increment current — no new transaction
-            // was created, and incrementing would skew block generations.
             let mut t = self.txg.state.lock().unwrap();
             t.synced = t.current;
             drop(t);
             self.txg.cv.notify_all();
-            return Ok(false);
+            return Ok(None);
         }
+        // Update in-memory roots first, then clone the SB for the commit.
+        // The actual disk write happens in write_sync() without the Fs lock.
+        self.sync_roots();
+        let new_slot = 1 - self.active_slot;
+        let mut new_sb = self.sb.clone();
+        new_sb.generation += 1;
+        Ok(Some(PreparedCommit {
+            new_sb,
+            slot: new_slot,
+        }))
+    }
+
+    /// P1 Phase 2: Write the prepared commit (WITHOUT the Fs write lock).
+    /// Does fsync + superblock write under the commit_mutex.
+    pub fn write_sync(&self, prepared: &PreparedCommit) -> Result<(), FsError> {
+        let _guard = self.commit_mutex.lock().unwrap();
         // The new generation's blocks must be on stable storage *before*
         // any superblock slot points at them.
         self.shared.lock().unwrap().dev.sync()?;
         self.check_fault(FaultPoint::AfterSync)?;
-        self.sync_roots();
-        // Note: bitmap_area is not flipped (delta bitmap: base at area 0,
-        // delta at area 1). The flip was for the old ping-pong full bitmap.
-        let mut sh = self.shared.lock().unwrap();
-        superblock::commit_generation(&mut sh.dev, &mut self.sb, &mut self.active_slot)?;
+        // Write the staged superblock to the new slot.
+        {
+            let mut sh = self.shared.lock().unwrap();
+            superblock::write_slot(&mut sh.dev, prepared.slot, &prepared.new_sb)?;
+            sh.dev.sync()?;
+        }
+        Ok(())
+    }
+
+    /// P1 Phase 3: Finish the commit (under write lock, brief).
+    /// Updates in-memory state to match what was written.
+    pub fn finish_sync(&mut self, prepared: PreparedCommit) -> Result<bool, FsError> {
+        self.active_slot = prepared.slot;
+        self.sb = prepared.new_sb;
         let mut t = self.txg.state.lock().unwrap();
         t.synced = t.current;
         t.current += 1;
@@ -1724,13 +1756,34 @@ impl Fs {
         t.error = None;
         drop(t);
         self.txg.cv.notify_all();
-        // P9: txg is durable; dirty bytes are now clean.
         self.dirty_bytes
             .store(0, std::sync::atomic::Ordering::Relaxed);
-        // P2: count physical commits for group-commit testing.
         self.sync_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(true)
+    }
+
+    /// Make the staged transaction group durable: fsync, then flip the
+    /// superblock slot. Called by the background sync thread; returns true
+    /// if a txg was synced. Wakes all [`TxgCoord::wait`] waiters.
+    ///
+    /// P1: This is now a convenience wrapper around the three-phase API.
+    /// For true lock-free commit, use prepare_sync/write_sync/finish_sync
+    /// directly to avoid holding the write lock across fsync.
+    pub fn sync_txg(&mut self) -> Result<bool, FsError> {
+        // P1: Use the three-phase API. Note: this wrapper still holds
+        // the &mut (write lock) across the phases, so it does NOT achieve
+        // the P1 goal. Callers seeking the P1 benefit must use
+        // prepare_sync/write_sync/finish_sync directly with lock release
+        // between phases.
+        let prepared = self.prepare_sync()?;
+        match prepared {
+            None => Ok(false),
+            Some(p) => {
+                self.write_sync(&p)?;
+                self.finish_sync(p)
+            }
+        }
     }
 
     /// P2: number of physical sync_txg() calls (for testing group commit).
