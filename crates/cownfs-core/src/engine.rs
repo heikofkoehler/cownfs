@@ -4145,4 +4145,62 @@ mod tests {
         assert!(fs.snapshot_lookup(999, 1, b"nope").is_err());
         std::fs::remove_file(&path).unwrap();
     }
+
+    #[test]
+    fn t9_eio_on_read_returns_error_no_panic() {
+        // T9: Injected EIO on read must return an error (not panic, not hang).
+        // We test via Fs::open (which does device reads) since in-memory
+        // reads hit the cache.
+        let (mut fs, path) = test_fs(256);
+        let ino = fs.create(ROOT_INO, b"f", 0o644, 0, 0).unwrap();
+        fs.write(ino, 0, b"hello").unwrap();
+        fs.commit().unwrap();
+        drop(fs);
+
+        // Open with EIO on reads: should fail (not panic, not hang).
+        // We can't easily inject faults during open (device is created
+        // internally), so we test the FileDevice directly.
+        use crate::block::{BlockDevice, FileDevice};
+        let mut dev = FileDevice::open(&path).unwrap();
+        let mut faults = crate::block::FaultInjector::new();
+        faults.fail_reads = true;
+        dev.set_faults(faults);
+        let mut buf = [0u8; crate::BLOCK_SIZE];
+        let result = dev.read_block(0, &mut buf);
+        assert!(result.is_err(), "read_block with injected EIO should fail");
+
+        // Clear faults; read should work (no poisoning).
+        dev.set_faults(crate::block::FaultInjector::new());
+        dev.read_block(0, &mut buf).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn t9_eio_on_sync_txg_recovers() {
+        // T9: Injected EIO on sync must fail the txg, but the txg must
+        // recover after the fault is cleared (no hangs, no poisoning).
+        let (mut fs, path) = test_fs(256);
+        let ino = fs.create(ROOT_INO, b"f", 0o644, 0, 0).unwrap();
+        fs.write(ino, 0, b"data").unwrap();
+
+        // Inject EIO on sync.
+        let mut faults = crate::block::FaultInjector::new();
+        faults.fail_sync = true;
+        fs.set_device_faults(faults);
+
+        // Commit should fail (sync fails).
+        let result = fs.commit();
+        assert!(result.is_err(), "commit with injected EIO on sync should fail");
+
+        // Clear faults; commit should succeed (txg recovers).
+        fs.set_device_faults(crate::block::FaultInjector::new());
+        fs.commit().unwrap();
+
+        // Data should be intact.
+        let data = fs.read(ino, 0, 4).unwrap();
+        assert_eq!(&data, b"data");
+
+        std::fs::remove_file(&path).unwrap();
+    }
 }

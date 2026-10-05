@@ -36,6 +36,12 @@ pub struct FaultInjector {
     pub reorder_writes: bool,
     /// Buffered writes when reorder_writes is true.
     buffered: Vec<(u64, Block)>,
+    /// T9: If true, read_block returns EIO.
+    pub fail_reads: bool,
+    /// T9: If true, sync returns EIO.
+    pub fail_sync: bool,
+    /// T9: If Some(ms), sync sleeps for ms milliseconds (latency injection).
+    pub sync_latency_ms: Option<u64>,
 }
 
 impl FaultInjector {
@@ -135,6 +141,15 @@ impl BlockDevice for FileDevice {
     }
 
     fn read_block(&self, n: u64, buf: &mut Block) -> io::Result<()> {
+        // T9: injected EIO on read.
+        if let Some(faults) = &self.faults {
+            if faults.fail_reads {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "injected EIO on read",
+                ));
+            }
+        }
         if n >= self.blocks {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -186,6 +201,19 @@ impl BlockDevice for FileDevice {
     }
 
     fn sync(&mut self) -> io::Result<()> {
+        // T9: injected EIO on sync.
+        if let Some(faults) = &self.faults {
+            if faults.fail_sync {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "injected EIO on sync",
+                ));
+            }
+            // T9: latency injection.
+            if let Some(ms) = faults.sync_latency_ms {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+        }
         // B3/D3: flush buffered writes in reverse order (reordering test).
         if let Some(faults) = &mut self.faults {
             if faults.reorder_writes && !faults.buffered.is_empty() {
