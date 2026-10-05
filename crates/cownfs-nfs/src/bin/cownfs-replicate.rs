@@ -221,6 +221,19 @@ fn do_send(
     for b in area_start..area_start + bitmap_blocks {
         blocks.insert(b);
     }
+    // Also send the bitmap CRC sidecar for the active area: the receiver
+    // must get the updated CRCs, otherwise the replica's bitmap verification
+    // fails with "bitmap CRC mismatch" (p53 feature).
+    {
+        use cownfs_core::superblock::bitmap_crc_blocks;
+        let cb = bitmap_crc_blocks(bitmap_blocks);
+        // Sidecar layout (engine.rs): sidecar_start = bitmap_start +
+        // 2*bblocks + slot*cb, where slot == bitmap_area for the active area.
+        let sidecar_start = bitmap_start + 2 * bitmap_blocks + bitmap_area * cb;
+        for b in sidecar_start..sidecar_start + cb {
+            blocks.insert(b);
+        }
+    }
 
     eprintln!(
         "{} send: {} blocks (gen {cur_gen})",
