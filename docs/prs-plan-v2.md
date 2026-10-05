@@ -242,5 +242,6 @@ flowchart LR
 2. **Pure-CoW purity vs. P7.** Allow in-place overwrite of unshared, ≥ 2-gen-old blocks (faster, ext4-like), or stay strictly CoW and rely on P5 run allocation?
    - **DECIDED 2026-10-05:** Pure CoW is NOT desired. P7 (in-place overwrite for unshared blocks) is approved. The A3 txg-local in-place overwrite stays; extend to ≥2-gen-old unshared blocks per P7 spec.
 3. **Perf gate.** Rebaseline the +25% `commit_p99` now (it buys bitmap CRCs), or hold the gate red until P1/P2 recover it?
+   - **DECIDED 2026-10-05:** Hold the gate red. Any perf regression keeps the gate red; do NOT rebaseline. P1/P2 must recover the performance.
 4. **CI substrate.** GitHub Actions hosted runners (no NFS mounts, so T5 needs a self-hosted or privileged runner or VM), or a self-hosted Linux box from day one?
 5. **Execution mode.** Phase 0 is small and urgent. I can start with T0 (repro tests that should fail on `main`) and then R1/R2/R3, one commit each.
