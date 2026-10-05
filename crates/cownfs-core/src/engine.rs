@@ -769,13 +769,7 @@ impl Fs {
         // Write initial CRCs for both bitmap areas.
         let raw = bitmap.to_bytes();
         Self::write_bitmap_crcs(&mut dev, &raw, 2, bblocks, 2 + 2 * bblocks)?;
-        Self::write_bitmap_crcs(
-            &mut dev,
-            &raw,
-            2 + bblocks,
-            bblocks,
-            2 + 2 * bblocks + cb,
-        )?;;
+        Self::write_bitmap_crcs(&mut dev, &raw, 2 + bblocks, bblocks, 2 + 2 * bblocks + cb)?;
         let shared = Arc::new(Mutex::new(Shared {
             dev,
             bitmap,
@@ -1788,8 +1782,7 @@ impl Fs {
 
     /// P2: number of physical sync_txg() calls (for testing group commit).
     pub fn sync_count(&self) -> u64 {
-        self.sync_count
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.sync_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Bytes written by the last bitmap persist (for benchmarking).
@@ -1823,6 +1816,24 @@ impl Fs {
     /// Set device-level fault injection (B3/D3 testing).
     pub fn set_device_faults(&mut self, faults: crate::block::FaultInjector) {
         self.shared.lock().unwrap().dev.set_faults(faults);
+    }
+
+    /// T1: arm the device operation recorder for crash-state enumeration.
+    /// Every subsequent `write_block`/`sync` is logged in order.
+    pub fn arm_recorder(&mut self) {
+        self.shared.lock().unwrap().dev.arm_recorder();
+    }
+
+    /// T1: live handle to the recording (for mid-workload sync counting).
+    pub fn recorder_handle(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<Vec<crate::block::RecordedOp>>>> {
+        self.shared.lock().unwrap().dev.recorder_handle()
+    }
+
+    /// T1: take the recorded operations, disarming the recorder.
+    pub fn take_recording(&mut self) -> Vec<crate::block::RecordedOp> {
+        self.shared.lock().unwrap().dev.take_recording()
     }
 
     /// Clear device-level fault injection.
@@ -4191,7 +4202,10 @@ mod tests {
 
         // Commit should fail (sync fails).
         let result = fs.commit();
-        assert!(result.is_err(), "commit with injected EIO on sync should fail");
+        assert!(
+            result.is_err(),
+            "commit with injected EIO on sync should fail"
+        );
 
         // Clear faults; commit should succeed (txg recovers).
         fs.set_device_faults(crate::block::FaultInjector::new());

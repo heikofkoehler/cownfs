@@ -23,6 +23,11 @@ pub struct FileDevice {
     blocks: u64,
     /// Fault injection for B3/D3 testing. None = disabled.
     faults: Option<FaultInjector>,
+    /// T1: operation recorder for crash-state enumeration. When armed,
+    /// every `write_block` and `sync` is appended to the shared log.
+    /// `Arc<Mutex<..>>` so the test can read it mid-workload (to tag
+    /// durability-ledger entries with the current sync index).
+    recorder: Option<std::sync::Arc<std::sync::Mutex<Vec<RecordedOp>>>>,
 }
 
 /// Fault injection modes for testing crash consistency.
@@ -76,6 +81,28 @@ impl FileDevice {
         self.faults = None;
     }
 
+    /// T1: arm the operation recorder. Every subsequent `write_block`
+    /// and `sync` is appended to the shared log (in order).
+    pub fn arm_recorder(&mut self) {
+        self.recorder = Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    }
+
+    /// T1: get a handle to the live recording (for mid-workload sync
+    /// counting). Returns None if the recorder is not armed.
+    pub fn recorder_handle(&self) -> Option<std::sync::Arc<std::sync::Mutex<Vec<RecordedOp>>>> {
+        self.recorder.clone()
+    }
+
+    /// T1: take the recorded operations, disarming the recorder.
+    pub fn take_recording(&mut self) -> Vec<RecordedOp> {
+        match self.recorder.take() {
+            Some(arc) => std::sync::Arc::try_unwrap(arc)
+                .map(|m| m.into_inner().unwrap())
+                .unwrap_or_else(|arc| arc.lock().unwrap().clone()),
+            None => Vec::new(),
+        }
+    }
+
     /// Take an exclusive advisory lock on the image file (flock).
     /// Serializes lease acquire/renew/release across processes.
     pub fn lock_exclusive(&self) -> io::Result<()> {
@@ -114,6 +141,7 @@ impl FileDevice {
             file,
             blocks,
             faults: None,
+            recorder: None,
         })
     }
 
@@ -131,6 +159,7 @@ impl FileDevice {
             blocks: len / BLOCK_SIZE as u64,
             file,
             faults: None,
+            recorder: None,
         })
     }
 }
@@ -144,10 +173,7 @@ impl BlockDevice for FileDevice {
         // T9: injected EIO on read.
         if let Some(faults) = &self.faults {
             if faults.fail_reads {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "injected EIO on read",
-                ));
+                return Err(io::Error::new(io::ErrorKind::Other, "injected EIO on read"));
             }
         }
         if n >= self.blocks {
@@ -165,6 +191,14 @@ impl BlockDevice for FileDevice {
                 io::ErrorKind::InvalidInput,
                 "block number out of range",
             ));
+        }
+        // T1: record the op (after the bounds check, before faults, so the
+        // log reflects what the filesystem attempted at the device layer).
+        if let Some(rec) = &self.recorder {
+            rec.lock().unwrap().push(RecordedOp::Write {
+                block: n,
+                data: *buf,
+            });
         }
         // B3/D3: fault injection.
         if let Some(faults) = &mut self.faults {
@@ -204,10 +238,7 @@ impl BlockDevice for FileDevice {
         // T9: injected EIO on sync.
         if let Some(faults) = &self.faults {
             if faults.fail_sync {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "injected EIO on sync",
-                ));
+                return Err(io::Error::new(io::ErrorKind::Other, "injected EIO on sync"));
             }
             // T9: latency injection.
             if let Some(ms) = faults.sync_latency_ms {
@@ -224,7 +255,12 @@ impl BlockDevice for FileDevice {
                 }
             }
         }
-        self.file.sync_all()
+        self.file.sync_all()?;
+        // T1: record the sync barrier.
+        if let Some(rec) = &self.recorder {
+            rec.lock().unwrap().push(RecordedOp::Sync);
+        }
+        Ok(())
     }
 }
 

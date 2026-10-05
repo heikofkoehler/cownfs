@@ -12,6 +12,7 @@ pub mod bitmap;
 pub mod block;
 pub mod btree;
 pub mod checksum;
+pub mod crash_enum;
 pub mod engine;
 pub mod store;
 pub mod superblock;
