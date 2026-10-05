@@ -687,7 +687,7 @@ mod tests {
                 shared: Arc::new(Mutex::new(Shared {
                     dev,
                     bitmap,
-                    pending_free: Vec::new(),
+                    pending_free: [Vec::new(), Vec::new()],
                     fault_point: None,
                 })),
                 path,
