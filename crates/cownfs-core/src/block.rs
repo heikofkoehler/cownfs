@@ -199,3 +199,178 @@ impl BlockDevice for FileDevice {
         self.file.sync_all()
     }
 }
+
+/// T1: Recording device for crash-state enumeration.
+///
+/// Logs every `write_block` and `sync` operation. A crash state is defined
+/// as: the full prefix of operations up to some sync, plus any subset (in
+/// any order) of the writes after that sync (bounded by `max_post_sync`).
+///
+/// To generate a crash state: call `crash_prefix(sync_idx)` to get the
+/// operations up to the `sync_idx`-th sync, then apply a chosen subset of
+/// subsequent writes to a fresh device.
+#[derive(Debug, Clone)]
+pub enum RecordedOp {
+    Write { block: u64, data: Block },
+    Sync,
+}
+
+pub struct RecordingDevice<D: BlockDevice> {
+    inner: D,
+    log: Vec<RecordedOp>,
+}
+
+impl<D: BlockDevice> RecordingDevice<D> {
+    pub fn new(inner: D) -> Self {
+        RecordingDevice {
+            inner,
+            log: Vec::new(),
+        }
+    }
+
+    /// The recorded operation log.
+    pub fn log(&self) -> &[RecordedOp] {
+        &self.log
+    }
+
+    /// Indices in the log where Sync operations occur.
+    pub fn sync_indices(&self) -> Vec<usize> {
+        self.log
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| matches!(op, RecordedOp::Sync))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Get the prefix of operations up to (and including) the `sync_idx`-th sync.
+    /// `sync_idx` is 0-based among syncs. Returns the ops to replay for a crash
+    /// at that point.
+    pub fn crash_prefix(&self, sync_idx: usize) -> Vec<RecordedOp> {
+        let syncs = self.sync_indices();
+        if sync_idx >= syncs.len() {
+            return self.log.clone();
+        }
+        let end = syncs[sync_idx] + 1; // include the sync
+        self.log[..end].to_vec()
+    }
+
+    /// Writes after the `sync_idx`-th sync (candidates for partial application).
+    pub fn post_sync_writes(&self, sync_idx: usize) -> Vec<RecordedOp> {
+        let syncs = self.sync_indices();
+        let start = if sync_idx < syncs.len() {
+            syncs[sync_idx] + 1
+        } else {
+            self.log.len()
+        };
+        self.log[start..]
+            .iter()
+            .filter(|op| matches!(op, RecordedOp::Write { .. }))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Replay a set of recorded operations onto a device.
+/// Free function (not associated with RecordingDevice) to avoid type inference issues.
+pub fn replay_ops<D2: BlockDevice>(ops: &[RecordedOp], dev: &mut D2) -> io::Result<()> {
+    for op in ops {
+        match op {
+            RecordedOp::Write { block, data } => {
+                dev.write_block(*block, data)?;
+            }
+            RecordedOp::Sync => {
+                dev.sync()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+impl<D: BlockDevice> BlockDevice for RecordingDevice<D> {
+    fn block_count(&self) -> u64 {
+        self.inner.block_count()
+    }
+
+    fn read_block(&self, n: u64, buf: &mut Block) -> io::Result<()> {
+        self.inner.read_block(n, buf)
+    }
+
+    fn write_block(&mut self, n: u64, buf: &Block) -> io::Result<()> {
+        // Log before writing (so a crash during write is represented by
+        // the op being in the log but potentially torn — the harness
+        // can simulate torn writes by truncating the data).
+        self.log.push(RecordedOp::Write {
+            block: n,
+            data: *buf,
+        });
+        self.inner.write_block(n, buf)
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        self.log.push(RecordedOp::Sync);
+        self.inner.sync()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("cownfs-rec-{}.img", name))
+    }
+
+    #[test]
+    fn t1_recording_device_logs_and_replays() {
+        let path = temp_path("t1");
+        let _ = std::fs::remove_file(&path);
+
+        // Create a device and wrap it.
+        let inner = FileDevice::create(&path, 16).unwrap();
+        let mut rec = RecordingDevice::new(inner);
+
+        // Do some writes and syncs.
+        let mut blk1 = [0u8; BLOCK_SIZE];
+        blk1[0] = 0xAA;
+        rec.write_block(5, &blk1).unwrap();
+        rec.sync().unwrap();
+
+        let mut blk2 = [0u8; BLOCK_SIZE];
+        blk2[0] = 0xBB;
+        rec.write_block(6, &blk2).unwrap();
+        // No sync after blk2 (simulates crash before sync).
+
+        // Verify the log.
+        let log = rec.log();
+        assert_eq!(log.len(), 3); // write, sync, write
+        assert!(matches!(log[0], RecordedOp::Write { block: 5, .. }));
+        assert!(matches!(log[1], RecordedOp::Sync));
+        assert!(matches!(log[2], RecordedOp::Write { block: 6, .. }));
+
+        // Crash prefix up to sync 0 should include the sync.
+        let prefix = rec.crash_prefix(0);
+        assert_eq!(prefix.len(), 2);
+
+        // Post-sync writes should be just blk2.
+        let post = rec.post_sync_writes(0);
+        assert_eq!(post.len(), 1);
+
+        // Replay the prefix to a new device and verify.
+        let path2 = temp_path("t1-replay");
+        let _ = std::fs::remove_file(&path2);
+        let mut dev2 = FileDevice::create(&path2, 16).unwrap();
+        replay_ops(&prefix, &mut dev2).unwrap();
+
+        let mut read_back = [0u8; BLOCK_SIZE];
+        dev2.read_block(5, &mut read_back).unwrap();
+        assert_eq!(read_back[0], 0xAA);
+        // Block 6 was not in the prefix (crash before it was durable).
+        dev2.read_block(6, &mut read_back).unwrap();
+        assert_eq!(read_back[0], 0x00); // never written
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+    }
+}
