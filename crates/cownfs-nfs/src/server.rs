@@ -277,7 +277,14 @@ struct Session {
     uid: u32,
     /// GID from AUTH_SYS credentials (for audit logging).
     gid: u32,
+    /// R5: duplicate request cache — (RPC xid, framed reply) for the most
+    /// recent COMPOUNDs. A retransmitted RPC (same xid) gets the cached
+    /// reply instead of re-executing non-idempotent ops.
+    drc: std::collections::VecDeque<(u32, Vec<u8>)>,
 }
+
+/// Maximum entries in the per-connection duplicate request cache.
+const DRC_CAPACITY: usize = 32;
 
 /// A filehandle: either a live filesystem inode, or a snapshot view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,6 +307,7 @@ impl Session {
             client_addr: addr,
             uid: 0,
             gid: 0,
+            drc: std::collections::VecDeque::new(),
         }
     }
 
@@ -2371,6 +2379,12 @@ fn handle_record(record: &[u8], session: &mut Session, debug_rpc: bool) -> Vec<u
     let results = match call.proc {
         crate::rpc::PROC_NULL => rpc::encode_reply(call.xid, &[]),
         crate::rpc::PROC_COMPOUND => {
+            // R5: duplicate request cache. A retransmitted RPC carries the
+            // same xid; return the cached reply instead of re-executing
+            // (non-idempotent ops like CREATE/REMOVE must not run twice).
+            if let Some(cached) = session.drc.iter().find(|(x, _)| *x == call.xid) {
+                return cached.1.clone();
+            }
             let (overall, payload) = match Compound::decode(&mut params) {
                 Ok(c) => {
                     let res = session.run(&c);
@@ -2425,7 +2439,15 @@ fn handle_record(record: &[u8], session: &mut Session, debug_rpc: bool) -> Vec<u
 
         _ => rpc::encode_reply(call.xid, &[]),
     };
-    rpc::frame_record(&results)
+    let framed = rpc::frame_record(&results);
+    // R5: cache the framed COMPOUND reply for duplicate detection.
+    if call.proc == crate::rpc::PROC_COMPOUND {
+        if session.drc.len() >= DRC_CAPACITY {
+            session.drc.pop_front();
+        }
+        session.drc.push_back((call.xid, framed.clone()));
+    }
+    framed
 }
 
 /// Run the server on an already-bound `listener` (e.g. port 0 for an

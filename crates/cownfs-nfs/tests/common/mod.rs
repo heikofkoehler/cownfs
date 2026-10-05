@@ -915,6 +915,39 @@ impl NfsClient {
         }
     }
 
+    /// Send a COMPOUND with an explicit RPC xid (R5: for retransmit tests).
+    /// Returns the overall status plus one reply per executed op.
+    /// Does NOT advance the client's xid counter.
+    pub fn call_with_xid(&mut self, tag: &[u8], ops: Vec<u8>, xid: u32) -> (u32, Vec<Reply>) {
+        let mut w = Writer::new();
+        w.u32(xid);
+        w.u32(0); // CALL
+        w.u32(2); // RPC version
+        w.u32(rpc::NFS_PROGRAM);
+        w.u32(rpc::NFS_VERSION);
+        w.u32(rpc::PROC_COMPOUND);
+        // AUTH_SYS credential (same as call_raw).
+        w.u32(1);
+        let mut cred = Writer::new();
+        cred.u32(0);
+        cred.string(b"test");
+        cred.u32(0);
+        cred.u32(0);
+        cred.u32(0);
+        w.opaque(&cred.into_bytes());
+        // AUTH_NONE verifier.
+        w.u32(0);
+        w.u32(0);
+        w.string(tag);
+        w.u32(0); // minorversion
+        w.raw(&ops);
+        self.stream
+            .write_all(&rpc::frame_record(&w.into_bytes()))
+            .expect("write compound");
+        let record = self.read_record();
+        Self::decode(&record, xid)
+    }
+
     /// Send a COMPOUND with an explicit minor version. Returns the overall
     /// status plus one reply per executed op.
     pub fn call_raw(&mut self, tag: &[u8], minor: u32, ops: Vec<u8>) -> (u32, Vec<Reply>) {
