@@ -77,6 +77,14 @@ fn write_file(fs: &mut Fs, name: &[u8], data: &[u8]) {
 
 #[test]
 fn backup_e2e_full_plus_three_incrementals() {
+    // Ensure the fsck binary is fresh (separate package; cargo test -p
+    // cownfs-nfs does not build it; a stale fsck fails on new formats).
+    let build = std::process::Command::new("cargo")
+        .args(["build", "-p", "cownfs-fsck"])
+        .status()
+        .expect("cargo build cownfs-fsck");
+    assert!(build.success(), "cargo build -p cownfs-fsck failed");
+
     let dir = std::env::temp_dir();
     let pid = std::process::id();
     let img1 = dir.join(format!("cownfs-bak-e2e-{pid}-src.img"));
