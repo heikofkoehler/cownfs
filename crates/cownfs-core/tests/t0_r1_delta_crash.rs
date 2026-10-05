@@ -39,7 +39,8 @@ fn r1_delta_overwrite_crash_is_consistent() {
     // Recovery must be consistent: the committed gen-2 trees reference
     // blocks that the loaded bitmap must mark allocated.
     let fs = Fs::open(&img).unwrap();
-    fs.check().expect("R1: bitmap must be consistent after crash");
+    fs.check()
+        .expect("R1: bitmap must be consistent after crash");
     // Gen-2 data must still read back.
     let (ino, _) = fs.lookup(ROOT_INO, b"f1").unwrap().unwrap();
     let data = fs.read(ino, 0, 8192).unwrap();

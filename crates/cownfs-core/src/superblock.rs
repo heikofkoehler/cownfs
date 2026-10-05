@@ -18,7 +18,7 @@ use crate::checksum::checksum;
 use crate::{Block, BLOCK_SIZE};
 
 pub const MAGIC: u64 = u64::from_le_bytes(*b"cownfs01");
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// Magic identifying a bitmap CRC sidecar area. v3 images lack this magic
 /// in the reserved sidecar blocks → CRC verification is skipped (legacy).

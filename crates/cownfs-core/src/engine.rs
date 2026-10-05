@@ -737,13 +737,23 @@ impl Fs {
         for b in 0..reserved {
             bitmap.set(b);
         }
+        // R1 fix: each slot owns its bitmap area (slot s → area s).
+        // Initialize both areas so either slot is readable.
         store::write_bitmap(&mut dev, &bitmap, 2, bblocks)?;
+        store::write_bitmap(&mut dev, &bitmap, 2 + bblocks, bblocks)?;
         // Mark the CRC sidecar areas with magic so open() knows this image
         // has bitmap CRCs (v3 images lack the magic → skip verification).
         Self::write_crc_magic(&mut dev, 2 + 2 * bblocks, cb)?;
         Self::write_crc_magic(&mut dev, 2 + 2 * bblocks + cb, cb)?;
-        // Write initial CRCs for the bitmap.
+        // Write initial CRCs for both bitmap areas.
         Self::write_bitmap_crcs(&mut dev, &bitmap, 2, bblocks, 2 + 2 * bblocks)?;
+        Self::write_bitmap_crcs(
+            &mut dev,
+            &bitmap,
+            2 + bblocks,
+            bblocks,
+            2 + 2 * bblocks + cb,
+        )?;
         let shared = Arc::new(Mutex::new(Shared {
             dev,
             bitmap,
@@ -851,9 +861,9 @@ impl Fs {
             let mut dev = FileDevice::open(path)?;
             let bblocks = sb.bitmap_blocks;
             let cb = superblock::bitmap_crc_blocks(bblocks);
-            // Bitmap area for CRC verification: use the base area (full bitmap).
-            let bitmap_start = sb.bitmap_start + sb.bitmap_base_area * bblocks;
-            let sidecar_start = sb.bitmap_start + 2 * bblocks + sb.bitmap_base_area * cb;
+            // R1 fix: each slot owns its bitmap area (slot s → area s).
+            let bitmap_start = sb.bitmap_start + slot as u64 * bblocks;
+            let sidecar_start = sb.bitmap_start + 2 * bblocks + slot as u64 * cb;
             let has_crcs = Self::has_crc_magic(&mut dev, sidecar_start, cb);
             match Self::verify_bitmap_crcs(&mut dev, bitmap_start, bblocks, sidecar_start) {
                 Ok(()) => {}
@@ -903,7 +913,7 @@ impl Fs {
     ) -> Result<Self, FsError> {
         let next_inode = sb.next_inode;
         let next_snap = sb.next_snap;
-        let bitmap = Self::load_bitmap(&mut dev, &sb)?;
+        let bitmap = Self::load_bitmap(&mut dev, &sb, active_slot)?;
         let shared = Arc::new(Mutex::new(Shared {
             dev,
             bitmap,
@@ -1305,7 +1315,9 @@ impl Fs {
         self.sb.snap_root_gen = new.snap.gen;
         self.sb.snap_len = new_lens[3];
         // Persist the full bitmap (updates sb.bitmap_* for generation+1).
-        self.persist_bitmap_full()?;
+        // Write to the target slot's area (like commit_async).
+        let target_slot = 1 - self.active_slot;
+        self.persist_bitmap_full(target_slot)?;
         // Advance the generation on the inactive slot.
         self.sb.generation += 1;
         {
@@ -1331,93 +1343,25 @@ impl Fs {
         Ok(a || b || c || d)
     }
 
-    /// Load the bitmap, applying a delta if the superblock indicates one.
-    /// Legacy images (both gens zero) load the full bitmap from the active
-    /// area as before.
+    /// Load the bitmap for the given superblock slot.
+    ///
+    /// R1 fix: each superblock slot owns its bitmap area
+    /// (`bitmap_start + slot*bitmap_blocks`). The area is written before the
+    /// slot flip, so the committed slot's bitmap is always intact. There are
+    /// no deltas (always full checkpoints); `bitmap_delta_gen` equals
+    /// `bitmap_full_gen`.
     fn load_bitmap(
         dev: &mut FileDevice,
         sb: &superblock::Superblock,
+        slot: usize,
     ) -> Result<crate::bitmap::Bitmap, FsError> {
-        // Legacy mode.
-        if sb.bitmap_full_gen == 0 && sb.bitmap_delta_gen == 0 {
-            return store::read_bitmap(
-                dev,
-                sb.block_count,
-                sb.bitmap_area_start(),
-                sb.bitmap_blocks,
-            )
-            .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)));
-        }
-        // Load full bitmap from the base area.
-        let base_start = sb.bitmap_start + sb.bitmap_base_area * sb.bitmap_blocks;
-        let mut bitmap = store::read_bitmap(dev, sb.block_count, base_start, sb.bitmap_blocks)
+        let base_start = sb.bitmap_start + slot as u64 * sb.bitmap_blocks;
+        let bitmap = store::read_bitmap(dev, sb.block_count, base_start, sb.bitmap_blocks)
             .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
-        // Apply delta if one is pending.
-        if sb.bitmap_delta_gen > sb.bitmap_full_gen {
-            let delta_start = sb.bitmap_start + (1 - sb.bitmap_base_area) * sb.bitmap_blocks;
-            Self::apply_delta(dev, sb, delta_start, &mut bitmap)?;
-        }
         Ok(bitmap)
     }
 
     /// Read the delta area and apply word updates to the bitmap.
-    fn apply_delta(
-        dev: &mut FileDevice,
-        sb: &superblock::Superblock,
-        delta_start: u64,
-        bitmap: &mut crate::bitmap::Bitmap,
-    ) -> Result<(), FsError> {
-        let cvt = |e: std::io::Error| FsError::Store(crate::store::StoreError::Io(e));
-        let mut hdr = [0u8; BLOCK_SIZE];
-        dev.read_block(delta_start, &mut hdr).map_err(cvt)?;
-        // Header: magic u64, full_gen u64, delta_gen u64, count u64, crc32c u64.
-        let magic = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
-        if magic != 0x61746c65646d6263 {
-            // "cbmdelta" in le — invalid delta, ignore (crash mid-write).
-            return Ok(());
-        }
-        let full_gen = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
-        let delta_gen = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
-        if full_gen != sb.bitmap_full_gen || delta_gen != sb.bitmap_delta_gen {
-            // Stale delta, ignore.
-            return Ok(());
-        }
-        let count = u64::from_le_bytes(hdr[24..32].try_into().unwrap()) as usize;
-        let expected_crc = u64::from_le_bytes(hdr[32..40].try_into().unwrap());
-        // Read all entry bytes for CRC verification.
-        let entry_bytes = count * 16;
-        let mut raw = Vec::with_capacity(entry_bytes);
-        let mut blk_idx = 1u64;
-        let mut blk = [0u8; BLOCK_SIZE];
-        while raw.len() < entry_bytes {
-            if blk_idx >= sb.bitmap_blocks {
-                break; // truncated
-            }
-            dev.read_block(delta_start + blk_idx, &mut blk)
-                .map_err(cvt)?;
-            blk_idx += 1;
-            let take = (entry_bytes - raw.len()).min(BLOCK_SIZE);
-            raw.extend_from_slice(&blk[..take]);
-        }
-        if raw.len() < entry_bytes {
-            return Ok(()); // truncated delta, ignore
-        }
-        let actual_crc = crate::checksum::checksum32(&raw) as u64;
-        if actual_crc != expected_crc {
-            // Corrupt delta, ignore (use base).
-            return Ok(());
-        }
-        // Apply.
-        for chunk in raw.chunks_exact(16) {
-            let wi = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
-            let val = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
-            if wi < bitmap.word_count() {
-                bitmap.set_word(wi, val);
-            }
-        }
-        Ok(())
-    }
-
     /// Apply deferred frees, then persist the bitmap: a delta if few words
     /// changed, else a full write (checkpoint). Updates the superblock's
     /// delta fields; the caller writes the superblock.
@@ -1429,38 +1373,36 @@ impl Fs {
                 sh.bitmap.clear(b);
             }
         }
-        // Decide: delta or full checkpoint.
-        let (dirty_words, word_count) = {
-            let sh = self.shared.lock().unwrap();
-            let bw = sh.bitmap.dirty_words();
-            (bw, sh.bitmap.word_count())
-        };
-        // Delta size: 1 header block + entries (16 bytes each).
-        let delta_blocks = 1 + (dirty_words.len() as u64 * 16).div_ceil(BLOCK_SIZE as u64);
-        // Checkpoint every 100 commits, if >10% of words dirty, if the delta
-        // wouldn't fit in the area, or if this is a legacy image (full_gen=0).
-        self.commits_since_checkpoint += 1;
-        let checkpoint = self.commits_since_checkpoint >= 100
-            || dirty_words.len() as u64 > word_count / 10
-            || delta_blocks > self.sb.bitmap_blocks
-            || self.sb.bitmap_full_gen == 0;
-        if checkpoint {
-            self.persist_bitmap_full()?;
-        } else {
-            self.persist_bitmap_delta(&dirty_words)?;
-        }
+        // R1 fix: always write a full checkpoint, never a delta.
+        //
+        // The delta scheme wrote the new delta over the area that the
+        // currently-committed superblock's delta lived in. A crash between
+        // the delta write and the superblock flip left apply_delta() with a
+        // gen-mismatched (or torn) delta, which it silently ignored —
+        // loading a stale base bitmap where recently-allocated blocks looked
+        // free. Subsequent allocations then reused live blocks (silent
+        // corruption).
+        //
+        // Full checkpoints write to the *inactive superblock slot's* bitmap
+        // area, which no committed generation references. A crash before the
+        // slot flip leaves the previous slot (and its bitmap) fully intact.
+        let target_slot = 1 - self.active_slot;
+        self.persist_bitmap_full(target_slot)?;
         Ok(())
     }
 
     /// Write the full bitmap to area 0 and reset delta state.
-    fn persist_bitmap_full(&mut self) -> Result<(), FsError> {
+    fn persist_bitmap_full(&mut self, target_slot: usize) -> Result<(), FsError> {
         let blocks = self.sb.bitmap_blocks;
         let raw = self.shared.lock().unwrap().bitmap.to_bytes();
         let mut sh = self.shared.lock().unwrap();
-        // Write to the delta area (not the base); the swap happens via
-        // bitmap_base_area in the superblock, so a crash before the
-        // superblock commit leaves the old base intact.
-        let write_start = self.sb.bitmap_start + (1 - self.sb.bitmap_base_area) * blocks;
+        // R1 fix: write to the *target superblock slot's* bitmap area.
+        // Slot s owns area s (bitmap_start + s*blocks). The currently-active
+        // slot's area is never touched, so a crash before the slot flip
+        // leaves the committed generation's bitmap fully intact.
+        // (The old base_area ping-pong shared areas between slots, which
+        // was the R1 hole.)
+        let write_start = self.sb.bitmap_start + target_slot as u64 * blocks;
         let mut buf = vec![0u8; blocks as usize * BLOCK_SIZE];
         let n = raw.len().min(buf.len());
         buf[..n].copy_from_slice(&raw[..n]);
@@ -1472,19 +1414,19 @@ impl Fs {
         let gen = self.sb.generation + 1; // the generation we're committing
         self.sb.bitmap_full_gen = gen;
         self.sb.bitmap_delta_gen = gen;
-        // Swap base and delta areas.
-        self.sb.bitmap_base_area = 1 - self.sb.bitmap_base_area;
+        // No base_area flip: each slot has its own dedicated area.
+        // (bitmap_base_area is retained in the struct for format compat
+        // but is no longer used for area selection.)
         self.last_bitmap_write_bytes = blocks * BLOCK_SIZE as u64;
         sh.bitmap.clear_dirty();
         drop(sh);
         self.commits_since_checkpoint = 0;
-        // Update the CRC sidecar for the new base area (if this image has CRCs).
+        // Update the CRC sidecar for the target slot's area (if CRCs present).
         if self.has_bitmap_crcs {
             let cb = superblock::bitmap_crc_blocks(blocks);
             if cb > 0 {
-                let bitmap_start = self.sb.bitmap_start + self.sb.bitmap_base_area * blocks;
-                let sidecar_start =
-                    self.sb.bitmap_start + 2 * blocks + self.sb.bitmap_base_area * cb;
+                let bitmap_start = self.sb.bitmap_start + target_slot as u64 * blocks;
+                let sidecar_start = self.sb.bitmap_start + 2 * blocks + target_slot as u64 * cb;
                 let bitmap = {
                     let sh = self.shared.lock().unwrap();
                     sh.bitmap.clone()
@@ -1497,45 +1439,6 @@ impl Fs {
     }
 
     /// Write only dirty words as a delta to area 1.
-    fn persist_bitmap_delta(&mut self, dirty_words: &[u64]) -> Result<(), FsError> {
-        // Delta goes to the non-base area.
-        let delta_start =
-            self.sb.bitmap_start + (1 - self.sb.bitmap_base_area) * self.sb.bitmap_blocks;
-        // Buffer entries first so we can CRC them.
-        let mut entries = Vec::with_capacity(dirty_words.len() * 16);
-        {
-            let sh = self.shared.lock().unwrap();
-            for &wi in dirty_words {
-                let val = sh.bitmap.word(wi);
-                entries.extend_from_slice(&wi.to_le_bytes());
-                entries.extend_from_slice(&val.to_le_bytes());
-            }
-        }
-        let crc = crate::checksum::checksum32(&entries) as u64;
-        let mut sh = self.shared.lock().unwrap();
-        // Header block: magic, full_gen, delta_gen, count, crc32c.
-        let mut hdr = [0u8; BLOCK_SIZE];
-        hdr[0..8].copy_from_slice(&0x61746c65646d6263u64.to_le_bytes()); // "cbmdelta"
-        hdr[8..16].copy_from_slice(&self.sb.bitmap_full_gen.to_le_bytes());
-        let gen = self.sb.generation + 1;
-        hdr[16..24].copy_from_slice(&gen.to_le_bytes());
-        hdr[24..32].copy_from_slice(&(dirty_words.len() as u64).to_le_bytes());
-        hdr[32..40].copy_from_slice(&crc.to_le_bytes());
-        sh.dev.write_block(delta_start, &hdr)?;
-        // Entry blocks.
-        for (i, chunk) in entries.chunks(BLOCK_SIZE).enumerate() {
-            let mut blk = [0u8; BLOCK_SIZE];
-            blk[..chunk.len()].copy_from_slice(chunk);
-            sh.dev.write_block(delta_start + 1 + i as u64, &blk)?;
-        }
-        self.sb.bitmap_delta_gen = gen;
-        self.last_bitmap_write_bytes =
-            (1 + entries.chunks(BLOCK_SIZE).len() as u64) * BLOCK_SIZE as u64;
-        // Don't clear dirty: words stay dirty until the next full checkpoint,
-        // so the delta always spans from full_gen.
-        Ok(())
-    }
-
     fn sync_roots(&mut self) {
         let r = self.inodes.root_id();
         self.sb.inode_root = r.idx;
@@ -1561,8 +1464,15 @@ impl Fs {
     /// the current area; no flip (generation 1 lives with area 0).
     fn commit_to_slots(&mut self) -> Result<(), FsError> {
         self.flush_all()?;
-        let area = self.sb.bitmap_area_start();
-        self.persist_bitmap(area)?;
+        {
+            let mut sh = self.shared.lock().unwrap();
+            let freed = std::mem::take(&mut sh.pending_free);
+            for b in freed {
+                sh.bitmap.clear(b);
+            }
+        }
+        // mkfs path: write bitmap to the *active* slot's area (no flip).
+        self.persist_bitmap_full(self.active_slot)?;
         self.shared.lock().unwrap().dev.sync()?;
         self.sync_roots();
         let mut sh = self.shared.lock().unwrap();
@@ -3834,11 +3744,13 @@ mod tests {
         // Mark block 500 allocated in the active bitmap area; nothing
         // references it.
         let mut dev = FileDevice::open(&path).unwrap();
-        let (sb, _) = superblock::open(&dev).unwrap();
+        let (sb, slot) = superblock::open(&dev).unwrap();
         let mut blk = [0u8; BLOCK_SIZE];
-        dev.read_block(sb.bitmap_area_start(), &mut blk).unwrap();
+        // R1 fix: bitmap area is per-slot (slot s → area s).
+        let area_start = sb.bitmap_start + slot as u64 * sb.bitmap_blocks;
+        dev.read_block(area_start, &mut blk).unwrap();
         blk[500 / 8] |= 1 << (500 % 8);
-        dev.write_block(sb.bitmap_area_start(), &blk).unwrap();
+        dev.write_block(area_start, &blk).unwrap();
         // Update the CRC sidecar so open() doesn't fail with BitmapCorrupt
         // (we're testing check(), not the CRC verification).
         {
@@ -3849,14 +3761,13 @@ mod tests {
                 // Read the modified bitmap area.
                 let mut raw = vec![0u8; (bblocks as usize) * BLOCK_SIZE];
                 for i in 0..bblocks {
-                    dev.read_block(sb.bitmap_area_start() + i, &mut blk)
-                        .unwrap();
+                    dev.read_block(area_start + i, &mut blk).unwrap();
                     let dst = (i as usize) * BLOCK_SIZE;
                     raw[dst..dst + BLOCK_SIZE].copy_from_slice(&blk);
                 }
                 let bitmap = Bitmap::from_bytes(sb.block_count, &raw);
-                let bitmap_start = sb.bitmap_start + sb.bitmap_base_area * bblocks;
-                let sidecar_start = sb.bitmap_start + 2 * bblocks + sb.bitmap_base_area * cb;
+                let bitmap_start = sb.bitmap_start + slot as u64 * bblocks;
+                let sidecar_start = sb.bitmap_start + 2 * bblocks + slot as u64 * cb;
                 Fs::write_bitmap_crcs(&mut dev, &bitmap, bitmap_start, bblocks, sidecar_start)
                     .unwrap();
             }
