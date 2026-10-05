@@ -86,9 +86,12 @@ fn write_reports_requested_stability() {
     let id = establish_client(&mut c, b"p10");
     let f = common::create_file(&mut c, &srv.uuid, id, ROOT_INO, b"f", 0o644);
 
+    // R2: the server treats DATA_SYNC4 as FILE_SYNC4 (full sync, stronger
+    // than required but correct) and reports the stability it actually
+    // provided, per RFC 7530 §16.8.
     for (stable, expect) in [
         (UNSTABLE4, UNSTABLE4),
-        (DATA_SYNC4, DATA_SYNC4),
+        (DATA_SYNC4, FILE_SYNC4),
         (FILE_SYNC4, FILE_SYNC4),
     ] {
         let mut ops = Ops::new();

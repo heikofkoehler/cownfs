@@ -1095,6 +1095,11 @@ impl NfsClient {
                     let _ = r.opaque_fixed(8).expect("verifier");
                     Reply::Written { count, committed }
                 }
+                nfs4::OP_COMMIT => {
+                    // RFC 7530 §16.8.2: COMMIT4resok { verifier4 commit_verifier; }
+                    let _ = r.opaque_fixed(8).expect("commit verifier");
+                    Reply::Ok
+                }
                 nfs4::OP_ACCESS => {
                     let supported = r.u32().expect("supported");
                     let granted = r.u32().expect("granted");
