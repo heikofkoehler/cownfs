@@ -31,8 +31,15 @@ fn delta_bitmap_survives_reopen() {
     drop(fs);
 
     // Reopen: bitmap must be reconstructed via delta application.
+    // R3: reopen frees the persisted deferred-free queue, so free count
+    // may increase (leaks reclaimed). It must never decrease.
     let fs = Fs::open(&img).unwrap();
-    assert_eq!(fs.free_block_count(), free_before);
+    assert!(
+        fs.free_block_count() >= free_before,
+        "free count {} < {} before reopen",
+        fs.free_block_count(),
+        free_before
+    );
     // Data must be intact.
     for i in 0..10 {
         let (ino, _) = fs
@@ -61,8 +68,15 @@ fn delta_bitmap_checkpoint() {
     let free_before = fs.free_block_count();
     drop(fs);
 
+    // R3: reopen frees the persisted deferred-free queue; free count may
+    // increase but never decrease.
     let fs = Fs::open(&img).unwrap();
-    assert_eq!(fs.free_block_count(), free_before);
+    assert!(
+        fs.free_block_count() >= free_before,
+        "free count {} < {} before reopen",
+        fs.free_block_count(),
+        free_before
+    );
     fs.check().unwrap();
     let _ = std::fs::remove_file(&img);
 }

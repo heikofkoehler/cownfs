@@ -629,7 +629,7 @@ impl Fs {
     /// Public for use by cownfs-backup restore-inc.
     pub fn write_bitmap_crcs(
         dev: &mut FileDevice,
-        bitmap: &Bitmap,
+        area_bytes: &[u8],
         bitmap_start: u64,
         bblocks: u64,
         sidecar_start: u64,
@@ -639,18 +639,16 @@ impl Fs {
         if cb == 0 {
             return Ok(());
         }
-        let raw = bitmap.to_bytes();
         let mut sidecar = vec![0u8; (cb as usize) * BLOCK_SIZE];
         sidecar[0..8].copy_from_slice(&superblock::BITMAP_CRC_MAGIC.to_le_bytes());
         for i in 0..bblocks {
             let start = (i as usize) * BLOCK_SIZE;
             let end = start + BLOCK_SIZE;
-            // Pad to full block with zeros to match the on-disk representation
-            // that verify_bitmap_crcs reads.
+            // CRC the actual on-disk bytes (bitmap + persisted queue padding).
             let mut block_data = [0u8; BLOCK_SIZE];
-            if start < raw.len() {
-                let copy_end = end.min(raw.len());
-                block_data[..copy_end - start].copy_from_slice(&raw[start..copy_end]);
+            if start < area_bytes.len() {
+                let copy_end = end.min(area_bytes.len());
+                block_data[..copy_end - start].copy_from_slice(&area_bytes[start..copy_end]);
             }
             let crc = crate::checksum::checksum32(&block_data);
             let off = 8 + (i as usize) * 4;
@@ -755,14 +753,15 @@ impl Fs {
         Self::write_crc_magic(&mut dev, 2 + 2 * bblocks, cb)?;
         Self::write_crc_magic(&mut dev, 2 + 2 * bblocks + cb, cb)?;
         // Write initial CRCs for both bitmap areas.
-        Self::write_bitmap_crcs(&mut dev, &bitmap, 2, bblocks, 2 + 2 * bblocks)?;
+        let raw = bitmap.to_bytes();
+        Self::write_bitmap_crcs(&mut dev, &raw, 2, bblocks, 2 + 2 * bblocks)?;
         Self::write_bitmap_crcs(
             &mut dev,
-            &bitmap,
+            &raw,
             2 + bblocks,
             bblocks,
             2 + 2 * bblocks + cb,
-        )?;
+        )?;;
         let shared = Arc::new(Mutex::new(Shared {
             dev,
             bitmap,
@@ -924,7 +923,14 @@ impl Fs {
     ) -> Result<Self, FsError> {
         let next_inode = sb.next_inode;
         let next_snap = sb.next_snap;
-        let bitmap = Self::load_bitmap(&mut dev, &sb, active_slot)?;
+        let (mut bitmap, deferred) = Self::load_bitmap(&mut dev, &sb, active_slot)?;
+        // R3 fix: free the persisted deferred-free queue. These blocks became
+        // unreachable in the committed (or ancestor) generation; the in-memory
+        // queue was lost on shutdown. Freeing them here prevents the
+        // allocated-but-unreachable leak that fails check().
+        for b in deferred {
+            bitmap.clear(b);
+        }
         let shared = Arc::new(Mutex::new(Shared {
             dev,
             bitmap,
@@ -1365,11 +1371,57 @@ impl Fs {
         dev: &mut FileDevice,
         sb: &superblock::Superblock,
         slot: usize,
-    ) -> Result<crate::bitmap::Bitmap, FsError> {
+    ) -> Result<(crate::bitmap::Bitmap, Vec<u64>), FsError> {
         let base_start = sb.bitmap_start + slot as u64 * sb.bitmap_blocks;
         let bitmap = store::read_bitmap(dev, sb.block_count, base_start, sb.bitmap_blocks)
             .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
-        Ok(bitmap)
+        // R3 fix: load the persisted deferred-free queue from the bitmap
+        // area's padding (after the bitmap bytes). These blocks are
+        // unreachable from the committed generation; the caller frees them.
+        let deferred = Self::load_deferred_queue(dev, sb, slot)?;
+        Ok((bitmap, deferred))
+    }
+
+    /// Read the deferred-free queue persisted in the bitmap area padding.
+    fn load_deferred_queue(
+        dev: &mut FileDevice,
+        sb: &superblock::Superblock,
+        slot: usize,
+    ) -> Result<Vec<u64>, FsError> {
+        let base_start = sb.bitmap_start + slot as u64 * sb.bitmap_blocks;
+        let bitmap_bytes = ((sb.block_count + 7) / 8) as usize;
+        let area_bytes = sb.bitmap_blocks as usize * BLOCK_SIZE;
+        if bitmap_bytes + 8 > area_bytes {
+            return Ok(Vec::new());
+        }
+        // Read the block containing the queue header.
+        let blk_idx = (bitmap_bytes / BLOCK_SIZE) as u64;
+        let blk_off = bitmap_bytes % BLOCK_SIZE;
+        let mut blk = [0u8; BLOCK_SIZE];
+        dev.read_block(base_start + blk_idx, &mut blk)
+            .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+        let count = u64::from_le_bytes(blk[blk_off..blk_off + 8].try_into().unwrap()) as usize;
+        // Sanity bound: queue can't exceed the area.
+        let max = (area_bytes - bitmap_bytes - 8) / 8;
+        let count = count.min(max);
+        let mut out = Vec::with_capacity(count);
+        let mut pos = blk_off + 8;
+        let mut cur_blk = blk_idx;
+        for _ in 0..count {
+            if pos + 8 > BLOCK_SIZE {
+                cur_blk += 1;
+                dev.read_block(base_start + cur_blk, &mut blk)
+                    .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+                pos = 0;
+            }
+            let b = u64::from_le_bytes(blk[pos..pos + 8].try_into().unwrap());
+            // Validate: block number must be in range.
+            if b < sb.block_count {
+                out.push(b);
+            }
+            pos += 8;
+        }
+        Ok(out)
     }
 
     /// Read the delta area and apply word updates to the bitmap.
@@ -1424,6 +1476,28 @@ impl Fs {
         let mut buf = vec![0u8; blocks as usize * BLOCK_SIZE];
         let n = raw.len().min(buf.len());
         buf[..n].copy_from_slice(&raw[..n]);
+        // R3 fix: persist the deferred-free queue in the bitmap area's
+        // padding (after the bitmap bytes). On open, these blocks are freed
+        // — they're unreachable from the committed generation. Without this,
+        // the in-memory queue is lost on reopen, leaking the blocks.
+        {
+            let q0 = &sh.pending_free[0];
+            let q1 = &sh.pending_free[1];
+            let total = q0.len() + q1.len();
+            let off = n;
+            // Header: total count (u64). Then block numbers (u64 each).
+            // Bound by available padding; excess stays in memory (leaked
+            // until fsck, but not corrupt — conservative).
+            let avail = buf.len().saturating_sub(off + 8) / 8;
+            let take = total.min(avail);
+            buf[off..off + 8].copy_from_slice(&(take as u64).to_le_bytes());
+            let mut pos = off + 8;
+            // Write [1] (older) first, then [0].
+            for b in q1.iter().chain(q0.iter()).take(take) {
+                buf[pos..pos + 8].copy_from_slice(&b.to_le_bytes());
+                pos += 8;
+            }
+        }
         for (i, chunk) in buf.chunks_exact(BLOCK_SIZE).enumerate() {
             let mut blk = [0u8; BLOCK_SIZE];
             blk.copy_from_slice(chunk);
@@ -1445,12 +1519,9 @@ impl Fs {
             if cb > 0 {
                 let bitmap_start = self.sb.bitmap_start + target_slot as u64 * blocks;
                 let sidecar_start = self.sb.bitmap_start + 2 * blocks + target_slot as u64 * cb;
-                let bitmap = {
-                    let sh = self.shared.lock().unwrap();
-                    sh.bitmap.clone()
-                };
                 let mut sh = self.shared.lock().unwrap();
-                Self::write_bitmap_crcs(&mut sh.dev, &bitmap, bitmap_start, blocks, sidecar_start)?;
+                // CRC the actual written bytes (bitmap + persisted queue).
+                Self::write_bitmap_crcs(&mut sh.dev, &buf, bitmap_start, blocks, sidecar_start)?;
             }
         }
         Ok(())
@@ -3820,10 +3891,9 @@ mod tests {
                     let dst = (i as usize) * BLOCK_SIZE;
                     raw[dst..dst + BLOCK_SIZE].copy_from_slice(&blk);
                 }
-                let bitmap = Bitmap::from_bytes(sb.block_count, &raw);
                 let bitmap_start = sb.bitmap_start + slot as u64 * bblocks;
                 let sidecar_start = sb.bitmap_start + 2 * bblocks + slot as u64 * cb;
-                Fs::write_bitmap_crcs(&mut dev, &bitmap, bitmap_start, bblocks, sidecar_start)
+                Fs::write_bitmap_crcs(&mut dev, &raw, bitmap_start, bblocks, sidecar_start)
                     .unwrap();
             }
         }
