@@ -1993,8 +1993,6 @@ impl Fs {
         // R3: blocks in the deferred-free queues are marked allocated but
         // intentionally unreachable (they'll be freed on the next commit).
         // Exclude them from the unreachable check.
-        static CHK_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let chk_n = CHK_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         for b in 0..self.sb.block_count {
             if !sh.bitmap.test(b) {
                 continue;

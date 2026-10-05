@@ -1,10 +1,18 @@
 //! Minimal NFSv4.0 TCP server: COMPOUND execution against the engine.
 //! Single-connection (`serve_listener`) or thread-per-connection
 //! (`serve_concurrent`) serving; filesystem and NFSv4 state are shared.
+//!
+//! R4 lock-poison policy: server locks use `lock_recover()` instead of
+//! `lock().unwrap()`. If a worker thread panics while holding a lock, the
+//! lock becomes poisoned; `lock_recover()` logs a warning and recovers the
+//! inner value via `PoisonError::into_inner()`, allowing the server to
+//! continue serving (availability over fail-fast). The R4 stale-NodeId fix
+//! (returning `Corrupt` instead of panicking) is the primary mechanism to
+//! avoid poisoning; this is defense-in-depth.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use cownfs_core::engine::{Fs, FsError, FTYPE_DIR, FTYPE_SYMLINK, ROOT_INO};
 
@@ -30,6 +38,19 @@ use crate::rpc::{self, Call, RecordReader, RpcError};
 use crate::state::{StateManager, OPEN4_SHARE_ACCESS_WRITE};
 use crate::xdr::{Writer, XdrError};
 use cownfs_core::engine::SetAttrs;
+
+/// R4: recover from a poisoned mutex instead of panicking.
+/// If a worker thread panicked while holding the lock, log a warning and
+/// continue with the inner value (availability over fail-fast).
+pub fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            eprintln!("WARNING: mutex poisoned, recovering (R4 policy)");
+            poisoned.into_inner()
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum ServerError {
@@ -356,7 +377,7 @@ impl Session {
 
     /// Lock the NFSv4 client/open/lock table.
     fn state(&self) -> std::sync::MutexGuard<'_, StateManager> {
-        self.shared.state.lock().unwrap()
+        lock_recover(&self.shared.state)
     }
 
     fn check_fh(&self, fh: &AnyFileHandle) -> Result<Fh, u32> {
@@ -444,7 +465,7 @@ impl Session {
     ) -> Vec<OpResult> {
         // Validate session and slot, check sequence.
         let replay: Option<Vec<OpResult>> = {
-            let mut table = self.shared.sessions.lock().unwrap();
+            let mut table = lock_recover(&self.shared.sessions);
             let sess = match table.get_session_mut(&sessionid) {
                 Some(s) => s,
                 None => return vec![OpResult::err(OP_SEQUENCE, NFS4ERR_BADSESSION)],
@@ -475,7 +496,7 @@ impl Session {
 
         // New request: SEQUENCE result first, then the rest of the compound.
         let seq_res = {
-            let table = self.shared.sessions.lock().unwrap();
+            let table = lock_recover(&self.shared.sessions);
             let sess = table.get_session(&sessionid).unwrap();
             let mut w = Writer::new();
             w.opaque_fixed(&sessionid);
@@ -505,7 +526,7 @@ impl Session {
 
         // Advance the slot and cache the reply.
         {
-            let mut table = self.shared.sessions.lock().unwrap();
+            let mut table = lock_recover(&self.shared.sessions);
             if let Some(sess) = table.get_session_mut(&sessionid) {
                 if let Some(slot) = sess.slots.get_mut(slotid as usize) {
                     slot.sequence = sequenceid;

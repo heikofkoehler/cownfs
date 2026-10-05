@@ -549,9 +549,6 @@ impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
             .bitmap
             .alloc()
             .ok_or(StoreError::NoSpace)?;
-        if block == 12875 {
-            eprintln!("{}", std::backtrace::Backtrace::capture());
-        }
         // Fresh blocks start a new generation. Reused blocks keep bumping it
         // so stale in-memory ids can never alias the new node.
         let gen = {
@@ -769,5 +766,69 @@ mod tests {
         assert!(2 * 7 - 1 <= max_keys_per_node(264, 16)); // dirs
         assert!(2 * 42 - 1 <= max_keys_per_node(16, 16)); // extents
         assert!(2 * 14 - 1 <= max_keys_per_node(8, 124)); // snapshots
+    }
+
+    #[test]
+    fn r4_stale_nodeid_returns_corrupt() {
+        // R4: a stale NodeId (wrong generation) must return
+        // StoreError::Corrupt, not panic. This simulates use-after-free:
+        // allocate a node, free it, reallocate the same block (bumping
+        // the generation), then try to load via the old NodeId.
+        let td = TestDevice::new(64);
+        let arena = td.arena::<u64, u64>(4);
+        let mut a = arena.lock().unwrap();
+
+        // Allocate a node.
+        let node = Node {
+            keys: vec![1u64],
+            vals: vec![10u64],
+            children: vec![],
+            refcount: 1,
+        };
+        let id1 = a.alloc(node).unwrap();
+        let gen1 = id1.gen;
+
+        // Free it (take with refcount 1).
+        let _ = a.take(id1).unwrap();
+        // Flush to disk so the generation is persisted.
+        a.flush().unwrap();
+
+        // Reallocate: should reuse the same block with bumped generation.
+        let node2 = Node {
+            keys: vec![2u64],
+            vals: vec![20u64],
+            children: vec![],
+            refcount: 1,
+        };
+        let id2 = a.alloc(node2).unwrap();
+        // The block may or may not be reused; if reused, gen must bump.
+        if id2.idx == id1.idx {
+            assert!(id2.gen > gen1, "reused block must bump generation");
+        }
+        a.flush().unwrap();
+        drop(a);
+
+        // Try to load via the stale id1 (wrong generation).
+        // If the block was reused, this must return Corrupt, not panic.
+        // If not reused, the block is free and load will fail differently
+        // (but still not panic).
+        let arena2 = td.arena::<u64, u64>(4);
+        let mut b = arena2.lock().unwrap();
+        // Evict from cache to force disk read.
+        b.cache.clear();
+        let stale_id = NodeId {
+            idx: id1.idx,
+            gen: gen1,
+        };
+        // Only assert Corrupt if the block was actually reused with a new gen.
+        if id2.idx == id1.idx {
+            match b.get(stale_id) {
+                Err(StoreError::Corrupt { block, .. }) => {
+                    assert_eq!(block, id1.idx);
+                }
+                Ok(_) => panic!("stale NodeId should not load successfully"),
+                Err(e) => panic!("expected Corrupt, got {e:?}"),
+            }
+        }
     }
 }
