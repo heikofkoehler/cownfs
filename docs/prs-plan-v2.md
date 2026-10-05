@@ -245,3 +245,4 @@ flowchart LR
    - **DECIDED 2026-10-05:** Hold the gate red. Any perf regression keeps the gate red; do NOT rebaseline. P1/P2 must recover the performance.
 4. **CI substrate.** GitHub Actions hosted runners (no NFS mounts, so T5 needs a self-hosted or privileged runner or VM), or a self-hosted Linux box from day one?
 5. **Execution mode.** Phase 0 is small and urgent. I can start with T0 (repro tests that should fail on `main`) and then R1/R2/R3, one commit each.
+   - **DECIDED 2026-10-05:** Approved. For each work item: write the repro/failing test first, then the fix, one commit per item. (Phase 0 executed this way.)
