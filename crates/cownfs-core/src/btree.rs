@@ -10,6 +10,7 @@ use std::cmp::Ordering;
 use std::sync::{Arc, Mutex};
 
 use crate::store::StoreError;
+use crate::block::BlockDevice;
 
 /// Generational node reference.
 ///
@@ -50,8 +51,24 @@ pub trait NodeStore<K, V> {
     fn dec_ref(&mut self, id: NodeId) -> Result<(), StoreError>;
     /// Persist dirty state. No-op for in-memory stores.
     /// Returns true if any dirty state was actually written.
+    ///
+    /// DEADLOCK WARNING: Implementations must NOT hold the store lock
+    /// while acquiring the shared device lock. Use prepare_flush() and
+    /// finish_flush() for two-phase operation.
     fn flush(&mut self) -> Result<bool, StoreError> {
         Ok(false)
+    }
+    /// Prepare flush: return (block, encoded_data) for dirty nodes.
+    /// Called with the store lock held; must NOT do I/O.
+    fn prepare_flush(&mut self) -> Vec<(u64, crate::Block)> {
+        Vec::new()
+    }
+    /// Finish flush: mark blocks clean. Called with store lock held, after I/O.
+    fn finish_flush(&mut self, _blocks: &[u64]) {}
+    /// Get the shared device Arc for I/O (without holding the store lock).
+    /// Returns None for in-memory stores.
+    fn shared_arc(&self) -> Option<std::sync::Arc<std::sync::Mutex<crate::store::Shared>>> {
+        None
     }
     /// Nodes currently allocated (for leak checks).
     fn live(&mut self) -> usize;
@@ -374,8 +391,42 @@ impl<K, V, S: NodeStore<K, V>, const T: usize> BTree<K, V, S, T> {
 
     /// Flush dirty state in block-backed stores.
     /// Returns true if any dirty nodes were written.
+    ///
+    /// DEADLOCK FIX: Uses two-phase flush to avoid AB-BA deadlock.
+    /// Phase 1: lock store, prepare data, clone shared Arc, drop lock.
+    /// Phase 2: lock shared (via cloned Arc), do I/O (no store lock held).
+    /// Phase 3: lock store, mark clean.
     pub fn flush(&self) -> Result<bool, StoreError> {
-        self.store.lock().unwrap().flush()
+        // Phase 1: prepare (with store lock).
+        let (prepared, shared_opt) = {
+            let mut store = self.store.lock().unwrap();
+            let prepared = store.prepare_flush();
+            let shared_opt = store.shared_arc();
+            (prepared, shared_opt)
+        };
+        if prepared.is_empty() {
+            return Ok(false);
+        }
+        // Phase 2: I/O (with shared lock, WITHOUT store lock).
+        if let Some(shared) = shared_opt {
+            for (block, buf) in &prepared {
+                shared
+                    .lock()
+                    .unwrap()
+                    .dev
+                    .write_block(*block, buf)
+                    .map_err(StoreError::Io)?;
+            }
+        } else {
+            // In-memory store: no I/O needed, just mark clean.
+        }
+        // Phase 3: finish (with store lock).
+        {
+            let mut store = self.store.lock().unwrap();
+            let blocks: Vec<u64> = prepared.iter().map(|(b, _)| *b).collect();
+            store.finish_flush(&blocks);
+        }
+        Ok(true)
     }
 }
 

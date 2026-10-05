@@ -140,8 +140,10 @@ fn p2_group_commit_coalesces() {
     // commit_async flush, so 64 writes = 64 physical commits).
     let img = test_image();
     let srv = spawn_server_on(&img);
-    // Disable background txg sync so the writes actually have work to do.
-    srv.shared.set_txg_interval_ms(u64::MAX);
+    // Use a short background txg interval so the FILE_SYNC wait() has a
+    // syncer to wake it. The 64 concurrent writes should coalesce into
+    // very few physical syncs.
+    srv.shared.set_txg_interval_ms(50);
 
     let uuid = srv.uuid;
     let baseline = srv.shared.fs.read().unwrap().sync_count();

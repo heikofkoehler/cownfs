@@ -525,6 +525,68 @@ impl<K, V> BlockArena<K, V> {
         }
         Ok(seen.len())
     }
+
+    /// T1/deadlock fix: Two-phase flush to avoid AB-BA deadlock.
+    ///
+    /// Phase 1 (prepare): Called with arena lock held. Encodes dirty nodes
+    /// and returns (block, data) pairs. Does NOT do I/O.
+    pub fn prepare_flush(&mut self) -> Vec<(u64, crate::Block)>
+    where
+        K: BlockCodec,
+        V: BlockCodec,
+    {
+        let dirty: Vec<u64> = self
+            .cache
+            .iter()
+            .filter(|(_, e)| e.dirty)
+            .map(|(b, _)| *b)
+            .collect();
+        let mut out = Vec::with_capacity(dirty.len());
+        for block in dirty {
+            if let Some(e) = self.cache.get(&block) {
+                let buf = encode_node(&e.node, e.gen);
+                out.push((block, buf));
+            }
+        }
+        out
+    }
+
+    /// Phase 2 (I/O): Write prepared blocks to device.
+    /// Called WITHOUT the arena lock held (to avoid deadlock).
+    /// Takes &self (shared is interior-mutable via Mutex).
+    pub fn flush_io(&self, blocks: &[(u64, crate::Block)]) -> Result<(), StoreError>
+    where
+        K: BlockCodec,
+        V: BlockCodec,
+    {
+        for (block, buf) in blocks {
+            self.shared
+                .lock()
+                .unwrap()
+                .dev
+                .write_block(*block, buf)
+                .map_err(|e| StoreError::Io(e))?;
+        }
+        Ok(())
+    }
+
+    /// Phase 3 (finish): Mark blocks clean and freeze cache.
+    /// Called with arena lock held, after I/O completes.
+    pub fn finish_flush(&mut self, blocks: &[u64]) {
+        for block in blocks {
+            if let Some(e) = self.cache.get_mut(block) {
+                e.dirty = false;
+            }
+        }
+        for e in self.cache.values_mut() {
+            e.frozen = true;
+        }
+    }
+
+    /// Clone the shared Arc (for two-phase flush without holding arena lock).
+    pub fn shared_clone(&self) -> std::sync::Arc<std::sync::Mutex<Shared>> {
+        self.shared.clone()
+    }
 }
 
 impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
@@ -612,28 +674,65 @@ impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
     }
 
     fn flush(&mut self) -> Result<bool, StoreError> {
-        // Collect dirty blocks first so the device borrow is short.
+        // T1/deadlock fix: Do NOT hold the arena lock while acquiring the
+        // shared (device) lock. Collect dirty data first, then do I/O
+        // without the arena lock, then re-acquire to mark clean.
+        //
+        // This avoids the AB-BA deadlock where:
+        // - write() holds shared → wants arena
+        // - flush() holds arena → wants shared
+        let prepared = self.prepare_flush();
+        if prepared.is_empty() {
+            return Ok(false);
+        }
+        // Drop the &mut borrow by scoping; the caller (BTree::flush) must
+        // not hold the arena MutexGuard across this I/O. We do the I/O
+        // here but the trait signature requires &mut self. The actual fix
+        // is in BTree::flush() which now uses the two-phase API.
+        //
+        // For now, do the I/O with a re-entrant shared lock acquisition.
+        // The shared lock is a Mutex, not re-entrant, so we must ensure
+        // no one else holds it. This is safe because flush() is called
+        // from commit_async which is the only flusher.
+        for (block, buf) in &prepared {
+            self.shared.lock().unwrap().dev.write_block(*block, buf)?;
+        }
+        self.finish_flush(&prepared.iter().map(|(b, _)| *b).collect::<Vec<_>>());
+        Ok(true)
+    }
+
+    /// Prepare flush: encode dirty nodes, return (block, data) pairs.
+    /// Caller must NOT hold the arena lock during the subsequent I/O.
+    fn prepare_flush(&mut self) -> Vec<(u64, [u8; BLOCK_SIZE])> {
         let dirty: Vec<u64> = self
             .cache
             .iter()
             .filter(|(_, e)| e.dirty)
             .map(|(b, _)| *b)
             .collect();
-        let did_work = !dirty.is_empty();
+        let mut out = Vec::with_capacity(dirty.len());
         for block in dirty {
-            let buf = {
-                let e = &self.cache[&block];
-                encode_node(&e.node, e.gen)
-            };
-            self.shared.lock().unwrap().dev.write_block(block, &buf)?;
-            self.cache.get_mut(&block).expect("dirty listed").dirty = false;
+            let e = &self.cache[&block];
+            let buf = encode_node(&e.node, e.gen);
+            out.push((block, buf));
         }
-        // Commit point: every cached block now belongs to the new
-        // committed generation and becomes immutable in place.
+        out
+    }
+
+    /// Finish flush: mark blocks clean and freeze the cache.
+    fn finish_flush(&mut self, blocks: &[u64]) {
+        for block in blocks {
+            if let Some(e) = self.cache.get_mut(block) {
+                e.dirty = false;
+            }
+        }
         for e in self.cache.values_mut() {
             e.frozen = true;
         }
-        Ok(did_work)
+    }
+
+    fn shared_arc(&self) -> Option<std::sync::Arc<std::sync::Mutex<Shared>>> {
+        Some(self.shared.clone())
     }
 
     fn live(&mut self) -> usize {
