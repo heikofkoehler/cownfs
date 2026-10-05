@@ -352,3 +352,9 @@ See [docs/production-readiness.md](docs/production-readiness.md) for complete op
 4. **Transport independence**: The core storage engine is decoupled from the NFS server and is tested independently of networking.
 5. **Memory safety**: Written in safe Rust without `unsafe` code in core engine paths.
 6. **Real-world client interoperability**: Strict protocol conformance where possible, prioritizing real-world client compatibility (macOS xnu, Linux kernel) and documenting necessary deviations.
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
