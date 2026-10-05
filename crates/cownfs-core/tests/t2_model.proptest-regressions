@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bd3726dc437863b21d11ef2c268b6c121e8a4d37aaeef4ffaab987a59d78e0d2 # shrinks to ops = [Symlink { parent: 0, name: 0, target: 0, uid: 0 }, HardLink { target: 0, parent: 0, name: 25 }]

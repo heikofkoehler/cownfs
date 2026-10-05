@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
-use cownfs_core::engine::{Fs, FsError, FTYPE_DIR, FTYPE_SYMLINK, ROOT_INO};
+use cownfs_core::engine::{Fs, FsError, FTYPE_DIR, FTYPE_FILE, FTYPE_SYMLINK, ROOT_INO};
 
 use crate::nfs4::{
     encode_compound, AnyFileHandle, AttrMask, AttrValues, Compound, FileAttrs, FileHandle,
@@ -2107,6 +2107,15 @@ impl Session {
             Ok(i) => i,
             Err(r) => return r,
         };
+        // RFC 7530 §16.8: WRITE targets regular files. Reject symlinks
+        // (and dirs) explicitly with INVAL rather than letting the engine
+        // error mapping decide: writing a symlink's bytes would corrupt
+        // its target, which POSIX makes unrepresentable.
+        match self.fs().getattr(ino) {
+            Ok(attr) if attr.ftype != FTYPE_FILE => return OpResult::err(OP_WRITE, NFS4ERR_INVAL),
+            Err(e) => return OpResult::err(OP_WRITE, fs_to_nfs(e)),
+            _ => {}
+        }
         if let Err(e) = self.fs_mut().write(ino, offset, data) {
             return OpResult::err(OP_WRITE, fs_to_nfs(e));
         }

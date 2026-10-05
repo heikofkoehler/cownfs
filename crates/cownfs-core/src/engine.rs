@@ -1961,8 +1961,8 @@ impl Fs {
         }
         // Truncate and rewrite.
         let ino = self.xattr_file_ino()?;
-        self.truncate(ino, 0)?;
-        self.write(ino, 0, &buf)?;
+        self.truncate_raw(ino, 0)?;
+        self.write_raw(ino, 0, &buf)?;
         Ok(())
     }
 
@@ -2370,7 +2370,7 @@ impl Fs {
         }
         self.check_quota(uid, Self::blocks_for_size(target.len() as u64))?;
         let ino = self.mknode(parent, name, FTYPE_SYMLINK, 0o777, uid, gid)?;
-        self.write(ino, 0, target)?;
+        self.write_raw(ino, 0, target)?;
         Ok(ino)
     }
 
@@ -2740,14 +2740,27 @@ impl Fs {
 
     /// Copy-on-write write: touched blocks are always freshly allocated;
     /// old blocks are freed (P3: unless a snapshot still references them).
+    /// Write file data. Only regular files are writable: writing to a
+    /// symlink or directory returns `NotFile` (POSIX has no write-to-symlink;
+    /// `open(O_WRONLY)` follows the link). `symlink()` uses `write_raw()`.
     pub fn write(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<(), FsError> {
         if data.is_empty() {
             return Ok(());
         }
-        let mut inode = self.getattr(ino)?;
-        if inode.ftype != FTYPE_FILE && inode.ftype != FTYPE_SYMLINK {
+        let inode = self.getattr(ino)?;
+        if inode.ftype != FTYPE_FILE {
             return Err(FsError::NotFile);
         }
+        self.write_raw(ino, offset, data)
+    }
+
+    /// Write without the file-type check (for symlink creation and the
+    /// xattr backing file).
+    fn write_raw(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<(), FsError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let mut inode = self.getattr(ino)?;
         // Quota: check the growth (extension) before allocating.
         let old_blocks = Self::blocks_for_size(inode.size);
         let new_size = (offset + data.len() as u64).max(inode.size);
@@ -2838,11 +2851,18 @@ impl Fs {
         Ok(())
     }
 
+    /// Resize a regular file. Symlinks and directories return `NotFile`
+    /// (POSIX: ftruncate on a symlink is not possible).
     pub fn truncate(&mut self, ino: u64, size: u64) -> Result<(), FsError> {
-        let mut inode = self.getattr(ino)?;
-        if inode.ftype != FTYPE_FILE && inode.ftype != FTYPE_SYMLINK {
+        let inode = self.getattr(ino)?;
+        if inode.ftype != FTYPE_FILE {
             return Err(FsError::NotFile);
         }
+        self.truncate_raw(ino, size)
+    }
+
+    fn truncate_raw(&mut self, ino: u64, size: u64) -> Result<(), FsError> {
+        let mut inode = self.getattr(ino)?;
         let old_size = inode.size;
         let uid = inode.uid;
         if size < old_size {

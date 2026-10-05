@@ -582,7 +582,7 @@ impl Driver {
                 } else {
                     match self.w.nodes.get(&t) {
                         None => Err("NotFound"),
-                        Some(n) if n.nt == NT::Dir => Err("NotFile"),
+                        Some(n) if n.nt != NT::File => Err("NotFile"),
                         Some(n) => {
                             let new_size =
                                 (*offset as u64 + data.len() as u64).max(n.data.len() as u64);
@@ -599,9 +599,9 @@ impl Driver {
                 let r = check(expect, self.fs.write(t, *offset as u64, data), "write")?;
                 if r.is_some() && !data.is_empty() {
                     // Fs succeeded: mirror the overlay. The target is a live
-                    // non-dir (otherwise the prediction would not be Ok).
+                    // file (otherwise the prediction would not be Ok).
                     if let Some(n) = self.w.nodes.get_mut(&t) {
-                        if n.nt != NT::Dir {
+                        if n.nt == NT::File {
                             let new_size =
                                 (*offset as u64 + data.len() as u64).max(n.data.len() as u64);
                             let growth = blocks_for_size(new_size)
@@ -624,7 +624,7 @@ impl Driver {
                 };
                 let expect = match self.w.nodes.get(&t) {
                     None => Err("NotFound"),
-                    Some(n) if n.nt == NT::Dir => Err("NotFile"),
+                    Some(n) if n.nt != NT::File => Err("NotFile"),
                     Some(n) => {
                         let old = n.data.len() as u64;
                         let (ob, nb) = (blocks_for_size(old), blocks_for_size(*size as u64));
@@ -638,7 +638,7 @@ impl Driver {
                 let r = check(expect, self.fs.truncate(t, *size as u64), "truncate")?;
                 if r.is_some() {
                     if let Some(n) = self.w.nodes.get_mut(&t) {
-                        if n.nt != NT::Dir {
+                        if n.nt == NT::File {
                             let old = n.data.len() as u64;
                             let (ob, nb) = (blocks_for_size(old), blocks_for_size(*size as u64));
                             n.data.resize(*size as usize, 0);

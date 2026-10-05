@@ -433,3 +433,47 @@ fn rpc_null_probe() {
     ops.getfh();
     c.check_ok(b"after-null", ops);
 }
+
+#[test]
+fn write_to_symlink_is_inval_and_target_intact() {
+    // T2 follow-up: WRITE to a symlink filehandle must not corrupt the
+    // link target (POSIX makes write-to-symlink unrepresentable; RFC 7530
+    // WRITE is for regular files). Expect NFS4ERR_INVAL.
+    let srv = spawn_server(4096);
+    let mut c = NfsClient::connect(&srv.addr);
+    let _cid = establish_client(&mut c, b"p8-symwrite");
+
+    // CREATE the symlink, then LOOKUP it to put its fh in cfh.
+    let mut ops = Ops::new();
+    ops.putfh(&srv.uuid, ROOT_INO);
+    ops.create_symlink(b"s", b"original-target");
+    c.check_ok(b"mksymlink", ops);
+
+    let mut ops = Ops::new();
+    ops.putfh(&srv.uuid, ROOT_INO);
+    ops.lookup(b"s");
+    ops.write(0, FILE_SYNC4, b"CORRUPT");
+    let (overall, res) = c.call(b"write-symlink", ops);
+    assert_eq!(overall, NFS4ERR_INVAL);
+    assert!(matches!(res[2], Reply::Err(NFS4ERR_INVAL)));
+
+    // The target is intact: READ the symlink fh returns the original path.
+    let mut ops = Ops::new();
+    ops.putfh(&srv.uuid, ROOT_INO);
+    ops.lookup(b"s");
+    ops.read(0, 64);
+    let res = c.check_ok(b"read-symlink", ops);
+    match &res[2] {
+        Reply::Read { data, .. } => assert_eq!(data, b"original-target"),
+        r => panic!("read: unexpected reply {r:?}"),
+    }
+
+    // WRITE to a directory fh is INVAL too.
+    let mut ops = Ops::new();
+    ops.putfh(&srv.uuid, ROOT_INO);
+    ops.write(0, FILE_SYNC4, b"x");
+    let (overall, res) = c.call(b"write-dir", ops);
+    assert_eq!(overall, NFS4ERR_INVAL);
+    assert!(matches!(res[1], Reply::Err(NFS4ERR_INVAL)));
+    // The server still serves after the rejected WRITEs.
+}
