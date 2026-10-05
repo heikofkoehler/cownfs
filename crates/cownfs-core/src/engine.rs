@@ -1396,32 +1396,35 @@ impl Fs {
         if bitmap_bytes + 8 > area_bytes {
             return Ok(Vec::new());
         }
-        // Read the block containing the queue header.
-        let blk_idx = (bitmap_bytes / BLOCK_SIZE) as u64;
-        let blk_off = bitmap_bytes % BLOCK_SIZE;
-        let mut blk = [0u8; BLOCK_SIZE];
-        dev.read_block(base_start + blk_idx, &mut blk)
-            .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
-        let count = u64::from_le_bytes(blk[blk_off..blk_off + 8].try_into().unwrap()) as usize;
+        // Helper: read 8 bytes at area-relative offset, handling block spans.
+        let mut read_u64 = |off: usize| -> Result<u64, FsError> {
+            let mut bytes = [0u8; 8];
+            let mut pos = 0;
+            let mut cur_off = off;
+            while pos < 8 {
+                let blk_idx = (cur_off / BLOCK_SIZE) as u64;
+                let blk_off = cur_off % BLOCK_SIZE;
+                let mut blk = [0u8; BLOCK_SIZE];
+                dev.read_block(base_start + blk_idx, &mut blk)
+                    .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+                let take = (8 - pos).min(BLOCK_SIZE - blk_off);
+                bytes[pos..pos + take].copy_from_slice(&blk[blk_off..blk_off + take]);
+                pos += take;
+                cur_off += take;
+            }
+            Ok(u64::from_le_bytes(bytes))
+        };
+        let count = read_u64(bitmap_bytes)? as usize;
         // Sanity bound: queue can't exceed the area.
         let max = (area_bytes - bitmap_bytes - 8) / 8;
         let count = count.min(max);
         let mut out = Vec::with_capacity(count);
-        let mut pos = blk_off + 8;
-        let mut cur_blk = blk_idx;
-        for _ in 0..count {
-            if pos + 8 > BLOCK_SIZE {
-                cur_blk += 1;
-                dev.read_block(base_start + cur_blk, &mut blk)
-                    .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
-                pos = 0;
-            }
-            let b = u64::from_le_bytes(blk[pos..pos + 8].try_into().unwrap());
+        for i in 0..count {
+            let b = read_u64(bitmap_bytes + 8 + i * 8)?;
             // Validate: block number must be in range.
             if b < sb.block_count {
                 out.push(b);
             }
-            pos += 8;
         }
         Ok(out)
     }
@@ -1466,8 +1469,28 @@ impl Fs {
     /// Write the full bitmap to area 0 and reset delta state.
     fn persist_bitmap_full(&self, target_slot: usize) -> Result<(), FsError> {
         let blocks = self.sb.bitmap_blocks;
-        let raw = self.shared.lock().unwrap().bitmap.to_bytes();
         let mut sh = self.shared.lock().unwrap();
+        // R3: if the deferred queue exceeds the bitmap area padding, free the
+        // excess [1] blocks now (safe: 2 gens old, writing to new slot
+        // pre-flip) rather than leaking them. Do this before capturing raw.
+        {
+            let bitmap_bytes = ((self.sb.block_count + 63) / 64) as usize * 8;
+            let area_bytes = blocks as usize * BLOCK_SIZE;
+            if bitmap_bytes + 8 <= area_bytes {
+                let avail = (area_bytes - (bitmap_bytes + 8)) / 8;
+                let total = sh.pending_free[0].len() + sh.pending_free[1].len();
+                if total > avail {
+                    let excess = total - avail;
+                    let free_now = excess.min(sh.pending_free[1].len());
+                    for _ in 0..free_now {
+                        if let Some(b) = sh.pending_free[1].pop() {
+                            sh.bitmap.clear(b);
+                        }
+                    }
+                }
+            }
+        }
+        let raw = sh.bitmap.to_bytes();
         // R1 fix: write to the *target superblock slot's* bitmap area.
         // Slot s owns area s (bitmap_start + s*blocks). The currently-active
         // slot's area is never touched, so a crash before the slot flip
@@ -1482,22 +1505,24 @@ impl Fs {
         // padding (after the bitmap bytes). On open, these blocks are freed
         // — they're unreachable from the committed generation. Without this,
         // the in-memory queue is lost on reopen, leaking the blocks.
+        // (Excess beyond padding was freed above.)
         {
             let q0 = &sh.pending_free[0];
             let q1 = &sh.pending_free[1];
             let total = q0.len() + q1.len();
             let off = n;
             // Header: total count (u64). Then block numbers (u64 each).
-            // Bound by available padding; excess stays in memory (leaked
-            // until fsck, but not corrupt — conservative).
-            let avail = buf.len().saturating_sub(off + 8) / 8;
-            let take = total.min(avail);
-            buf[off..off + 8].copy_from_slice(&(take as u64).to_le_bytes());
-            let mut pos = off + 8;
-            // Write [1] (older) first, then [0].
-            for b in q1.iter().chain(q0.iter()).take(take) {
-                buf[pos..pos + 8].copy_from_slice(&b.to_le_bytes());
-                pos += 8;
+            // If the bitmap fills the area (no padding), skip the queue.
+            if off + 8 <= buf.len() {
+                let avail = (buf.len() - (off + 8)) / 8;
+                let take = total.min(avail);
+                buf[off..off + 8].copy_from_slice(&(take as u64).to_le_bytes());
+                let mut pos = off + 8;
+                // Write [1] (older) first, then [0].
+                for b in q1.iter().chain(q0.iter()).take(take) {
+                    buf[pos..pos + 8].copy_from_slice(&b.to_le_bytes());
+                    pos += 8;
+                }
             }
         }
         for (i, chunk) in buf.chunks_exact(BLOCK_SIZE).enumerate() {
