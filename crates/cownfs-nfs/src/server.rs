@@ -229,7 +229,19 @@ impl Shared {
                                 last_err = None;
                                 break;
                             }
-                            Err(e) => last_err = Some(format!("{e:?}")),
+                            Err(e) => {
+                                // T9: deterministic injected faults are not
+                                // retried — retrying a one-shot fault would
+                                // silently succeed and defeat the test's
+                                // error-mapping check. Real transient errors
+                                // (EIO) still retry.
+                                let injected =
+                                    matches!(e, FsError::InjectedFault(_));
+                                last_err = Some(format!("{e:?}"));
+                                if injected {
+                                    break;
+                                }
+                            }
                         }
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     }

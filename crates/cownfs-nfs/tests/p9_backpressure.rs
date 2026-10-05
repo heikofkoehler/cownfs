@@ -12,7 +12,9 @@ use cownfs_nfs::nfs4::{self, FILE_SYNC4, UNSTABLE4};
 fn dirty_backpressure_returns_delay_then_recovers() {
     let srv = common::spawn_server(4096);
     // Disable the background sync so dirty bytes don't get reset mid-test.
-    srv.shared.set_txg_interval_ms(3_600_000);
+    // u64::MAX makes op_commit/op_write fall back to direct sync_txg()
+    // instead of waiting on the (disabled) background thread.
+    srv.shared.set_txg_interval_ms(u64::MAX);
     // Low threshold for the test.
     srv.shared
         .fs

@@ -1666,10 +1666,15 @@ impl Fs {
     pub fn mark_txg_dirty(&self) -> u64 {
         let mut t = self.txg.state.lock().unwrap();
         t.dirty = true;
+        // T9: new transaction, old errors are stale. A persistent failure
+        // will set the error again on the next background attempt.
+        t.error = None;
         t.current
     }
 
     pub fn commit_async(&self) -> Result<u64, FsError> {
+        // T9: new commit attempt; clear stale txg errors (see mark_txg_dirty).
+        self.txg.clear_error();
         let flushed = self.flush_all()?;
         self.check_fault(FaultPoint::AfterFlush)?;
         // Only persist the bitmap if something was actually flushed.
