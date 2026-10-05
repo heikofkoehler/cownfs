@@ -13,8 +13,28 @@ use crate::{Block, BLOCK_SIZE};
 pub trait BlockDevice {
     fn block_count(&self) -> u64;
     fn read_block(&self, n: u64, buf: &mut Block) -> io::Result<()>;
-    fn write_block(&mut self, n: u64, buf: &Block) -> io::Result<()>;
-    fn sync(&mut self) -> io::Result<()>;
+    /// P4: takes `&self` — positional `write_all_at` needs no file offset,
+    /// so concurrent writers need no mutex. Fault-injector state lives
+    /// behind its own lock.
+    fn write_block(&self, n: u64, buf: &Block) -> io::Result<()>;
+    fn sync(&self) -> io::Result<()>;
+}
+
+/// P4: `Arc<D>` forwards to `D`, so shared devices can be passed to
+/// `&impl BlockDevice` helpers without unwrapping.
+impl<D: BlockDevice> BlockDevice for std::sync::Arc<D> {
+    fn block_count(&self) -> u64 {
+        (**self).block_count()
+    }
+    fn read_block(&self, n: u64, buf: &mut Block) -> io::Result<()> {
+        (**self).read_block(n, buf)
+    }
+    fn write_block(&self, n: u64, buf: &Block) -> io::Result<()> {
+        (**self).write_block(n, buf)
+    }
+    fn sync(&self) -> io::Result<()> {
+        (**self).sync()
+    }
 }
 
 /// A [`BlockDevice`] backed by a regular file (or a block device node).
@@ -22,12 +42,15 @@ pub struct FileDevice {
     file: File,
     blocks: u64,
     /// Fault injection for B3/D3 testing. None = disabled.
-    faults: Option<FaultInjector>,
+    /// P4: behind a Mutex so all device I/O takes `&self` (positional
+    /// pread/pwrite need no file-level lock; only the injector's own
+    /// small mutable state is guarded).
+    faults: std::sync::Mutex<Option<FaultInjector>>,
     /// T1: operation recorder for crash-state enumeration. When armed,
     /// every `write_block` and `sync` is appended to the shared log.
     /// `Arc<Mutex<..>>` so the test can read it mid-workload (to tag
     /// durability-ledger entries with the current sync index).
-    recorder: Option<std::sync::Arc<std::sync::Mutex<Vec<RecordedOp>>>>,
+    recorder: std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<Vec<RecordedOp>>>>>,
 }
 
 /// Fault injection modes for testing crash consistency.
@@ -72,30 +95,31 @@ impl FaultInjector {
 
 impl FileDevice {
     /// Set the fault injector (B3/D3 testing).
-    pub fn set_faults(&mut self, faults: FaultInjector) {
-        self.faults = Some(faults);
+    pub fn set_faults(&self, faults: FaultInjector) {
+        *self.faults.lock().unwrap() = Some(faults);
     }
 
     /// Clear the fault injector.
-    pub fn clear_faults(&mut self) {
-        self.faults = None;
+    pub fn clear_faults(&self) {
+        *self.faults.lock().unwrap() = None;
     }
 
     /// T1: arm the operation recorder. Every subsequent `write_block`
     /// and `sync` is appended to the shared log (in order).
-    pub fn arm_recorder(&mut self) {
-        self.recorder = Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    pub fn arm_recorder(&self) {
+        *self.recorder.lock().unwrap() =
+            Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
     }
 
     /// T1: get a handle to the live recording (for mid-workload sync
     /// counting). Returns None if the recorder is not armed.
     pub fn recorder_handle(&self) -> Option<std::sync::Arc<std::sync::Mutex<Vec<RecordedOp>>>> {
-        self.recorder.clone()
+        self.recorder.lock().unwrap().clone()
     }
 
     /// T1: take the recorded operations, disarming the recorder.
-    pub fn take_recording(&mut self) -> Vec<RecordedOp> {
-        match self.recorder.take() {
+    pub fn take_recording(&self) -> Vec<RecordedOp> {
+        match self.recorder.lock().unwrap().take() {
             Some(arc) => std::sync::Arc::try_unwrap(arc)
                 .map(|m| m.into_inner().unwrap())
                 .unwrap_or_else(|arc| arc.lock().unwrap().clone()),
@@ -140,8 +164,8 @@ impl FileDevice {
         Ok(Self {
             file,
             blocks,
-            faults: None,
-            recorder: None,
+            faults: std::sync::Mutex::new(None),
+            recorder: std::sync::Mutex::new(None),
         })
     }
 
@@ -158,8 +182,8 @@ impl FileDevice {
         Ok(Self {
             blocks: len / BLOCK_SIZE as u64,
             file,
-            faults: None,
-            recorder: None,
+            faults: std::sync::Mutex::new(None),
+            recorder: std::sync::Mutex::new(None),
         })
     }
 }
@@ -171,10 +195,14 @@ impl BlockDevice for FileDevice {
 
     fn read_block(&self, n: u64, buf: &mut Block) -> io::Result<()> {
         // T9: injected EIO on read.
-        if let Some(faults) = &self.faults {
-            if faults.fail_reads {
-                return Err(io::Error::new(io::ErrorKind::Other, "injected EIO on read"));
-            }
+        if self
+            .faults
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|f| f.fail_reads)
+        {
+            return Err(io::Error::other("injected EIO on read"));
         }
         if n >= self.blocks {
             return Err(io::Error::new(
@@ -185,7 +213,7 @@ impl BlockDevice for FileDevice {
         self.file.read_exact_at(buf, n * BLOCK_SIZE as u64)
     }
 
-    fn write_block(&mut self, n: u64, buf: &Block) -> io::Result<()> {
+    fn write_block(&self, n: u64, buf: &Block) -> io::Result<()> {
         if n >= self.blocks {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -194,70 +222,97 @@ impl BlockDevice for FileDevice {
         }
         // T1: record the op (after the bounds check, before faults, so the
         // log reflects what the filesystem attempted at the device layer).
-        if let Some(rec) = &self.recorder {
+        if let Some(rec) = self.recorder.lock().unwrap().clone() {
             rec.lock().unwrap().push(RecordedOp::Write {
                 block: n,
                 data: *buf,
             });
         }
-        // B3/D3: fault injection.
-        if let Some(faults) = &mut self.faults {
-            // Reordering: buffer the write, flush on sync.
-            if faults.reorder_writes {
-                faults.buffered.push((n, *buf));
-                return Ok(());
+        // B3/D3: fault injection. Decide under the injector lock, then do
+        // file I/O without holding it (P4: concurrent writers must not
+        // serialize on fault state).
+        enum FaultAction {
+            Plain,
+            Torn(usize),
+            BitFlip(f64),
+        }
+        let action = {
+            let mut faults = self.faults.lock().unwrap();
+            match faults.as_mut() {
+                None => FaultAction::Plain,
+                Some(f) if f.reorder_writes => {
+                    f.buffered.push((n, *buf));
+                    return Ok(());
+                }
+                Some(f) => {
+                    if let Some(torn_bytes) = f.torn_write_bytes {
+                        FaultAction::Torn(torn_bytes)
+                    } else if f.bit_flip_prob > 0.0 {
+                        FaultAction::BitFlip(f.bit_flip_prob)
+                    } else {
+                        FaultAction::Plain
+                    }
+                }
             }
-            let mut data = *buf;
-            // Torn write: only first N bytes.
-            if let Some(torn_bytes) = faults.torn_write_bytes {
+        };
+        let at = n * BLOCK_SIZE as u64;
+        match action {
+            FaultAction::Plain => self.file.write_all_at(buf, at),
+            FaultAction::Torn(torn_bytes) => {
                 let mut torn = [0u8; BLOCK_SIZE];
                 let nb = torn_bytes.min(BLOCK_SIZE);
-                torn[..nb].copy_from_slice(&data[..nb]);
+                torn[..nb].copy_from_slice(&buf[..nb]);
                 // The rest stays as it was (we don't know old content, so
                 // just write the partial — the test will verify detection).
-                self.file.write_all_at(&torn[..nb], n * BLOCK_SIZE as u64)?;
-                return Ok(());
+                self.file.write_all_at(&torn[..nb], at)
             }
-            // Bit flip.
-            if faults.bit_flip_prob > 0.0 {
+            FaultAction::BitFlip(prob) => {
+                let mut data = *buf;
                 // Simple deterministic PRNG for reproducibility.
                 let seed = n.wrapping_mul(0x9e3779b97f4a7c15);
                 let r = ((seed >> 33) as f64) / (u64::MAX as f64);
-                if r < faults.bit_flip_prob {
+                if r < prob {
                     let bit = (seed % (BLOCK_SIZE as u64 * 8)) as usize;
                     data[bit / 8] ^= 1 << (bit % 8);
                 }
+                self.file.write_all_at(&data, at)
             }
-            self.file.write_all_at(&data, n * BLOCK_SIZE as u64)?;
-            return Ok(());
         }
-        self.file.write_all_at(buf, n * BLOCK_SIZE as u64)
     }
 
-    fn sync(&mut self) -> io::Result<()> {
-        // T9: injected EIO on sync.
-        if let Some(faults) = &self.faults {
-            if faults.fail_sync {
-                return Err(io::Error::new(io::ErrorKind::Other, "injected EIO on sync"));
+    fn sync(&self) -> io::Result<()> {
+        // T9: injected EIO on sync / latency injection. Read the settings,
+        // then act without holding the injector lock.
+        let (fail_sync, latency_ms, reorder) = {
+            let faults = self.faults.lock().unwrap();
+            match faults.as_ref() {
+                Some(f) => (f.fail_sync, f.sync_latency_ms, f.reorder_writes),
+                None => (false, None, false),
             }
-            // T9: latency injection.
-            if let Some(ms) = faults.sync_latency_ms {
-                std::thread::sleep(std::time::Duration::from_millis(ms));
-            }
+        };
+        if fail_sync {
+            return Err(io::Error::other("injected EIO on sync"));
+        }
+        if let Some(ms) = latency_ms {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
         }
         // B3/D3: flush buffered writes in reverse order (reordering test).
-        if let Some(faults) = &mut self.faults {
-            if faults.reorder_writes && !faults.buffered.is_empty() {
-                let buffered = std::mem::take(&mut faults.buffered);
-                // Reverse order: superblock (written last) hits disk first.
-                for (n, buf) in buffered.into_iter().rev() {
-                    self.file.write_all_at(&buf, n * BLOCK_SIZE as u64)?;
-                }
+        if reorder {
+            let buffered = {
+                let mut faults = self.faults.lock().unwrap();
+                faults
+                    .as_mut()
+                    .map(|f| std::mem::take(&mut f.buffered))
+                    .unwrap_or_default()
+            };
+            // Reverse order: superblock (written last) hits disk first.
+            for (n, buf) in buffered.into_iter().rev() {
+                self.file.write_all_at(&buf, n * BLOCK_SIZE as u64)?;
             }
         }
         self.file.sync_all()?;
         // T1: record the sync barrier.
-        if let Some(rec) = &self.recorder {
+        if let Some(rec) = self.recorder.lock().unwrap().clone() {
             rec.lock().unwrap().push(RecordedOp::Sync);
         }
         Ok(())
@@ -281,25 +336,29 @@ pub enum RecordedOp {
 
 pub struct RecordingDevice<D: BlockDevice> {
     inner: D,
-    log: Vec<RecordedOp>,
+    log: std::sync::Mutex<Vec<RecordedOp>>,
 }
 
 impl<D: BlockDevice> RecordingDevice<D> {
     pub fn new(inner: D) -> Self {
         RecordingDevice {
             inner,
-            log: Vec::new(),
+            log: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     /// The recorded operation log.
-    pub fn log(&self) -> &[RecordedOp] {
-        &self.log
+    /// P4: returns a snapshot copy; the log is behind a Mutex so
+    /// `BlockDevice` can be implemented for `&self`.
+    pub fn log(&self) -> Vec<RecordedOp> {
+        self.log.lock().unwrap().clone()
     }
 
     /// Indices in the log where Sync operations occur.
     pub fn sync_indices(&self) -> Vec<usize> {
         self.log
+            .lock()
+            .unwrap()
             .iter()
             .enumerate()
             .filter(|(_, op)| matches!(op, RecordedOp::Sync))
@@ -311,23 +370,35 @@ impl<D: BlockDevice> RecordingDevice<D> {
     /// `sync_idx` is 0-based among syncs. Returns the ops to replay for a crash
     /// at that point.
     pub fn crash_prefix(&self, sync_idx: usize) -> Vec<RecordedOp> {
-        let syncs = self.sync_indices();
+        let log = self.log.lock().unwrap();
+        let syncs: Vec<usize> = log
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| matches!(op, RecordedOp::Sync))
+            .map(|(i, _)| i)
+            .collect();
         if sync_idx >= syncs.len() {
-            return self.log.clone();
+            return log.clone();
         }
         let end = syncs[sync_idx] + 1; // include the sync
-        self.log[..end].to_vec()
+        log[..end].to_vec()
     }
 
     /// Writes after the `sync_idx`-th sync (candidates for partial application).
     pub fn post_sync_writes(&self, sync_idx: usize) -> Vec<RecordedOp> {
-        let syncs = self.sync_indices();
+        let log = self.log.lock().unwrap();
+        let syncs: Vec<usize> = log
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| matches!(op, RecordedOp::Sync))
+            .map(|(i, _)| i)
+            .collect();
         let start = if sync_idx < syncs.len() {
             syncs[sync_idx] + 1
         } else {
-            self.log.len()
+            log.len()
         };
-        self.log[start..]
+        log[start..]
             .iter()
             .filter(|op| matches!(op, RecordedOp::Write { .. }))
             .cloned()
@@ -337,7 +408,7 @@ impl<D: BlockDevice> RecordingDevice<D> {
 
 /// Replay a set of recorded operations onto a device.
 /// Free function (not associated with RecordingDevice) to avoid type inference issues.
-pub fn replay_ops<D2: BlockDevice>(ops: &[RecordedOp], dev: &mut D2) -> io::Result<()> {
+pub fn replay_ops<D2: BlockDevice>(ops: &[RecordedOp], dev: &D2) -> io::Result<()> {
     for op in ops {
         match op {
             RecordedOp::Write { block, data } => {
@@ -360,19 +431,19 @@ impl<D: BlockDevice> BlockDevice for RecordingDevice<D> {
         self.inner.read_block(n, buf)
     }
 
-    fn write_block(&mut self, n: u64, buf: &Block) -> io::Result<()> {
+    fn write_block(&self, n: u64, buf: &Block) -> io::Result<()> {
         // Log before writing (so a crash during write is represented by
         // the op being in the log but potentially torn — the harness
         // can simulate torn writes by truncating the data).
-        self.log.push(RecordedOp::Write {
+        self.log.lock().unwrap().push(RecordedOp::Write {
             block: n,
             data: *buf,
         });
         self.inner.write_block(n, buf)
     }
 
-    fn sync(&mut self) -> io::Result<()> {
-        self.log.push(RecordedOp::Sync);
+    fn sync(&self) -> io::Result<()> {
+        self.log.lock().unwrap().push(RecordedOp::Sync);
         self.inner.sync()
     }
 }
@@ -393,7 +464,7 @@ mod tests {
 
         // Create a device and wrap it.
         let inner = FileDevice::create(&path, 16).unwrap();
-        let mut rec = RecordingDevice::new(inner);
+        let rec = RecordingDevice::new(inner);
 
         // Do some writes and syncs.
         let mut blk1 = [0u8; BLOCK_SIZE];

@@ -337,7 +337,7 @@ fn do_receive(image: &Path, listen_addr: &str) -> Result<(), String> {
         return Err("bad hello".into());
     }
 
-    let mut dev = FileDevice::open(image).map_err(|e| format!("open image: {e}"))?;
+    let dev = FileDevice::open(image).map_err(|e| format!("open image: {e}"))?;
     let mut blocks_received = 0u64;
     // Superblock slots are buffered, not written immediately. On COMMIT
     // we fsync data blocks first, then publish the superblock, then fsync

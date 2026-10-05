@@ -30,7 +30,7 @@ fn corrupt_delta_falls_back_to_base() {
     drop(fs);
 
     // Corrupt the delta area (flip a byte in the entry region).
-    let mut dev = FileDevice::open(&img).unwrap();
+    let dev = FileDevice::open(&img).unwrap();
     let (sb, _) = superblock::open(&dev).unwrap();
     // Delta is in the non-base area.
     let delta_start = sb.bitmap_start + (1 - sb.bitmap_base_area) * sb.bitmap_blocks;

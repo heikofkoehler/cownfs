@@ -28,10 +28,10 @@ fn corrupt(path: &PathBuf, offset: u64, len: usize) {
 
 #[test]
 fn format_open_roundtrip() {
-    let (_path, mut dev) = tmp_image(1024);
+    let (_path, dev) = tmp_image(1024);
     let sb = {
         let n = dev.block_count();
-        superblock::format(&mut dev, n)
+        superblock::format(&dev, n)
     }
     .unwrap();
     assert_eq!(sb.generation, 1);
@@ -44,10 +44,10 @@ fn format_open_roundtrip() {
 
 #[test]
 fn bit_flip_falls_back_to_other_slot() {
-    let (path, mut dev) = tmp_image(1024);
+    let (path, dev) = tmp_image(1024);
     {
         let n = dev.block_count();
-        superblock::format(&mut dev, n)
+        superblock::format(&dev, n)
     }
     .unwrap();
     drop(dev);
@@ -62,10 +62,10 @@ fn bit_flip_falls_back_to_other_slot() {
 
 #[test]
 fn both_slots_corrupt_fails() {
-    let (path, mut dev) = tmp_image(1024);
+    let (path, dev) = tmp_image(1024);
     {
         let n = dev.block_count();
-        superblock::format(&mut dev, n)
+        superblock::format(&dev, n)
     }
     .unwrap();
     drop(dev);
@@ -78,30 +78,30 @@ fn both_slots_corrupt_fails() {
 
 #[test]
 fn commit_generation_ping_pongs() {
-    let (_path, mut dev) = tmp_image(1024);
+    let (_path, dev) = tmp_image(1024);
     {
         let n = dev.block_count();
-        superblock::format(&mut dev, n)
+        superblock::format(&dev, n)
     }
     .unwrap();
     let (mut sb, mut active) = superblock::open(&dev).unwrap();
     assert_eq!((sb.generation, active), (1, 0));
 
-    superblock::commit_generation(&mut dev, &mut sb, &mut active).unwrap();
+    superblock::commit_generation(&dev, &mut sb, &mut active).unwrap();
     assert_eq!((sb.generation, active), (2, 1));
 
     // Re-open from disk: the new generation must win.
     let (sb2, active2) = superblock::open(&dev).unwrap();
     assert_eq!((sb2.generation, active2), (2, 1));
 
-    superblock::commit_generation(&mut dev, &mut sb, &mut active).unwrap();
+    superblock::commit_generation(&dev, &mut sb, &mut active).unwrap();
     let (sb3, active3) = superblock::open(&dev).unwrap();
     assert_eq!((sb3.generation, active3), (3, 0));
 }
 
 #[test]
 fn block_read_write_roundtrip() {
-    let (_path, mut dev) = tmp_image(64);
+    let (_path, dev) = tmp_image(64);
     let mut w = [0u8; BLOCK_SIZE];
     for (i, b) in w.iter_mut().enumerate() {
         *b = (i * 7 % 251) as u8;
@@ -140,20 +140,20 @@ fn bitmap_alloc_and_exhaustion() {
 
 #[test]
 fn format_rejects_tiny_images() {
-    let (_path, mut dev) = tmp_image(8);
+    let (_path, dev) = tmp_image(8);
     assert!({
         let n = dev.block_count();
-        superblock::format(&mut dev, n)
+        superblock::format(&dev, n)
     }
     .is_err());
 }
 
 #[test]
 fn format_reserves_dual_bitmap_areas() {
-    let (_path, mut dev) = tmp_image(1024);
+    let (_path, dev) = tmp_image(1024);
     let sb = {
         let n = dev.block_count();
-        superblock::format(&mut dev, n)
+        superblock::format(&dev, n)
     }
     .unwrap();
     assert_eq!(sb.bitmap_area, 0);
@@ -163,7 +163,7 @@ fn format_reserves_dual_bitmap_areas() {
     assert_eq!(sb.bitmap_blocks, bblocks);
     assert_eq!(sb.bitmap_start, 2);
     // Area 0's bitmap marks slots and both areas allocated.
-    let map0 = cownfs_core::store::read_bitmap(&mut dev, 1024, 2, bblocks).unwrap();
+    let map0 = cownfs_core::store::read_bitmap(&dev, 1024, 2, bblocks).unwrap();
     for b in 0..2 + 2 * bblocks {
         assert!(map0.test(b), "reserved bit {b} not set in area 0");
     }

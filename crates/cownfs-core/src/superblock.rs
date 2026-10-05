@@ -213,7 +213,7 @@ impl Superblock {
 
 /// Write a single superblock slot. Public for incremental restore,
 /// which advances the generation outside the normal commit path.
-pub fn write_slot(dev: &mut impl BlockDevice, slot: usize, sb: &Superblock) -> io::Result<()> {
+pub fn write_slot(dev: &impl BlockDevice, slot: usize, sb: &Superblock) -> io::Result<()> {
     let mut blk = [0u8; BLOCK_SIZE];
     blk[..HDR_LEN].copy_from_slice(&sb.encode());
     dev.write_block(SLOT_BLOCKS[slot], &blk)
@@ -221,7 +221,7 @@ pub fn write_slot(dev: &mut impl BlockDevice, slot: usize, sb: &Superblock) -> i
 
 /// Write both slots with `sb` as-is (no generation bump) and sync.
 /// Used by mkfs; the engine's transaction path uses [`commit_generation`].
-pub fn write_slots(dev: &mut impl BlockDevice, sb: &Superblock) -> io::Result<()> {
+pub fn write_slots(dev: &impl BlockDevice, sb: &Superblock) -> io::Result<()> {
     write_slot(dev, 0, sb)?;
     write_slot(dev, 1, sb)?;
     dev.sync()
@@ -261,7 +261,7 @@ pub fn is_v3_slot(dev: &impl BlockDevice, slot: usize) -> bool {
 /// Formats a fresh P0-style image: writes the bitmap and both superblock
 /// slots at generation 1 (no filesystem trees; roots are zero).
 /// The engine's `format_fs` builds on this for full P2 images.
-pub fn format(dev: &mut impl BlockDevice, block_count: u64) -> io::Result<Superblock> {
+pub fn format(dev: &impl BlockDevice, block_count: u64) -> io::Result<Superblock> {
     let bblocks = bitmap::blocks_needed(block_count);
     let reserved = 2 + 2 * bblocks; // slots + two alternating bitmap areas
     if block_count < reserved + 16 {
@@ -310,7 +310,7 @@ pub fn open(dev: &impl BlockDevice) -> io::Result<(Superblock, usize)> {
 /// and syncing. The caller must have flushed dirty metadata and the bitmap
 /// first; a crash before this point exposes the previous generation.
 pub fn commit_generation(
-    dev: &mut impl BlockDevice,
+    dev: &impl BlockDevice,
     sb: &mut Superblock,
     active: &mut usize,
 ) -> io::Result<()> {

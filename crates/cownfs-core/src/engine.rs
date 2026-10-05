@@ -361,7 +361,7 @@ fn now_secs() -> u64 {
 /// Shared read path for the live trees and snapshot views.
 fn read_from(
     extents: &ExtentTree,
-    shared: &Arc<Mutex<Shared>>,
+    dev: &FileDevice,
     inode: &Inode,
     ino: u64,
     offset: u64,
@@ -376,19 +376,42 @@ fn read_from(
     }
     let mut out = Vec::with_capacity((end - offset) as usize);
 
-    // Hold the lock across the entire read to avoid per-block mutex overhead.
-    let sh = shared.lock().unwrap();
+    // P4: no lock is held across this read. The extent mapping is fetched
+    // with one range scan under a single brief arena-lock acquisition;
+    // data I/O goes straight to the device via &self (positional pread),
+    // so concurrent readers scale instead of serializing on the Shared
+    // mutex.
 
     // A4: gather extents, group contiguous physical blocks, read each run
     // in a single syscall.
     let start_blk = offset / BLOCK_SIZE as u64;
     let end_blk = (end - 1) / BLOCK_SIZE as u64;
     // Collect (file_blk, phys_blk, cksum) for the range.
-    let mut mappings = Vec::new();
+    //
+    // P4: one range scan under a single arena-lock acquisition, not a
+    // point lookup per block. A 1 MiB read does 256 point lookups; the
+    // per-lookup root-to-leaf walk (~20us in debug) dominated the read
+    // and serialized all readers on the extent arena's mutex. The scan
+    // descends once and walks the leaves.
+    let entries = extents.range(
+        &ExtentKey {
+            ino,
+            off: start_blk,
+        },
+        &ExtentKey { ino, off: end_blk },
+    )?;
+    let mut mappings = Vec::with_capacity((end_blk - start_blk + 1) as usize);
+    let mut idx = 0;
     for blk_off in start_blk..=end_blk {
-        match extents.get(&ExtentKey { ino, off: blk_off })? {
-            Some(ext) => mappings.push((blk_off, ext.blk, ext.cksum)),
-            None => mappings.push((blk_off, u64::MAX, 0)), // hole
+        while idx < entries.len() && entries[idx].0.off < blk_off {
+            idx += 1;
+        }
+        if idx < entries.len() && entries[idx].0.off == blk_off {
+            let ext = &entries[idx].1;
+            mappings.push((blk_off, ext.blk, ext.cksum));
+            idx += 1;
+        } else {
+            mappings.push((blk_off, u64::MAX, 0)); // hole
         }
     }
     // Group contiguous physical blocks (skip holes).
@@ -423,7 +446,7 @@ fn read_from(
         }
         // Read the run in one syscall.
         let mut buf = vec![0u8; run_len * BLOCK_SIZE];
-        sh.dev.read_blocks(pblk, &mut buf).map_err(StoreError::Io)?;
+        dev.read_blocks(pblk, &mut buf).map_err(StoreError::Io)?;
         // Verify checksums and copy out.
         for j in 0..run_len {
             let (fblk_j, _, cksum_j) = mappings[i + j];
@@ -539,6 +562,9 @@ impl TxgCoord {
 
 pub struct Fs {
     shared: Arc<Mutex<Shared>>,
+    /// P4: direct device handle for reads, bypassing the Shared mutex.
+    /// Same Arc as `shared.dev`.
+    dev: Arc<FileDevice>,
     sb: Superblock,
     active_slot: usize,
     inodes: InodeTree,
@@ -623,7 +649,7 @@ impl Fs {
     // -- lifecycle ---------------------------------------------------------
 
     /// Write the CRC sidecar magic to the given area (cb blocks).
-    fn write_crc_magic(dev: &mut FileDevice, sidecar_start: u64, cb: u64) -> Result<(), FsError> {
+    fn write_crc_magic(dev: &FileDevice, sidecar_start: u64, cb: u64) -> Result<(), FsError> {
         if cb == 0 {
             return Ok(());
         }
@@ -642,7 +668,7 @@ impl Fs {
     /// Sidecar layout: [8-byte magic][4-byte CRC per block][padding].
     /// Public for use by cownfs-backup restore-inc.
     pub fn write_bitmap_crcs(
-        dev: &mut FileDevice,
+        dev: &FileDevice,
         area_bytes: &[u8],
         bitmap_start: u64,
         bblocks: u64,
@@ -679,7 +705,7 @@ impl Fs {
 
     /// Check if the CRC sidecar at the given location has the magic.
     /// Returns false for legacy v3 images (no magic) or if cb is 0.
-    fn has_crc_magic(dev: &mut FileDevice, sidecar_start: u64, cb: u64) -> bool {
+    fn has_crc_magic(dev: &FileDevice, sidecar_start: u64, cb: u64) -> bool {
         use crate::BLOCK_SIZE;
         if cb == 0 {
             return false;
@@ -696,7 +722,7 @@ impl Fs {
     /// if the image lacks CRC sidecars (legacy v3). Returns
     /// Err(FsError::BitmapCorrupt) on mismatch.
     fn verify_bitmap_crcs(
-        dev: &mut FileDevice,
+        dev: &FileDevice,
         bitmap_start: u64,
         bblocks: u64,
         sidecar_start: u64,
@@ -746,7 +772,9 @@ impl Fs {
 
     /// Format a fresh filesystem image with an empty root directory.
     pub fn format(path: &Path, blocks: u64) -> Result<Self, FsError> {
-        let mut dev = FileDevice::create(path, blocks)?;
+        let dev = FileDevice::create(path, blocks)?;
+        // P4: share the device by Arc so reads bypass the Shared mutex.
+        let dev = Arc::new(dev);
         let bblocks = store::bitmap_blocks_for(blocks);
         // slots + two alternating bitmap areas + two CRC sidecar areas
         let cb = superblock::bitmap_crc_blocks(bblocks);
@@ -760,18 +788,18 @@ impl Fs {
         }
         // R1 fix: each slot owns its bitmap area (slot s → area s).
         // Initialize both areas so either slot is readable.
-        store::write_bitmap(&mut dev, &bitmap, 2, bblocks)?;
-        store::write_bitmap(&mut dev, &bitmap, 2 + bblocks, bblocks)?;
+        store::write_bitmap(&dev, &bitmap, 2, bblocks)?;
+        store::write_bitmap(&dev, &bitmap, 2 + bblocks, bblocks)?;
         // Mark the CRC sidecar areas with magic so open() knows this image
         // has bitmap CRCs (v3 images lack the magic → skip verification).
-        Self::write_crc_magic(&mut dev, 2 + 2 * bblocks, cb)?;
-        Self::write_crc_magic(&mut dev, 2 + 2 * bblocks + cb, cb)?;
+        Self::write_crc_magic(&dev, 2 + 2 * bblocks, cb)?;
+        Self::write_crc_magic(&dev, 2 + 2 * bblocks + cb, cb)?;
         // Write initial CRCs for both bitmap areas.
         let raw = bitmap.to_bytes();
-        Self::write_bitmap_crcs(&mut dev, &raw, 2, bblocks, 2 + 2 * bblocks)?;
-        Self::write_bitmap_crcs(&mut dev, &raw, 2 + bblocks, bblocks, 2 + 2 * bblocks + cb)?;
+        Self::write_bitmap_crcs(&dev, &raw, 2, bblocks, 2 + 2 * bblocks)?;
+        Self::write_bitmap_crcs(&dev, &raw, 2 + bblocks, bblocks, 2 + 2 * bblocks + cb)?;
         let shared = Arc::new(Mutex::new(Shared {
-            dev,
+            dev: Arc::clone(&dev),
             bitmap,
             pending_free: [Vec::new(), Vec::new()],
             fault_point: None,
@@ -784,6 +812,7 @@ impl Fs {
 
         let mut fs = Fs {
             shared: Arc::clone(&shared),
+            dev: Arc::clone(&dev),
             sb: Superblock::blank(blocks, 2, bblocks),
             active_slot: 0,
             inodes: InodeTree::open(ia, iroot, 0),
@@ -893,14 +922,14 @@ impl Fs {
         // prevent opening the older, consistent generation.
         let mut last_err: Option<FsError> = None;
         for (sb, slot) in slots {
-            let mut dev = FileDevice::open(path)?;
+            let dev = FileDevice::open(path)?;
             let bblocks = sb.bitmap_blocks;
             let cb = superblock::bitmap_crc_blocks(bblocks);
             // R1 fix: each slot owns its bitmap area (slot s → area s).
             let bitmap_start = sb.bitmap_start + slot as u64 * bblocks;
             let sidecar_start = sb.bitmap_start + 2 * bblocks + slot as u64 * cb;
-            let has_crcs = Self::has_crc_magic(&mut dev, sidecar_start, cb);
-            match Self::verify_bitmap_crcs(&mut dev, bitmap_start, bblocks, sidecar_start) {
+            let has_crcs = Self::has_crc_magic(&dev, sidecar_start, cb);
+            match Self::verify_bitmap_crcs(&dev, bitmap_start, bblocks, sidecar_start) {
                 Ok(()) => {}
                 Err(FsError::BitmapCorrupt) => {
                     eprintln!(
@@ -941,14 +970,14 @@ impl Fs {
 
     /// Open with a specific superblock slot already chosen (after CRC verification).
     fn open_with_sb(
-        mut dev: FileDevice,
+        dev: FileDevice,
         sb: superblock::Superblock,
         active_slot: usize,
         has_bitmap_crcs: bool,
     ) -> Result<Self, FsError> {
         let next_inode = sb.next_inode;
         let next_snap = sb.next_snap;
-        let (mut bitmap, deferred) = Self::load_bitmap(&mut dev, &sb, active_slot)?;
+        let (mut bitmap, deferred) = Self::load_bitmap(&dev, &sb, active_slot)?;
         // R3 fix: free the persisted deferred-free queue. These blocks became
         // unreachable in the committed (or ancestor) generation; the in-memory
         // queue was lost on shutdown. Freeing them here prevents the
@@ -956,8 +985,10 @@ impl Fs {
         for b in deferred {
             bitmap.clear(b);
         }
+        // P4: share the device by Arc so reads bypass the Shared mutex.
+        let dev = Arc::new(dev);
         let shared = Arc::new(Mutex::new(Shared {
-            dev,
+            dev: Arc::clone(&dev),
             bitmap,
             pending_free: [Vec::new(), Vec::new()],
             fault_point: None,
@@ -1038,6 +1069,7 @@ impl Fs {
 
         let mut fs = Fs {
             shared,
+            dev: Arc::clone(&dev),
             sb,
             active_slot,
             inodes,
@@ -1306,7 +1338,7 @@ impl Fs {
         // CoW-new blocks (never referenced by the base state), so no
         // in-memory cache entry can be stale for them.
         {
-            let mut sh = self.shared.lock().unwrap();
+            let sh = self.shared.lock().unwrap();
             for (blk, data) in changed {
                 sh.dev
                     .write_block(*blk, data)
@@ -1365,9 +1397,9 @@ impl Fs {
         // Advance the generation on the inactive slot.
         self.sb.generation += 1;
         {
-            let mut sh = self.shared.lock().unwrap();
+            let sh = self.shared.lock().unwrap();
             let slot = 1 - self.active_slot;
-            superblock::write_slot(&mut sh.dev, slot, &self.sb)
+            superblock::write_slot(&sh.dev, slot, &self.sb)
                 .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
             sh.dev
                 .sync()
@@ -1395,7 +1427,7 @@ impl Fs {
     /// no deltas (always full checkpoints); `bitmap_delta_gen` equals
     /// `bitmap_full_gen`.
     fn load_bitmap(
-        dev: &mut FileDevice,
+        dev: &FileDevice,
         sb: &superblock::Superblock,
         slot: usize,
     ) -> Result<(crate::bitmap::Bitmap, Vec<u64>), FsError> {
@@ -1411,7 +1443,7 @@ impl Fs {
 
     /// Read the deferred-free queue persisted in the bitmap area padding.
     fn load_deferred_queue(
-        dev: &mut FileDevice,
+        dev: &FileDevice,
         sb: &superblock::Superblock,
         slot: usize,
     ) -> Result<Vec<u64>, FsError> {
@@ -1424,7 +1456,7 @@ impl Fs {
             return Ok(Vec::new());
         }
         // Helper: read 8 bytes at area-relative offset, handling block spans.
-        let mut read_u64 = |off: usize| -> Result<u64, FsError> {
+        let read_u64 = |off: usize| -> Result<u64, FsError> {
             let mut bytes = [0u8; 8];
             let mut pos = 0;
             let mut cur_off = off;
@@ -1632,8 +1664,8 @@ impl Fs {
         self.persist_bitmap_full(self.active_slot)?;
         self.shared.lock().unwrap().dev.sync()?;
         self.sync_roots();
-        let mut sh = self.shared.lock().unwrap();
-        superblock::write_slots(&mut sh.dev, &self.sb)?;
+        let sh = self.shared.lock().unwrap();
+        superblock::write_slots(&sh.dev, &self.sb)?;
         Ok(())
     }
 
@@ -1736,8 +1768,8 @@ impl Fs {
         self.check_fault(FaultPoint::AfterSync)?;
         // Write the staged superblock to the new slot.
         {
-            let mut sh = self.shared.lock().unwrap();
-            superblock::write_slot(&mut sh.dev, prepared.slot, &prepared.new_sb)?;
+            let sh = self.shared.lock().unwrap();
+            superblock::write_slot(&sh.dev, prepared.slot, &prepared.new_sb)?;
             sh.dev.sync()?;
         }
         Ok(())
@@ -2236,7 +2268,8 @@ impl Fs {
     }
 
     fn read_block(&self, blk: u64, buf: &mut [u8; BLOCK_SIZE]) -> Result<(), FsError> {
-        self.shared.lock().unwrap().dev.read_block(blk, buf)?;
+        // P4: direct device read, no Shared lock.
+        self.dev.read_block(blk, buf)?;
         Ok(())
     }
 
@@ -2717,7 +2750,7 @@ impl Fs {
             max_end.saturating_sub(offset) as usize
         };
 
-        let mut data = read_from(&self.extents, &self.shared, &inode, ino, offset, fetch_len)?;
+        let mut data = read_from(&self.extents, &self.dev, &inode, ino, offset, fetch_len)?;
         // Truncate to the requested length; the extra data was only for
         // warming the page cache.
         data.truncate(len);
@@ -3086,7 +3119,7 @@ impl Fs {
     ) -> Result<Vec<u8>, FsError> {
         let (inodes, _, extents) = self.snap_trees(snap_id)?;
         let inode = inodes.get(&ino)?.ok_or(FsError::NotFound)?;
-        read_from(&extents, &self.shared, &inode, ino, offset, len)
+        read_from(&extents, &self.dev, &inode, ino, offset, len)
     }
 
     /// Look up a name as of a snapshot.
@@ -3145,7 +3178,7 @@ impl Fs {
         // Serialize the read-modify-write against other processes via an
         // exclusive file lock; without it two racers can both see an empty
         // holder and both "win" (split-brain).
-        let mut sh = self.shared.lock().unwrap();
+        let sh = self.shared.lock().unwrap();
         sh.dev
             .lock_exclusive()
             .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
@@ -3165,8 +3198,7 @@ impl Fs {
             let mut sb = sb;
             sb.lease_holder = lease_node_id_bytes(node_id);
             sb.lease_expiry = now + ttl_secs;
-            superblock::write_slots(&mut sh.dev, &sb)
-                .map_err(|e| FsError::Invalid(format!("{e}")))?;
+            superblock::write_slots(&sh.dev, &sb).map_err(|e| FsError::Invalid(format!("{e}")))?;
             Ok(true)
         })();
         sh.dev
@@ -3177,7 +3209,7 @@ impl Fs {
 
     /// Renew the lease. Returns true if renewed, false if we lost it.
     pub fn lease_renew(&mut self, node_id: &str, ttl_secs: u64) -> Result<bool, FsError> {
-        let mut sh = self.shared.lock().unwrap();
+        let sh = self.shared.lock().unwrap();
         sh.dev
             .lock_exclusive()
             .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
@@ -3189,8 +3221,7 @@ impl Fs {
             }
             let mut sb = sb;
             sb.lease_expiry = now_secs() + ttl_secs;
-            superblock::write_slots(&mut sh.dev, &sb)
-                .map_err(|e| FsError::Invalid(format!("{e}")))?;
+            superblock::write_slots(&sh.dev, &sb).map_err(|e| FsError::Invalid(format!("{e}")))?;
             Ok(true)
         })();
         sh.dev
@@ -3208,7 +3239,7 @@ impl Fs {
 
     /// Voluntarily release the lease.
     pub fn lease_release(&mut self, node_id: &str) -> Result<(), FsError> {
-        let mut sh = self.shared.lock().unwrap();
+        let sh = self.shared.lock().unwrap();
         sh.dev
             .lock_exclusive()
             .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
@@ -3219,7 +3250,7 @@ impl Fs {
                 let mut sb = sb;
                 sb.lease_holder = [0u8; 32];
                 sb.lease_expiry = 0;
-                superblock::write_slots(&mut sh.dev, &sb)
+                superblock::write_slots(&sh.dev, &sb)
                     .map_err(|e| FsError::Invalid(format!("{e}")))?;
             }
             Ok(())
@@ -3775,7 +3806,7 @@ mod tests {
     }
 
     fn write_slot_block(path: &std::path::Path, slot: usize, blk: &[u8; BLOCK_SIZE]) {
-        let mut dev = FileDevice::open(path).unwrap();
+        let dev = FileDevice::open(path).unwrap();
         dev.write_block(SLOT_BLOCKS[slot], blk).unwrap();
         dev.sync().unwrap();
     }
@@ -4069,7 +4100,7 @@ mod tests {
 
         // Mark block 500 allocated in the active bitmap area; nothing
         // references it.
-        let mut dev = FileDevice::open(&path).unwrap();
+        let dev = FileDevice::open(&path).unwrap();
         let (sb, slot) = superblock::open(&dev).unwrap();
         let mut blk = [0u8; BLOCK_SIZE];
         // R1 fix: bitmap area is per-slot (slot s → area s).
@@ -4093,8 +4124,7 @@ mod tests {
                 }
                 let bitmap_start = sb.bitmap_start + slot as u64 * bblocks;
                 let sidecar_start = sb.bitmap_start + 2 * bblocks + slot as u64 * cb;
-                Fs::write_bitmap_crcs(&mut dev, &raw, bitmap_start, bblocks, sidecar_start)
-                    .unwrap();
+                Fs::write_bitmap_crcs(&dev, &raw, bitmap_start, bblocks, sidecar_start).unwrap();
             }
         }
         dev.sync().unwrap();
@@ -4222,7 +4252,7 @@ mod tests {
         // We can't easily inject faults during open (device is created
         // internally), so we test the FileDevice directly.
         use crate::block::{BlockDevice, FileDevice};
-        let mut dev = FileDevice::open(&path).unwrap();
+        let dev = FileDevice::open(&path).unwrap();
         let mut faults = crate::block::FaultInjector::new();
         faults.fail_reads = true;
         dev.set_faults(faults);

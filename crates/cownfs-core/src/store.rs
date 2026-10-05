@@ -11,7 +11,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use crate::bitmap::Bitmap;
-use crate::block::BlockDevice;
+use crate::block::{BlockDevice, FileDevice};
 use crate::btree::{Node, NodeId, NodeStore};
 use crate::checksum::checksum;
 use crate::BLOCK_SIZE;
@@ -106,7 +106,10 @@ impl<const N: usize> BlockCodec for [u8; N] {
 /// Device + free-space bitmap shared by every tree of a filesystem.
 /// Each tree owns a [`BlockArena`] over the same `Shared`.
 pub struct Shared {
-    pub dev: crate::block::FileDevice,
+    /// P4: the device behind an Arc so readers can do I/O without taking
+    /// the Shared mutex (positional pread/pwrite need no file-level lock).
+    /// Writers still take the Shared lock for bitmap/device atomicity.
+    pub dev: Arc<FileDevice>,
     pub bitmap: crate::bitmap::Bitmap,
     /// Blocks freed in the current (uncommitted) transaction ([0]) and the
     /// previous transaction ([1]). R3 fix: two-generation deferred free.
@@ -132,7 +135,7 @@ pub fn bitmap_blocks_for(nbits: u64) -> u64 {
 
 /// Persist the bitmap to `[start, start + blocks)`.
 pub fn write_bitmap(
-    dev: &mut crate::block::FileDevice,
+    dev: &crate::block::FileDevice,
     bitmap: &Bitmap,
     start: u64,
     blocks: u64,
@@ -153,7 +156,7 @@ pub fn write_bitmap(
 
 /// Load the bitmap from `[start, start + blocks)`.
 pub fn read_bitmap(
-    dev: &mut crate::block::FileDevice,
+    dev: &crate::block::FileDevice,
     nbits: u64,
     start: u64,
     blocks: u64,
@@ -307,6 +310,9 @@ struct CacheEntry<K, V> {
 /// and written back on [`flush`](NodeStore::flush).
 pub struct BlockArena<K, V> {
     shared: Arc<Mutex<Shared>>,
+    /// P4: direct device handle for cache-miss reads, bypassing the
+    /// Shared mutex. Cloned from `shared` at construction.
+    dev: Arc<FileDevice>,
     cache: HashMap<u64, CacheEntry<K, V>>,
     /// Indexed LRU for cache eviction.
     /// `lru_stack` holds block indices in use order (index 0 = least
@@ -335,8 +341,10 @@ impl<K, V> BlockArena<K, V> {
             "degree {t} does not fit: max {}",
             max_keys_per_node(K::SIZE, V::SIZE)
         );
+        let dev = shared.lock().unwrap().dev.clone();
         BlockArena {
             shared,
+            dev,
             cache: HashMap::new(),
             lru_stack: Vec::new(),
             lru_index: HashMap::new(),
@@ -423,11 +431,10 @@ impl<K, V> BlockArena<K, V> {
     {
         if !self.cache.contains_key(&id.idx) {
             let mut buf = [0u8; BLOCK_SIZE];
-            self.shared
-                .lock()
-                .unwrap()
-                .dev
-                .read_block(id.idx, &mut buf)?;
+            // P4: cache-miss I/O goes straight to the device, bypassing the
+            // Shared mutex (the arena's own lock is already held by the
+            // caller via BTree).
+            self.dev.read_block(id.idx, &mut buf)?;
             let (node, gen) = decode_node::<K, V>(id.idx, &buf)?;
             // A stale id (wrong generation) means a use-after-free bug: the
             // block was recycled for another node. R4: return Corrupt instead
@@ -616,7 +623,7 @@ impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
             let mut buf = [0u8; BLOCK_SIZE];
             // Best-effort: read the previous header for its generation.
             // (A short read on a never-written block yields zeros.)
-            let _ = self.shared.lock().unwrap().dev.read_block(block, &mut buf);
+            let _ = self.dev.read_block(block, &mut buf);
             if u16::from_le_bytes([buf[0], buf[1]]) == NODE_MAGIC {
                 u32::from_le_bytes(buf[8..12].try_into().unwrap()).wrapping_add(1)
             } else {
@@ -694,7 +701,7 @@ impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
         // no one else holds it. This is safe because flush() is called
         // from commit_async which is the only flusher.
         for (block, buf) in &prepared {
-            self.shared.lock().unwrap().dev.write_block(*block, buf)?;
+            self.dev.write_block(*block, buf)?;
         }
         self.finish_flush(&prepared.iter().map(|(b, _)| *b).collect::<Vec<_>>());
         Ok(true)
@@ -775,17 +782,17 @@ mod tests {
                 std::process::id(),
                 n
             ));
-            let mut dev = FileDevice::create(&path, blocks).unwrap();
+            let dev = FileDevice::create(&path, blocks).unwrap();
             let mut bitmap = Bitmap::new(blocks);
             bitmap.set(0); // reserved
-            write_bitmap(&mut dev, &bitmap, 1, bitmap_blocks_for(blocks)).unwrap();
+            write_bitmap(&dev, &bitmap, 1, bitmap_blocks_for(blocks)).unwrap();
             // Reserve the bitmap blocks themselves.
             for b in 1..1 + bitmap_blocks_for(blocks) {
                 bitmap.set(b);
             }
             TestDevice {
                 shared: Arc::new(Mutex::new(Shared {
-                    dev,
+                    dev: Arc::new(dev),
                     bitmap,
                     pending_free: [Vec::new(), Vec::new()],
                     fault_point: None,

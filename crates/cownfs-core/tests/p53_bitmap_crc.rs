@@ -19,7 +19,7 @@ fn corrupt_bitmap_bit(img: &PathBuf, bit_offset: u64) {
     use cownfs_core::block::{BlockDevice, FileDevice};
     use cownfs_core::superblock;
 
-    let mut dev = FileDevice::open(img).unwrap();
+    let dev = FileDevice::open(img).unwrap();
     let (sb, _) = superblock::open(&dev).unwrap();
     let bitmap_start = sb.bitmap_start + sb.bitmap_base_area * sb.bitmap_blocks;
     let block_idx = bit_offset / 4096 / 8;
@@ -70,7 +70,7 @@ fn bitmap_corrupt_both_areas_fails() {
     use cownfs_core::block::{BlockDevice, FileDevice};
     use cownfs_core::superblock;
 
-    let mut dev = FileDevice::open(&img).unwrap();
+    let dev = FileDevice::open(&img).unwrap();
     let (sb, _) = superblock::open(&dev).unwrap();
     let bblocks = sb.bitmap_blocks;
     for area in 0..2 {
@@ -118,7 +118,7 @@ fn legacy_v3_image_opens_and_writes() {
     use cownfs_core::block::{BlockDevice, FileDevice};
     use cownfs_core::superblock;
 
-    let mut dev = FileDevice::open(&img).unwrap();
+    let dev = FileDevice::open(&img).unwrap();
     // Read superblock to find bitmap layout.
     let (sb, _) = superblock::open(&dev).unwrap();
     let bblocks = sb.bitmap_blocks;

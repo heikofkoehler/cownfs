@@ -217,7 +217,6 @@ fn do_restore(backup: &Path, image: &Path) -> Result<(), String> {
     drop(fs);
 
     let dev = FileDevice::open(image).map_err(|e| format!("open: {e}"))?;
-    let mut dev = dev;
     for (blk, data) in &blocks {
         dev.write_block(*blk, data)
             .map_err(|e| format!("write block {blk}: {e}"))?;
