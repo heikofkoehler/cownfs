@@ -724,6 +724,17 @@ impl Session {
                 if !self.shared.throttle.acquire_writer(ino) {
                     return OpResult::err(OP_WRITE, NFS4ERR_RESOURCE);
                 }
+                // P9: dirty-data backpressure — if uncommitted dirty bytes
+                // exceed the threshold, tell the client to retry later
+                // instead of growing memory without bound.
+                let over_pressure = {
+                    let fs = self.fs();
+                    fs.dirty_bytes() > fs.dirty_backpressure_threshold()
+                };
+                if over_pressure {
+                    self.shared.throttle.release_writer(ino);
+                    return OpResult::err(OP_WRITE, NFS4ERR_DELAY);
+                }
                 let res = self.op_write(*offset, *stable, data);
                 self.shared.throttle.release_writer(ino);
                 res

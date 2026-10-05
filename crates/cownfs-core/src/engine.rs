@@ -571,6 +571,12 @@ pub struct Fs {
     /// Bytes written by the last persist_bitmap (for benchmarking).
     /// P1: Mutex for commit_async(&self).
     last_bitmap_write_bytes: std::sync::Mutex<u64>,
+    /// P9: uncommitted dirty data bytes (backpressure). Incremented on
+    /// write(), reset to 0 when sync_txg() makes a txg durable.
+    dirty_bytes: std::sync::atomic::AtomicU64,
+    /// P9: dirty-bytes threshold above which WRITEs get NFS4ERR_DELAY.
+    /// Default 256 MiB; tests lower it via set_dirty_backpressure_threshold.
+    dirty_backpressure_threshold: std::sync::atomic::AtomicU64,
     /// Blocks allocated in the current txg (not yet committed).
     /// In-place overwrites are only safe for these blocks.
     /// P1: Mutex for commit_async(&self).
@@ -786,6 +792,8 @@ impl Fs {
             xattrs: std::collections::HashMap::new(),
             commits_since_checkpoint: std::sync::Mutex::new(0),
             last_bitmap_write_bytes: std::sync::Mutex::new(0),
+            dirty_bytes: std::sync::atomic::AtomicU64::new(0),
+            dirty_backpressure_threshold: std::sync::atomic::AtomicU64::new(256 * 1024 * 1024),
             txg_allocated: std::sync::Mutex::new(std::collections::HashSet::new()),
             has_bitmap_crcs: true, // fresh format always has CRC sidecars
             readahead: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1014,6 +1022,8 @@ impl Fs {
             xattrs: std::collections::HashMap::new(),
             commits_since_checkpoint: std::sync::Mutex::new(0),
             last_bitmap_write_bytes: std::sync::Mutex::new(0),
+            dirty_bytes: std::sync::atomic::AtomicU64::new(0),
+            dirty_backpressure_threshold: std::sync::atomic::AtomicU64::new(256 * 1024 * 1024),
             txg_allocated: std::sync::Mutex::new(std::collections::HashSet::new()),
             has_bitmap_crcs,
             readahead: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1570,12 +1580,33 @@ impl Fs {
         t.error = None;
         drop(t);
         self.txg.cv.notify_all();
+        // P9: txg is durable; dirty bytes are now clean.
+        self.dirty_bytes
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         Ok(true)
     }
 
     /// Bytes written by the last bitmap persist (for benchmarking).
     pub fn last_bitmap_write_bytes(&self) -> u64 {
         *self.last_bitmap_write_bytes.lock().unwrap()
+    }
+
+    /// P9: uncommitted dirty data bytes.
+    pub fn dirty_bytes(&self) -> u64 {
+        self.dirty_bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// P9: set the dirty-bytes backpressure threshold. WRITEs arriving when
+    /// dirty_bytes exceeds the threshold get NFS4ERR_DELAY.
+    pub fn set_dirty_backpressure_threshold(&self, bytes: u64) {
+        self.dirty_backpressure_threshold
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// P9: the dirty-bytes backpressure threshold.
+    pub fn dirty_backpressure_threshold(&self) -> u64 {
+        self.dirty_backpressure_threshold
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The transaction group coordinator (for [`TxgCoord::wait`]).
@@ -2554,6 +2585,9 @@ impl Fs {
         if grown > 0 {
             self.add_usage(uid, grown);
         }
+        // P9: track dirty bytes for backpressure.
+        self.dirty_bytes
+            .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
