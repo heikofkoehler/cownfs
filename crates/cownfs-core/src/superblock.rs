@@ -38,8 +38,18 @@ pub fn bitmap_crc_blocks(bitmap_blocks: u64) -> u64 {
     bytes.div_ceil(crate::BLOCK_SIZE as u64)
 }
 
-const HDR_LEN: usize = 256;
+const HDR_LEN: usize = 280;
+/// R7: legacy header length (pre-feature-flags). Decode accepts both.
+const HDR_LEN_LEGACY: usize = 256;
 const OFF_CHECKSUM: usize = 64;
+
+/// R7: feature flags understood by this build.
+/// - `compat`: safe to ignore unknown bits.
+/// - `ro_compat`: unknown bits → open read-only.
+/// - `incompat`: unknown bits → refuse to open.
+pub const KNOWN_COMPAT: u64 = 0;
+pub const KNOWN_RO_COMPAT: u64 = 0;
+pub const KNOWN_INCOMPAT: u64 = 0;
 
 /// In-memory superblock. The on-disk encoding is a 256-byte little-endian
 /// header at the start of the slot block; the rest of the block is zeroed.
@@ -87,6 +97,13 @@ pub struct Superblock {
     /// Which bitmap area (0 or 1) holds the full bitmap at `bitmap_full_gen`.
     /// The other area holds the delta. Swapped on checkpoint.
     pub bitmap_base_area: u64,
+    /// R7: feature flags (ZFS/ext4 style).
+    /// Unknown `compat` bits are safe to ignore.
+    pub compat: u64,
+    /// Unknown `ro_compat` bits force a read-only open.
+    pub ro_compat: u64,
+    /// Unknown `incompat` bits refuse the open entirely.
+    pub incompat: u64,
 }
 
 impl Superblock {
@@ -119,6 +136,10 @@ impl Superblock {
         hdr[232..240].copy_from_slice(&self.bitmap_full_gen.to_le_bytes());
         hdr[240..248].copy_from_slice(&self.bitmap_delta_gen.to_le_bytes());
         hdr[248..256].copy_from_slice(&self.bitmap_base_area.to_le_bytes());
+        // R7: feature flags.
+        hdr[256..264].copy_from_slice(&self.compat.to_le_bytes());
+        hdr[264..272].copy_from_slice(&self.ro_compat.to_le_bytes());
+        hdr[272..280].copy_from_slice(&self.incompat.to_le_bytes());
         // Checksum covers the header with the checksum field zeroed.
         let sum = checksum(&hdr);
         hdr[OFF_CHECKSUM..OFF_CHECKSUM + 8].copy_from_slice(&sum.to_le_bytes());
@@ -135,11 +156,23 @@ impl Superblock {
             return None;
         }
         let stored = u64::from_le_bytes(hdr[OFF_CHECKSUM..OFF_CHECKSUM + 8].try_into().ok()?);
+        // R7: accept both the current 280-byte header and the legacy
+        // 256-byte header (pre-feature-flags images have zeros past 256,
+        // so their 256-byte checksum won't verify as a 280-byte one).
         let mut tmp = *hdr;
         tmp[OFF_CHECKSUM..OFF_CHECKSUM + 8].fill(0);
-        if checksum(&tmp) != stored {
-            return None;
-        }
+        let legacy = if checksum(&tmp) == stored {
+            false
+        } else {
+            let mut tmp256 = tmp;
+            // Zero the flag area so only the first 256 bytes matter.
+            tmp256[HDR_LEN_LEGACY..].fill(0);
+            if checksum(&tmp256[..HDR_LEN_LEGACY]) == stored {
+                true
+            } else {
+                return None;
+            }
+        };
         let u32_at = |o: usize| -> Option<u32> {
             Some(u32::from_le_bytes(hdr.get(o..o + 4)?.try_into().ok()?))
         };
@@ -172,6 +205,10 @@ impl Superblock {
             bitmap_full_gen: u64_at(232)?,
             bitmap_delta_gen: u64_at(240)?,
             bitmap_base_area: u64_at(248)?,
+            // R7: legacy images have no flag area → all zeros.
+            compat: if legacy { 0 } else { u64_at(256)? },
+            ro_compat: if legacy { 0 } else { u64_at(264)? },
+            incompat: if legacy { 0 } else { u64_at(272)? },
         })
     }
 
@@ -207,6 +244,9 @@ impl Superblock {
             bitmap_full_gen: 0,
             bitmap_delta_gen: 0,
             bitmap_base_area: 0,
+            compat: 0,
+            ro_compat: 0,
+            incompat: 0,
         }
     }
 }

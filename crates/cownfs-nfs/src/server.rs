@@ -121,6 +121,9 @@ fn fs_to_nfs(e: FsError) -> u32 {
         // The renewal thread exits on lease loss; a commit hitting this
         // is a server fault from the client's perspective.
         FsError::Fenced => NFS4ERR_SERVERFAULT,
+        // R7: refusing to open (incompat) or mutating a read-only FS.
+        FsError::IncompatibleFeature(_) => NFS4ERR_SERVERFAULT,
+        FsError::ReadOnly => NFS4ERR_ROFS,
     }
 }
 

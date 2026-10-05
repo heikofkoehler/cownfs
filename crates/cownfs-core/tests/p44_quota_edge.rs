@@ -17,7 +17,7 @@ fn setup() -> (std::path::PathBuf, Fs) {
 #[test]
 fn quota_released_on_rename_over() {
     let (_img, mut fs) = setup();
-    fs.set_quota(1000, 10);
+    fs.set_quota(1000, 10).unwrap();
     // Create two files as uid 1000.
     let a = fs.create(ROOT_INO, b"a", 0o644, 1000, 1000).unwrap();
     fs.write(a, 0, &vec![0u8; 8192]).unwrap(); // 2 data blocks + 1 inode = 3
@@ -38,8 +38,8 @@ fn quota_released_on_rename_over() {
 #[test]
 fn quota_transfers_on_uid_change() {
     let (_img, mut fs) = setup();
-    fs.set_quota(1000, 10);
-    fs.set_quota(2000, 10);
+    fs.set_quota(1000, 10).unwrap();
+    fs.set_quota(2000, 10).unwrap();
     let ino = fs.create(ROOT_INO, b"f", 0o644, 1000, 1000).unwrap();
     fs.write(ino, 0, &vec![0u8; 8192]).unwrap(); // 3 blocks for uid 1000
     assert_eq!(fs.quota_usage(1000), 3);
@@ -60,7 +60,7 @@ fn quota_transfers_on_uid_change() {
 #[test]
 fn quota_released_on_rmdir() {
     let (_img, mut fs) = setup();
-    fs.set_quota(1000, 10);
+    fs.set_quota(1000, 10).unwrap();
     let dir = fs.mkdir(ROOT_INO, b"d", 0o755, 1000, 1000).unwrap();
     let f = fs.create(dir, b"f", 0o644, 1000, 1000).unwrap();
     fs.write(f, 0, &vec![0u8; 8192]).unwrap();

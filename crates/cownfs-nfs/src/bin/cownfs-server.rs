@@ -109,7 +109,7 @@ fn main() {
 
     // Per-UID block quotas.
     for (uid, blocks) in &quota_specs {
-        fs.set_quota(*uid, *blocks);
+        fs.set_quota(*uid, *blocks).unwrap();
         eprintln!("quota: uid {uid} limited to {blocks} blocks");
     }
 

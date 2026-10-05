@@ -91,6 +91,11 @@ pub enum FsError {
     /// R6: commit refused — the lease epoch changed, meaning another node
     /// took the write lease (fencing). The caller must re-acquire or exit.
     Fenced,
+    /// R7: image uses an unknown incompat feature flag; refused to open.
+    IncompatibleFeature(String),
+    /// R7: filesystem opened read-only (unknown ro_compat flag, or
+    /// explicit read-only open); mutation refused.
+    ReadOnly,
 }
 
 impl std::fmt::Display for FsError {
@@ -106,6 +111,8 @@ impl std::fmt::Display for FsError {
             FsError::QuotaExceeded => write!(f, "disk quota exceeded"),
             FsError::BitmapCorrupt => write!(f, "bitmap CRC mismatch"),
             FsError::Fenced => write!(f, "fenced: lease lost to another node"),
+            FsError::IncompatibleFeature(s) => write!(f, "incompatible feature flags: {s}"),
+            FsError::ReadOnly => write!(f, "filesystem is read-only"),
             FsError::BadName => write!(f, "invalid file name"),
             FsError::NoSpace => write!(f, "no space left on device"),
             FsError::Invalid(s) => write!(f, "invalid: {s}"),
@@ -577,6 +584,9 @@ pub struct Fs {
     /// R6: fencing epoch from our last `lease_acquire`. Commits refuse
     /// to run if the on-disk epoch changed (another node took the lease).
     lease_epoch: Option<u64>,
+    /// R7: opened read-only (unknown `ro_compat` flags). Mutations are
+    /// refused with `FsError::ReadOnly`.
+    read_only: bool,
     sb: Superblock,
     active_slot: usize,
     inodes: InodeTree,
@@ -849,6 +859,7 @@ impl Fs {
             image_path: path.to_path_buf(),
             lease_block: Some(crate::lease::LEASE_BLOCK),
             lease_epoch: None,
+            read_only: false,
             sb: Superblock::blank(blocks, bitmap_start, bblocks),
             active_slot: 0,
             inodes: InodeTree::open(ia, iroot, 0),
@@ -952,6 +963,18 @@ impl Fs {
         let mut slots = slots;
         slots.sort_by(|a, b| b.0.generation.cmp(&a.0.generation));
 
+        // R7: feature-flag gating on the newest slot. Unknown `incompat`
+        // bits → clean refusal (no fallback; it's the same image).
+        // Unknown `ro_compat` bits → open read-only.
+        let newest = &slots[0].0;
+        let unknown_incompat = newest.incompat & !superblock::KNOWN_INCOMPAT;
+        if unknown_incompat != 0 {
+            return Err(FsError::IncompatibleFeature(format!(
+                "unknown incompat flags {unknown_incompat:#x}"
+            )));
+        }
+        let read_only = newest.ro_compat & !superblock::KNOWN_RO_COMPAT != 0;
+
         // Try each slot newest-first; fall back to the older generation if
         // the bitmap CRCs don't verify OR if the tree blocks are corrupt
         // (torn write from a crash). A corrupt newer generation must not
@@ -980,7 +1003,7 @@ impl Fs {
             // Bitmap CRCs pass; try to open the trees. If the tree blocks
             // are corrupt (torn write), fall back to the older generation.
             let gen = sb.generation;
-            match Self::open_with_sb(dev, path, sb, slot, has_crcs) {
+            match Self::open_with_sb(dev, path, sb, slot, has_crcs, read_only) {
                 Ok(fs) => return Ok(fs),
                 Err(FsError::Corrupt(what)) => {
                     eprintln!(
@@ -1011,6 +1034,7 @@ impl Fs {
         sb: superblock::Superblock,
         active_slot: usize,
         has_bitmap_crcs: bool,
+        read_only: bool,
     ) -> Result<Self, FsError> {
         let next_inode = sb.next_inode;
         let next_snap = sb.next_snap;
@@ -1116,6 +1140,7 @@ impl Fs {
                 Err(e) => return Err(FsError::Store(crate::store::StoreError::Io(e))),
             },
             lease_epoch: None,
+            read_only,
             sb,
             active_slot,
             inodes,
@@ -1726,12 +1751,22 @@ impl Fs {
     /// leaves the previous slot pointing at the previous bitmap area: the
     /// previous generation stays fully consistent.
     pub fn commit(&mut self) -> Result<(), FsError> {
+        // R7: read-only filesystems refuse durable commits.
+        self.check_writable()?;
         // R6: fencing — refuse the durable commit if another node took the
         // lease since our acquire. Checked before staging so a fenced node
         // cannot advance the generation.
         self.check_fenced()?;
         self.commit_async()?;
         self.sync_txg()?;
+        Ok(())
+    }
+
+    /// R7: refuse mutations on a read-only open.
+    fn check_writable(&self) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         Ok(())
     }
 
@@ -1757,6 +1792,7 @@ impl Fs {
     }
 
     pub fn commit_async(&self) -> Result<u64, FsError> {
+        self.check_writable()?;
         // T9: new commit attempt; clear stale txg errors (see mark_txg_dirty).
         self.txg.clear_error();
         let flushed = self.flush_all()?;
@@ -1813,6 +1849,7 @@ impl Fs {
     /// P1 Phase 2: Write the prepared commit (WITHOUT the Fs write lock).
     /// Does fsync + superblock write under the commit_mutex.
     pub fn write_sync(&self, prepared: &PreparedCommit) -> Result<(), FsError> {
+        self.check_writable()?;
         let _guard = self.commit_mutex.lock().unwrap();
         // The new generation's blocks must be on stable storage *before*
         // any superblock slot points at them.
@@ -1933,12 +1970,14 @@ impl Fs {
     // -- quotas ------------------------------------------------------------
 
     /// Set a per-UID block quota (0 = no limit). In-memory only.
-    pub fn set_quota(&mut self, uid: u32, max_blocks: u64) {
+    pub fn set_quota(&mut self, uid: u32, max_blocks: u64) -> Result<(), FsError> {
+        self.check_writable()?;
         if max_blocks == 0 {
             self.quotas.remove(&uid);
         } else {
             self.quotas.insert(uid, max_blocks);
         }
+        Ok(())
     }
 
     /// Get the block quota for a UID (None = no limit).
@@ -1993,6 +2032,7 @@ impl Fs {
 
     /// Set an extended attribute on an inode.
     pub fn setxattr(&mut self, ino: u64, name: &[u8], value: &[u8]) -> Result<(), FsError> {
+        self.check_writable()?;
         // Verify the inode exists.
         self.getattr(ino)?;
         if name.is_empty() || name.len() > 255 {
@@ -2025,6 +2065,7 @@ impl Fs {
 
     /// Remove an extended attribute. Returns None if not set.
     pub fn removexattr(&mut self, ino: u64, name: &[u8]) -> Result<bool, FsError> {
+        self.check_writable()?;
         self.getattr(ino)?;
         let removed = self.xattrs.remove(&(ino, name.to_vec())).is_some();
         if removed {
@@ -2422,6 +2463,7 @@ impl Fs {
         uid: u32,
         gid: u32,
     ) -> Result<u64, FsError> {
+        self.check_writable()?;
         self.mknode(parent, name, FTYPE_FILE, mode, uid, gid)
     }
 
@@ -2433,6 +2475,7 @@ impl Fs {
         uid: u32,
         gid: u32,
     ) -> Result<u64, FsError> {
+        self.check_writable()?;
         self.mknode(parent, name, FTYPE_DIR, mode, uid, gid)
     }
 
@@ -2444,6 +2487,7 @@ impl Fs {
         uid: u32,
         gid: u32,
     ) -> Result<u64, FsError> {
+        self.check_writable()?;
         // T2: validate in mknode's order (parent, name, existence) first
         // to preserve error precedence, then pre-check the total quota
         // charge (mknode's 1 block plus the target write's growth) so a
@@ -2473,6 +2517,7 @@ impl Fs {
 
     /// Remove a name. Frees the inode (and its blocks) at the last link.
     pub fn unlink(&mut self, parent: u64, name: &[u8]) -> Result<(), FsError> {
+        self.check_writable()?;
         let key = DirKey::new(parent, name)?;
         let ent = self.dirs.remove(&key)?.ok_or(FsError::NotFound)?;
         if ent.typ == FTYPE_DIR {
@@ -2491,6 +2536,7 @@ impl Fs {
 
     /// Create a hard link to `target` named `name` in `parent`.
     pub fn link(&mut self, target: u64, parent: u64, name: &[u8]) -> Result<(), FsError> {
+        self.check_writable()?;
         let inode = self.getattr(target)?;
         if inode.ftype == FTYPE_DIR {
             return Err(FsError::Invalid("cannot hard-link a directory".into()));
@@ -2519,6 +2565,7 @@ impl Fs {
     }
 
     pub fn rmdir(&mut self, parent: u64, name: &[u8]) -> Result<(), FsError> {
+        self.check_writable()?;
         let key = DirKey::new(parent, name)?;
         let ent = self.dirs.get(&key)?.ok_or(FsError::NotFound)?;
         if ent.typ != FTYPE_DIR {
@@ -2587,6 +2634,7 @@ impl Fs {
     }
 
     pub fn rename(&mut self, sp: u64, sn: &[u8], dp: u64, dn: &[u8]) -> Result<(), FsError> {
+        self.check_writable()?;
         let skey = DirKey::new(sp, sn)?;
         let ent = self.dirs.get(&skey)?.ok_or(FsError::NotFound)?;
         let d = self.getattr(dp)?;
@@ -2738,6 +2786,7 @@ impl Fs {
     }
 
     pub fn setattr(&mut self, ino: u64, attrs: &SetAttrs) -> Result<(), FsError> {
+        self.check_writable()?;
         if let Some(size) = attrs.size {
             self.truncate(ino, size)?;
         }
@@ -2833,6 +2882,7 @@ impl Fs {
     /// symlink or directory returns `NotFile` (POSIX has no write-to-symlink;
     /// `open(O_WRONLY)` follows the link). `symlink()` uses `write_raw()`.
     pub fn write(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<(), FsError> {
+        self.check_writable()?;
         if data.is_empty() {
             return Ok(());
         }
@@ -2943,6 +2993,7 @@ impl Fs {
     /// Resize a regular file. Symlinks and directories return `NotFile`
     /// (POSIX: ftruncate on a symlink is not possible).
     pub fn truncate(&mut self, ino: u64, size: u64) -> Result<(), FsError> {
+        self.check_writable()?;
         let inode = self.getattr(ino)?;
         if inode.ftype != FTYPE_FILE {
             return Err(FsError::NotFile);
@@ -3016,6 +3067,7 @@ impl Fs {
     /// reference-counted; later CoW mutations copy instead of rewriting,
     /// so the snapshot's blocks stay intact. Returns the snapshot id.
     pub fn snapshot_create(&mut self, name: &[u8]) -> Result<u64, FsError> {
+        self.check_writable()?;
         if name.is_empty() || name.len() > 64 {
             return Err(FsError::BadName);
         }
@@ -3064,6 +3116,7 @@ impl Fs {
     /// commit); blocks still shared with the live trees just lose one
     /// reference.
     pub fn snapshot_delete(&mut self, snap_id: u64) -> Result<(), FsError> {
+        self.check_writable()?;
         // Collect the snapshot's data blocks BEFORE removing the record:
         // any of them not referenced by the live tree or a remaining
         // snapshot become free (their bits were kept set while pinned).
@@ -3241,6 +3294,7 @@ impl Fs {
     /// Try to acquire the write lease. Returns true if acquired.
     /// Returns false if another node holds a live lease.
     pub fn lease_acquire(&mut self, node_id: &str, ttl_secs: u64) -> Result<bool, FsError> {
+        self.check_writable()?;
         let blk = self.lease_blk()?;
         // Serialize the read-modify-write against other processes on this
         // host via an exclusive file lock; without it two racers can both
@@ -3282,6 +3336,7 @@ impl Fs {
     /// Renew the lease. Returns true if renewed, false if we lost it.
     /// Renewal extends the expiry; the fencing epoch is unchanged.
     pub fn lease_renew(&mut self, node_id: &str, ttl_secs: u64) -> Result<bool, FsError> {
+        self.check_writable()?;
         let blk = self.lease_blk()?;
         let sh = self.shared.lock().unwrap();
         sh.dev
@@ -3317,6 +3372,7 @@ impl Fs {
 
     /// Voluntarily release the lease.
     pub fn lease_release(&mut self, node_id: &str) -> Result<(), FsError> {
+        self.check_writable()?;
         let blk = self.lease_blk()?;
         let sh = self.shared.lock().unwrap();
         sh.dev

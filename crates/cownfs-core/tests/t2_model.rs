@@ -42,6 +42,8 @@ fn disc(e: &FsError) -> &'static str {
         FsError::QuotaExceeded => "QuotaExceeded",
         FsError::BitmapCorrupt => "BitmapCorrupt",
         FsError::Fenced => "Fenced",
+        FsError::IncompatibleFeature(_) => "IncompatibleFeature",
+        FsError::ReadOnly => "ReadOnly",
     }
 }
 
@@ -833,7 +835,7 @@ impl Driver {
             Op::SetQuota { uid, limit } => {
                 let u = uid_of(*uid);
                 let l = quota_limit_of(*limit);
-                self.fs.set_quota(u, l);
+                self.fs.set_quota(u, l).unwrap();
                 if l == 0 {
                     self.w.quotas.remove(&u);
                 } else {
