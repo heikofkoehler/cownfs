@@ -475,3 +475,70 @@ impl PagedBitmap {
         self.free_counts[page_idx as usize] = count;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P3 exit criteria: counter equals popcount after random op storm.
+    #[test]
+    fn p3_free_count_matches_popcount() {
+        let mut bm = Bitmap::new(1000);
+        // Simple deterministic PRNG (xorshift).
+        let mut state: u64 = 0x12345678;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for _ in 0..10000 {
+            let op = next() % 4;
+            let bit = next() % 1000;
+            match op {
+                0 => bm.set(bit),
+                1 => bm.clear(bit),
+                2 => {
+                    let _ = bm.alloc();
+                }
+                3 => {
+                    let _ = bm.alloc_at(bit);
+                }
+                _ => unreachable!(),
+            }
+            // Verify counter matches actual popcount.
+            let mut actual_free = 0u64;
+            for i in 0..1000 {
+                if !bm.test(i) {
+                    actual_free += 1;
+                }
+            }
+            assert_eq!(
+                bm.free_count(),
+                actual_free,
+                "free_count mismatch after op {op} on bit {bit}"
+            );
+        }
+
+        // Also test from_bytes recomputes correctly.
+        let bytes = bm.to_bytes();
+        let bm2 = Bitmap::from_bytes(1000, &bytes);
+        assert_eq!(bm2.free_count(), bm.free_count());
+    }
+
+    #[test]
+    fn p3_set_word_maintains_counter() {
+        let mut bm = Bitmap::new(128);
+        // Set a word to all ones (0 free in that word).
+        bm.set_word(0, u64::MAX);
+        assert_eq!(bm.free_count(), 64); // 128 - 64 = 64 free
+        // Set to all zeros.
+        bm.set_word(0, 0);
+        assert_eq!(bm.free_count(), 128);
+        // Set to half.
+        bm.set_word(0, 0x0000_FFFF_0000_FFFF);
+        // 32 bits set in the word, so 128 - 32 = 96 free.
+        assert_eq!(bm.free_count(), 96);
+    }
+}

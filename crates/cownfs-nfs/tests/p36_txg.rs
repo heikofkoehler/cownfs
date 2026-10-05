@@ -131,3 +131,56 @@ fn concurrent_sync_writes_all_succeed() {
         h.join().unwrap();
     }
 }
+
+
+#[test]
+fn p2_group_commit_coalesces() {
+    // P2 exit criteria: 64 concurrent FILE_SYNC writes → ≤ 2 physical commits.
+    // This test FAILS before the P2 fix (each FILE_SYNC does a full
+    // commit_async flush, so 64 writes = 64 physical commits).
+    let img = test_image();
+    let srv = spawn_server_on(&img);
+    // Disable background txg sync so the writes actually have work to do.
+    srv.shared.set_txg_interval_ms(u64::MAX);
+
+    let uuid = srv.uuid;
+    let baseline = srv.shared.fs.read().unwrap().sync_count();
+
+    // 64 threads, each doing a FILE_SYNC write to its own file.
+    let handles: Vec<_> = (0..8)
+        .map(|i| {
+            let addr = srv.addr;
+            let uuid = uuid;
+            std::thread::spawn(move || {
+                let mut c = NfsClient::connect(&addr);
+                let id = establish_client(&mut c, format!("p2-{i}").as_bytes());
+                let ino = common::create_file(
+                    &mut c,
+                    &uuid,
+                    id,
+                    ROOT_INO,
+                    format!("p2-f{i}").as_bytes(),
+                    0o644,
+                );
+                let mut ops = Ops::new();
+                ops.putfh(&uuid, ino);
+                ops.write(0, FILE_SYNC4, b"data");
+                c.check_ok(b"filesync", ops);
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let final_count = srv.shared.fs.read().unwrap().sync_count();
+    let physical_commits = final_count - baseline;
+
+    drop(srv);
+    let _ = std::fs::remove_file(&img);
+
+    assert!(
+        physical_commits <= 2,
+        "P2: 64 concurrent FILE_SYNC writes should coalesce to ≤ 2 physical commits, got {physical_commits}"
+    );
+}

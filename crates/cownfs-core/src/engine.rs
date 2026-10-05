@@ -589,6 +589,9 @@ pub struct Fs {
     /// starts where the last one ended, it's sequential and we prefetch.
     /// Guarded by Mutex for interior mutability (Fs::read takes &self).
     readahead: std::sync::Mutex<std::collections::HashMap<u64, (u64, u64)>>,
+    /// P2: count of physical sync_txg() calls (for group-commit testing).
+    /// Incremented when sync_txg() does actual work (returns Ok(true)).
+    sync_count: std::sync::atomic::AtomicU64,
 }
 
 /// Name of the hidden file backing extended attributes.
@@ -796,6 +799,7 @@ impl Fs {
             txg_allocated: std::sync::Mutex::new(std::collections::HashSet::new()),
             has_bitmap_crcs: true, // fresh format always has CRC sidecars
             readahead: std::sync::Mutex::new(std::collections::HashMap::new()),
+            sync_count: std::sync::atomic::AtomicU64::new(0),
         };
 
         let now = now_secs();
@@ -1048,6 +1052,7 @@ impl Fs {
             txg_allocated: std::sync::Mutex::new(std::collections::HashSet::new()),
             has_bitmap_crcs,
             readahead: std::sync::Mutex::new(std::collections::HashMap::new()),
+            sync_count: std::sync::atomic::AtomicU64::new(0),
         };
         fs.rebuild_pinned()?;
         fs.rebuild_quota_usage()?;
@@ -1711,7 +1716,16 @@ impl Fs {
         // P9: txg is durable; dirty bytes are now clean.
         self.dirty_bytes
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        // P2: count physical commits for group-commit testing.
+        self.sync_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(true)
+    }
+
+    /// P2: number of physical sync_txg() calls (for testing group commit).
+    pub fn sync_count(&self) -> u64 {
+        self.sync_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Bytes written by the last bitmap persist (for benchmarking).
