@@ -29,29 +29,32 @@ repo-local tracking copy.
 
 ## Phase 2 — Strategic (month)
 
+Items map to workstreams in `docs/performance-resiliency-scale-plan.md`
+(P←A Performance, R←B Resiliency, S←C Scale, T←D Testing).
+
 | Item | Description | Status |
 |------|-------------|--------|
-| P4 | (see external plan) | ❌ TODO |
-| R6 | (see external plan) | ❌ TODO |
-| R7 | (see external plan) | ❌ TODO |
-| S3 | (see external plan) | ❌ TODO |
-| S4 | (see external plan) | ❌ TODO |
-| T3 | (see external plan) | ❌ TODO |
-| T4 | (see external plan) | ❌ TODO |
-| T5 | (see external plan) | ❌ TODO |
-| T7 | (see external plan) | ❌ TODO |
+| P4 | Workstream A4/A5: vectored/readahead reads, B-tree node cache (see `performance-resiliency-scale-plan.md` §A4, §A5) | ❌ TODO |
+| R6 | Workstream B6: quota/xattr crash consistency (see §B6) | ❌ TODO |
+| R7 | Workstream B3/B4: fault-injection expansion, lease failover (see §B3, §B4) | ❌ TODO |
+| S3 | Workstream C3: connection-scale measurement (see §C3) | ❌ TODO |
+| S4 | Workstream C4: shard rebalance (see §C4) | ❌ TODO |
+| T3 | Workstream D3: fault-injection harness (see §D3) | ❌ TODO |
+| T4 | Workstream D4: performance regression suite (see §D4) | ❌ TODO |
+| T5 | Workstream D1: close known gaps (see §D1) | ❌ TODO |
+| T7 | (see external `prs_plan_v2.md` for T7 specifics) | ❌ TODO |
 
 ## Phase 3 — Strategic (quarter)
 
 | Item | Description | Status |
 |------|-------------|--------|
-| S1 | (see external plan) | ❌ TODO |
-| P5 | (see external plan) | ❌ TODO |
-| S5 | (see external plan) | ❌ TODO |
-| S6 | (see external plan) | ❌ TODO |
-| P6 | (see external plan) | ❌ TODO |
-| Migration tooling | v3→v4 (beyond detection) | ❌ TODO |
-| T6 | (see external plan) | ❌ TODO |
+| S1 | Workstream C1: bitmap memory / paged bitmap (see `performance-resiliency-scale-plan.md` §C1; also `docs/c1-paged-bitmap-deferred.md`) | ❌ TODO |
+| P5 | Workstream A6: async I/O server (see §A6; also `docs/a6-c4-deferred.md`) | ❌ TODO |
+| S5 | (see external `prs_plan_v2.md` for S5 specifics) | ❌ TODO |
+| S6 | (see external `prs_plan_v2.md` for S6 specifics) | ❌ TODO |
+| P6 | (see external `prs_plan_v2.md` for P6 specifics) | ❌ TODO |
+| Migration tooling | v3→v4 automatic (beyond detection) | ❌ TODO |
+| T6 | (see external `prs_plan_v2.md` for T6 specifics) | ❌ TODO |
 
 ## Preserved (not deferred)
 
