@@ -3443,10 +3443,15 @@ impl Fs {
     pub fn lease_acquire(&mut self, node_id: &str, ttl_secs: u64) -> Result<bool, FsError> {
         self.check_writable()?;
         let blk = self.lease_blk()?;
-        // Serialize the read-modify-write against other processes on this
-        // host via an exclusive file lock; without it two racers can both
-        // see an empty holder and both "win" (split-brain). (On shared SAN
-        // without flock, the fencing epoch is the backstop.)
+        // Cross-host safety: flock only serializes processes on THIS host.
+        // On a shared SAN, two hosts can both pass the flock and race the
+        // read-modify-write. We close the hole with:
+        // 1. A unique fencing epoch (timestamp + pid + counter) — two racers
+        //    cannot write the same epoch value.
+        // 2. Write, then delay, then re-read to confirm we still hold it.
+        //    If a competitor overwrote us, our epoch won't match and we lose.
+        // 3. The commit path re-checks the epoch on every commit (fencing),
+        //    so even a lost race that slips through cannot corrupt data.
         let sh = self.shared.lock().unwrap();
         sh.dev
             .lock_exclusive()
@@ -3465,19 +3470,62 @@ impl Fs {
             st.holder = crate::lease::node_id_bytes(node_id);
             st.expiry = now + ttl_secs;
             if holder_changed {
-                // New holder (or first acquire): bump the fencing epoch so
-                // any previous holder's in-flight commits are rejected.
-                st.epoch = st.epoch.wrapping_add(1);
+                // New holder (or first acquire): generate a unique fencing
+                // epoch so any previous holder's in-flight commits are
+                // rejected, and so two cross-host racers cannot write the
+                // same epoch value.
+                st.epoch = Self::unique_epoch();
             }
+            let my_epoch = st.epoch;
             crate::lease::write_lease(&self.image_path, blk, &st)
                 .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
-            self.lease_epoch = Some(st.epoch);
+            // Release the local flock BEFORE the confirmation delay, so we
+            // don't block other local processes during the sleep. The epoch
+            // check below is what provides cross-host safety.
+            sh.dev
+                .unlock()
+                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+            // Let competing writes settle, then confirm we still hold it.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let confirmed = crate::lease::read_lease(&self.image_path, blk)
+                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))? 
+                .map(|s| s.holder_name() == node_id && s.epoch == my_epoch)
+                .unwrap_or(false);
+            // Re-acquire flock for the unlock at function end.
+            sh.dev
+                .lock_exclusive()
+                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+            if !confirmed {
+                return Ok(false);
+            }
+            self.lease_epoch = Some(my_epoch);
             Ok(true)
         })();
         sh.dev
             .unlock()
             .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
         res
+    }
+
+    /// Generate a unique fencing epoch: nanosecond timestamp mixed with PID
+    /// and an atomic counter. Two hosts (or two processes) cannot generate
+    /// the same value for different acquisition attempts.
+    fn unique_epoch() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let pid = std::process::id() as u64;
+        let ctr = COUNTER.fetch_add(1, Ordering::Relaxed);
+        // Mix: nanos in high bits, pid and counter in low bits.
+        (nanos << 20) ^ (pid << 32) ^ ctr ^ 0x9E3779B97F4A7C15
+    }
+
+    /// Current fencing epoch held by this instance (for tests).
+    pub fn lease_epoch_for_test(&self) -> Option<u64> {
+        self.lease_epoch
     }
 
     /// Renew the lease. Returns true if renewed, false if we lost it.

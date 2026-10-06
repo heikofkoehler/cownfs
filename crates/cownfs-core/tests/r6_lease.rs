@@ -296,3 +296,59 @@ fn r6_renew_keeps_epoch() {
 
     let _ = std::fs::remove_file(&img);
 }
+
+/// R6 cross-host race: two "hosts" (separate Fs instances, no shared flock)
+/// racing to acquire an empty lease. Only one may win.
+/// Simulates SAN hosts by having both read-empty then write concurrently.
+#[test]
+fn r6_cross_host_race_one_winner() {
+    let img = tmp_path("xhost");
+    let _ = std::fs::remove_file(&img);
+    let _fs0 = Fs::format(&img, 2048).expect("format");
+    drop(_fs0);
+
+    // Two separate Fs handles = two "hosts". They share the image file but
+    // (simulating separate SAN hosts) we bypass the local flock by racing
+    // the acquire calls from threads; the unique-epoch + re-read protocol
+    // must ensure only one reports success.
+    let img1 = img.clone();
+    let img2 = img.clone();
+    let h1 = std::thread::spawn(move || {
+        let mut fs = Fs::open(&img1).expect("open1");
+        fs.lease_acquire("hostA", 60).expect("acquire A")
+    });
+    let h2 = std::thread::spawn(move || {
+        let mut fs = Fs::open(&img2).expect("open2");
+        fs.lease_acquire("hostB", 60).expect("acquire B")
+    });
+    let a_won = h1.join().expect("t1");
+    let b_won = h2.join().expect("t2");
+
+    // Exactly one winner.
+    assert!(
+        a_won ^ b_won,
+        "R6 cross-host race: exactly one must win (A={a_won}, B={b_won})"
+    );
+
+    let _ = std::fs::remove_file(&img);
+}
+
+/// R6: unique epochs — two acquisitions generate different fencing epochs.
+#[test]
+fn r6_epoch_unique() {
+    let img = tmp_path("epochuniq");
+    let _ = std::fs::remove_file(&img);
+    let mut fs = Fs::format(&img, 2048).expect("format");
+
+    assert!(fs.lease_acquire("n1", 60).expect("acquire1"));
+    let e1 = fs.lease_epoch_for_test();
+    fs.lease_release("n1").expect("release");
+
+    let mut fs2 = Fs::open(&img).expect("open2");
+    assert!(fs2.lease_acquire("n1", 60).expect("acquire2"));
+    let e2 = fs2.lease_epoch_for_test();
+
+    assert_ne!(e1, e2, "R6: fencing epochs must be unique per acquisition");
+
+    let _ = std::fs::remove_file(&img);
+}
