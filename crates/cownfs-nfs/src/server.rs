@@ -135,7 +135,7 @@ fn fs_to_nfs(e: FsError) -> u32 {
 #[derive(Clone)]
 pub struct Shared {
     pub fs: Arc<RwLock<Fs>>,
-    pub state: Arc<Mutex<StateManager>>,
+    pub state: Arc<StateManager>,
     /// NFSv4.1 client/session/slot table (exactly-once semantics).
     pub sessions: Arc<Mutex<crate::sessions::SessionTable>>,
     /// pNFS layout table (single data server in v1).
@@ -271,7 +271,7 @@ impl Shared {
             fs,
             txg,
             txg_interval_ms,
-            state: Arc::new(Mutex::new(StateManager::new())),
+            state: Arc::new(StateManager::new()),
             sessions: Arc::new(Mutex::new(crate::sessions::SessionTable::new())),
             layouts: Arc::new(Mutex::new(crate::layouts::LayoutTable::new())),
             ds_addr: None,
@@ -306,12 +306,12 @@ impl Shared {
     /// server accepts clients. Every shard primary (and its standbys)
     /// needs a distinct id; 0 is the single-server default.
     pub fn set_server_id(&self, server_id: u32) {
-        self.state.lock().unwrap().set_server_id(server_id);
+        self.state.set_server_id(server_id);
     }
 
     /// The server id this instance qualifies clientids/stateids with.
     pub fn server_id(&self) -> u32 {
-        self.state.lock().unwrap().server_id()
+        self.state.server_id()
     }
 
     pub fn new_read_only(fs: Fs, image_path: Option<std::path::PathBuf>) -> Self {
@@ -320,7 +320,7 @@ impl Shared {
             fs: Arc::new(RwLock::new(fs)),
             txg,
             txg_interval_ms: Arc::new(std::sync::atomic::AtomicU64::new(100)),
-            state: Arc::new(Mutex::new(StateManager::new())),
+            state: Arc::new(StateManager::new()),
             sessions: Arc::new(Mutex::new(crate::sessions::SessionTable::new())),
             layouts: Arc::new(Mutex::new(crate::layouts::LayoutTable::new())),
             ds_addr: None,
@@ -488,10 +488,8 @@ impl Session {
         Ok(())
     }
 
-    /// Lock the NFSv4 client/open/lock table.
-    fn state(&self) -> std::sync::MutexGuard<'_, StateManager> {
-        lock_recover(&self.shared.state)
-    }
+    /// Check for '.'/'..' in mutating ops (CREATE/REMOVE/RENAME/LINK).
+    /// LOOKUP of '.'/'..' is legal; creating/removing them is not.
 
     fn check_fh(&self, fh: &AnyFileHandle) -> Result<Fh, u32> {
         match fh {
@@ -1882,7 +1880,7 @@ impl Session {
         };
         self.cfh = Some(new_cfh);
         // P6: create real open state with share reservation checking.
-        let open_rec = match self.state().open(
+        let open_rec = match self.shared.state.open(
             seqid,
             clientid,
             owner.to_vec(),
@@ -2270,7 +2268,7 @@ impl Session {
     }
 
     fn op_setclientid(&mut self, verifier: [u8; 8], name: &[u8]) -> OpResult {
-        let (clientid, _) = self.state().setclientid(verifier, name.to_vec());
+        let (clientid, _) = self.shared.state.setclientid(verifier, name.to_vec());
         let mut w = Writer::new();
         w.u64(clientid);
         w.opaque_fixed(&verifier);
@@ -2278,7 +2276,7 @@ impl Session {
     }
 
     fn op_setclientid_confirm(&mut self, clientid: u64, verifier: [u8; 8]) -> OpResult {
-        if self.state().confirm(clientid, verifier) {
+        if self.shared.state.confirm(clientid, verifier) {
             OpResult::ok(OP_SETCLIENTID_CONFIRM, Vec::new())
         } else {
             OpResult::err(OP_SETCLIENTID_CONFIRM, NFS4ERR_STALE_CLIENTID)
@@ -2286,7 +2284,7 @@ impl Session {
     }
 
     fn op_close(&mut self, seqid: u32, stateid: &StateId) -> OpResult {
-        match self.state().close(stateid, seqid) {
+        match self.shared.state.close(stateid, seqid) {
             Ok(()) => {
                 // CLOSE4resok: return the "closed" stateid (all zeros per RFC 7530 §16.2.3)
                 let mut w = Writer::new();
@@ -2307,7 +2305,8 @@ impl Session {
         share_deny: u32,
     ) -> OpResult {
         match self
-            .state()
+            .shared
+            .state
             .open_downgrade(stateid, seqid, share_access, share_deny)
         {
             Ok(new_stateid) => {
@@ -2342,7 +2341,7 @@ impl Session {
         // from the RPC credentials or the open_stateid. For simplicity, we
         // use a fixed clientid 1 (the test will use SETCLIENTID first).
         // Actually, let's get it from the open_stateid's client.
-        let clientid = match self.state().find_open(open_stateid) {
+        let clientid = match self.shared.state.find_open(open_stateid) {
             Some(o) => o.clientid,
             None if !new_lock_owner => {
                 // Existing lock owner: find by lock_stateid.
@@ -2355,7 +2354,7 @@ impl Session {
         } else {
             None
         };
-        match self.state().lock(
+        match self.shared.state.lock(
             clientid,
             lock_owner.to_vec(),
             file_ino,
@@ -2382,7 +2381,7 @@ impl Session {
         offset: u64,
         length: u64,
     ) -> OpResult {
-        match self.state().unlock(stateid, seqid, offset, length) {
+        match self.shared.state.unlock(stateid, seqid, offset, length) {
             Ok(sid) => {
                 let mut w = Writer::new();
                 sid.encode(&mut w);
@@ -2394,7 +2393,7 @@ impl Session {
     }
 
     fn op_renew(&mut self, clientid: u64) -> OpResult {
-        if self.state().renew(clientid) {
+        if self.shared.state.renew(clientid) {
             OpResult::ok(OP_RENEW, Vec::new())
         } else {
             OpResult::err(OP_RENEW, NFS4ERR_EXPIRED)

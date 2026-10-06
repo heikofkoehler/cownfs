@@ -190,8 +190,17 @@ point where dead-client state lingers too long.
 
 1. **Server-qualified clientids/stateids** (§4.2). Small, no protocol
    change, kills the aliasing hazard. Shippable alone.
+   ✅ DONE (commit f6c6a22): `clientid = (server_id << 32) | seq`,
+   `stateid.other = [server_id:4][boot_gen:4][seq:4]`, `--server-id` flag
+   (else FNV-1a of `--node-id`, else 0 = legacy layout).
 2. **Bucketed StateManager** (§4.1). Removes the mutex bottleneck; no
    behavior change. Shippable alone.
+   ✅ DONE: 64 buckets by `hash(clientid)`, per-bucket locks, lock-free
+   atomic id sequences, global name→clientid index, cross-bucket
+   share/lock conflict checks serialized by a dedicated conflict lock so
+   detection stays exact. Outer `Mutex<StateManager>` removed;
+   `find_open` returns owned records. Lock ordering: names -> bucket,
+   conflict -> bucket (never reversed).
 3. **Grace period + reclaim per RFC** (§4.4, minus WAL). Spec compliance
    that's currently missing; required before any failover story.
 4. **State change log + standby tailing** (§4.3). Failover without
