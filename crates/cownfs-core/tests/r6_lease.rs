@@ -265,10 +265,14 @@ fn r6_stale_primary_commit_rejected() {
     fs_b.write(ino_b, 0, b"fresh").expect("write B");
     fs_b.commit().expect("B commit works");
 
-    // B releases; A re-acquiring gets a fresh epoch and can commit again.
+    // N12: A must NOT re-acquire on the fenced Fs. Its in-memory state is
+    // stale (doesn't know about B's allocations). The correct recovery is
+    // to drop fs_a and reopen. We verify that reopening works.
+    drop(fs_a);
     fs_b.lease_release("node-B").expect("B release");
-    assert!(fs_a.lease_acquire("node-A", 60).expect("A re-acquire"));
-    fs_a.commit().expect("A commit after re-acquire works");
+    let mut fs_a2 = Fs::open(&img).expect("reopen A");
+    assert!(fs_a2.lease_acquire("node-A", 60).expect("A acquire after reopen"));
+    fs_a2.commit().expect("commit after reopen works");
 
     let _ = std::fs::remove_file(&img);
 }

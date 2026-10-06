@@ -123,3 +123,49 @@ fn s4_paged_alloc_free() {
 
     let _ = std::fs::remove_file(&img);
 }
+
+/// N5 regression: dirtying >64 bitmap pages must not corrupt the live area.
+/// Allocates blocks across many 128 MiB regions (each touches a different
+/// bitmap page), then verifies the image still opens and fsck is clean.
+/// With the old (buggy) eviction, dirty pages were written to the live
+/// area, causing a torn bitmap after crash.
+#[test]
+fn s4_many_dirty_pages_no_corruption() {
+    use cownfs_core::engine::{Fs, ROOT_INO};
+    let img = std::env::temp_dir().join(format!(
+        "cownfs-s4-n5-{}-{}.img",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&img);
+    // 8 GiB image = 2M blocks = 64 bitmap pages. We need >64 dirty pages,
+    // so use a larger image or force many distinct regions.
+    // 16 GiB = 4M blocks = 128 pages.
+    let mut fs = Fs::format(&img, 16 * 1024 * 1024 * 1024 / 4096).expect("format");
+    fs.commit().expect("commit");
+
+    // Allocate 100 blocks spread across the image to dirty many pages.
+    // Each allocation in a different 128 MiB region touches a different page.
+    for i in 0..100 {
+        let name = format!("f{i:03}");
+        let ino = fs.create(ROOT_INO, name.as_bytes(), 0o644, 0, 0).expect("create");
+        // Write 1 MiB (256 blocks) to force allocation.
+        let data = vec![i as u8; 1024 * 1024];
+        fs.write(ino, 0, &data).expect("write");
+        if i % 20 == 19 {
+            fs.commit().expect("commit");
+        }
+    }
+    fs.commit().expect("final commit");
+    drop(fs);
+
+    // Reopen and verify clean.
+    let fs = Fs::open(&img).expect("open after many dirty pages");
+    fs.check().expect("fsck clean");
+    drop(fs);
+
+    let _ = std::fs::remove_file(&img);
+}

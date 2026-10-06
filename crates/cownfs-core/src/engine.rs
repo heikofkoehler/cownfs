@@ -89,7 +89,10 @@ pub enum FsError {
     /// `Fs::open` falls back to the older superblock generation.
     BitmapCorrupt,
     /// R6: commit refused — the lease epoch changed, meaning another node
-    /// took the write lease (fencing). The caller must re-acquire or exit.
+    /// took the write lease (fencing). The caller must REOPEN the image
+    /// (not just re-acquire); the in-memory state is stale and a re-acquire
+    /// followed by commit would overwrite the new holder's generation.
+    /// N12: re-acquiring on a fenced Fs is unsafe.
     Fenced,
     /// R7: image uses an unknown incompat feature flag; refused to open.
     IncompatibleFeature(String),
