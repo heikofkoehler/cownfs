@@ -38,10 +38,12 @@ pub fn bitmap_crc_blocks(bitmap_blocks: u64) -> u64 {
     bytes.div_ceil(crate::BLOCK_SIZE as u64)
 }
 
-const HDR_LEN: usize = 312;
-/// R7: legacy header lengths. Decode accepts 312 (current) and 256
-/// (pre-R7); the 280-byte R7 intermediate was never deployed.
+const HDR_LEN: usize = 320;
+/// R7: legacy header lengths. Decode accepts 320 (current), 312 (S3), and
+/// 256 (pre-R7); the 280-byte R7 intermediate was never deployed.
 const HDR_LEN_LEGACY: usize = 256;
+/// S3 intermediate (live counts but no free_blocks).
+const HDR_LEN_S3: usize = 312;
 const OFF_CHECKSUM: usize = 64;
 
 /// R7: feature flags understood by this build.
@@ -111,6 +113,8 @@ pub struct Superblock {
     pub live_dirs: u64,
     pub live_extents: u64,
     pub live_snaps: u64,
+    /// S4: P3 free-block counter, persisted on every commit.
+    pub free_blocks: u64,
     /// Not serialized: true if the on-disk header predates S3 live counts
     /// (legacy 256-byte header). Open falls back to the reachability walk.
     #[allow(dead_code)]
@@ -156,6 +160,8 @@ impl Superblock {
         hdr[288..296].copy_from_slice(&self.live_dirs.to_le_bytes());
         hdr[296..304].copy_from_slice(&self.live_extents.to_le_bytes());
         hdr[304..312].copy_from_slice(&self.live_snaps.to_le_bytes());
+        // S4: P3 free-block counter.
+        hdr[312..320].copy_from_slice(&self.free_blocks.to_le_bytes());
         // Checksum covers the header with the checksum field zeroed.
         let sum = checksum(&hdr);
         hdr[OFF_CHECKSUM..OFF_CHECKSUM + 8].copy_from_slice(&sum.to_le_bytes());
@@ -177,18 +183,28 @@ impl Superblock {
         // so their 256-byte checksum won't verify as a 280-byte one).
         let mut tmp = *hdr;
         tmp[OFF_CHECKSUM..OFF_CHECKSUM + 8].fill(0);
-        let legacy = if checksum(&tmp) == stored {
-            false
+        // Accept 320 (current), 312 (S3, no free_blocks), and 256 (pre-R7).
+        // Older images have zeros past their length, so their shorter
+        // checksum won't verify as a longer one.
+        let hdr_len = if checksum(&tmp) == stored {
+            HDR_LEN
         } else {
-            let mut tmp256 = tmp;
-            // Zero the flag area so only the first 256 bytes matter.
-            tmp256[HDR_LEN_LEGACY..].fill(0);
-            if checksum(&tmp256[..HDR_LEN_LEGACY]) == stored {
-                true
+            let mut tmp312 = tmp;
+            tmp312[HDR_LEN_S3..].fill(0);
+            if checksum(&tmp312[..HDR_LEN_S3]) == stored {
+                HDR_LEN_S3
             } else {
-                return None;
+                let mut tmp256 = tmp;
+                tmp256[HDR_LEN_LEGACY..].fill(0);
+                if checksum(&tmp256[..HDR_LEN_LEGACY]) == stored {
+                    HDR_LEN_LEGACY
+                } else {
+                    return None;
+                }
             }
         };
+        let legacy = hdr_len == HDR_LEN_LEGACY;
+        let has_free_blocks = hdr_len == HDR_LEN;
         let u32_at = |o: usize| -> Option<u32> {
             Some(u32::from_le_bytes(hdr.get(o..o + 4)?.try_into().ok()?))
         };
@@ -233,6 +249,8 @@ impl Superblock {
             live_dirs: if legacy { 0 } else { u64_at(288)? },
             live_extents: if legacy { 0 } else { u64_at(296)? },
             live_snaps: if legacy { 0 } else { u64_at(304)? },
+            // S4: S3-era images (312 bytes) have no free_blocks → 0.
+            free_blocks: if has_free_blocks { u64_at(312)? } else { 0 },
             has_live_counts: !legacy,
         })
     }
@@ -276,6 +294,7 @@ impl Superblock {
             live_dirs: 0,
             live_extents: 0,
             live_snaps: 0,
+            free_blocks: 0,
             has_live_counts: true,
         }
     }

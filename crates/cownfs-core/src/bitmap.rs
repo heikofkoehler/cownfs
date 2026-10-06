@@ -3,6 +3,10 @@
 //! The bitmap itself is CoW-updated per transaction (see the architecture
 //! plan); this type is the in-memory representation plus serialization.
 //!
+use std::io;
+use std::sync::Arc;
+
+use crate::block::{BlockDevice, FileDevice};
 use crate::BLOCK_SIZE;
 
 /// Number of bitmap blocks needed to track `nbits` blocks.
@@ -24,6 +28,23 @@ pub struct Bitmap {
     /// P3: O(1) free-space counter. Number of clear bits (free blocks).
     /// Maintained incrementally on set/clear/alloc; recomputed on load.
     free_count: u64,
+}
+
+impl Bitmap {
+    /// S4: construct from raw words (used by PagedBitmap::to_bitmap).
+    pub(crate) fn from_words(words: Vec<u64>, nbits: u64, free_count: u64) -> Self {
+        let mut dirty = std::collections::HashSet::new();
+        for i in 0..words.len() as u64 {
+            dirty.insert(i);
+        }
+        Self {
+            words,
+            nbits,
+            dirty,
+            cursor: 0,
+            free_count,
+        }
+    }
 }
 
 impl Bitmap {
@@ -210,24 +231,28 @@ pub const MAX_CACHED_PAGES: usize = 64;
 /// A memory-bounded bitmap that pages 4KiB blocks from disk on demand.
 ///
 /// Only `MAX_CACHED_PAGES` pages are held in memory (LRU eviction).
-/// Per-page free counts are always resident (8KB per 1M pages) for
-/// efficient allocation scanning without loading every page.
-#[derive(Debug)]
+/// Per-page free counts are lazily computed (`u32::MAX` = unknown).
 pub struct PagedBitmap {
     nbits: u64,
     bitmap_blocks: u64,
+    /// S4: device for paging I/O (None = standalone, no paging).
+    dev: Option<Arc<FileDevice>>,
+    /// S4: first block of the active bitmap area (for paging I/O).
+    area_start: u64,
     /// page_idx -> 512 words (4KiB). Only cached pages are here.
     cache: std::collections::HashMap<u64, [u64; WORDS_PER_PAGE]>,
     /// LRU order: front = oldest.
     lru: std::collections::VecDeque<u64>,
     /// Pages with unflushed modifications.
     dirty_pages: std::collections::HashSet<u64>,
-    /// Free bit count per page. Always resident. Initialized at load.
+    /// Free bit count per page. `u32::MAX` = unknown (lazy).
     free_counts: Vec<u32>,
     /// Global word indices modified (for delta persists).
     dirty_words: std::collections::HashSet<u64>,
     /// Allocation cursor: page index to start next alloc scan.
     cursor: u64,
+    /// S4: P3 free-block counter, maintained incrementally.
+    total_free: u64,
 }
 
 impl PagedBitmap {
@@ -236,13 +261,51 @@ impl PagedBitmap {
         Self {
             nbits,
             bitmap_blocks,
+            dev: None,
+            area_start: 0,
             cache: std::collections::HashMap::new(),
             lru: std::collections::VecDeque::new(),
             dirty_pages: std::collections::HashSet::new(),
-            free_counts: vec![0; npages],
+            // S4: lazy (u32::MAX = unknown); computed on first page load.
+            free_counts: vec![u32::MAX; npages],
             dirty_words: std::collections::HashSet::new(),
             cursor: 0,
+            total_free: nbits, // all free initially; caller adjusts
         }
+    }
+
+    /// Attach a device for transparent paging. After this, `test`/`set`/
+    /// `clear`/`alloc` page data in on demand.
+    pub fn with_device(mut self, dev: Arc<FileDevice>, area_start: u64) -> Self {
+        self.dev = Some(dev);
+        self.area_start = area_start;
+        self
+    }
+
+    /// Update the active area (on slot flip).
+    /// The cache is cleared: cached pages belong to the old area and must
+    /// not be written to the new area on eviction.
+    /// Caller must have flushed dirty pages (commit does via write_full_to).
+    pub fn set_area_start(&mut self, area_start: u64) {
+        if self.area_start != area_start {
+            self.area_start = area_start;
+            // Dirty pages were just written to the new area by write_full_to.
+            // Clear the cache to avoid stale reads/writes.
+            self.cache.clear();
+            self.lru.clear();
+            self.dirty_pages.clear();
+            self.dirty_words.clear();
+        }
+    }
+
+    /// S4: P3 free-block counter.
+    pub fn free_count(&self) -> u64 {
+        self.total_free
+    }
+
+    /// Set the total free count (at load time, from the superblock).
+    pub fn set_total_free(&mut self, n: u64) {
+        self.total_free = n;
     }
 
     pub fn len(&self) -> u64 {
@@ -289,8 +352,11 @@ impl PagedBitmap {
             self.dirty_pages.insert(page);
             self.dirty_words
                 .insert(page * WORDS_PER_PAGE as u64 + wi as u64);
-            if self.free_counts[page as usize] > 0 {
+            if self.free_counts[page as usize] > 0 && self.free_counts[page as usize] != u32::MAX {
                 self.free_counts[page as usize] -= 1;
+            }
+            if self.total_free > 0 {
+                self.total_free -= 1;
             }
             self.touch(page);
         }
@@ -308,7 +374,10 @@ impl PagedBitmap {
             self.dirty_pages.insert(page);
             self.dirty_words
                 .insert(page * WORDS_PER_PAGE as u64 + wi as u64);
-            self.free_counts[page as usize] += 1;
+            if self.free_counts[page as usize] != u32::MAX {
+                self.free_counts[page as usize] += 1;
+            }
+            self.total_free += 1;
             self.touch(page);
         }
     }
@@ -381,8 +450,13 @@ impl PagedBitmap {
                     self.dirty_pages.insert(page_idx);
                     self.dirty_words
                         .insert(page_idx * WORDS_PER_PAGE as u64 + wi as u64);
-                    if self.free_counts[page_idx as usize] > 0 {
+                    if self.free_counts[page_idx as usize] > 0
+                        && self.free_counts[page_idx as usize] != u32::MAX
+                    {
                         self.free_counts[page_idx as usize] -= 1;
+                    }
+                    if self.total_free > 0 {
+                        self.total_free -= 1;
                     }
                     self.touch(page_idx);
                     return Some(idx);
@@ -407,8 +481,11 @@ impl PagedBitmap {
             self.dirty_pages.insert(page);
             self.dirty_words
                 .insert(page * WORDS_PER_PAGE as u64 + wi as u64);
-            if self.free_counts[page as usize] > 0 {
+            if self.free_counts[page as usize] > 0 && self.free_counts[page as usize] != u32::MAX {
                 self.free_counts[page as usize] -= 1;
+            }
+            if self.total_free > 0 {
+                self.total_free -= 1;
             }
             self.touch(page);
             true
@@ -473,6 +550,180 @@ impl PagedBitmap {
     /// Set free count directly (used at load time).
     pub fn set_free_count(&mut self, page_idx: u64, count: u32) {
         self.free_counts[page_idx as usize] = count;
+    }
+
+    // ---- S4: transparent paging (device-backed) ----
+
+    /// Ensure `page_idx` is cached, loading from disk if necessary.
+    /// Evicts the LRU page (writing back if dirty) when at capacity.
+    fn ensure_cached(&mut self, page_idx: u64) -> io::Result<()> {
+        if self.cache.contains_key(&page_idx) {
+            return Ok(());
+        }
+        let (dev, area_start) = match (self.dev.clone(), self.area_start) {
+            (Some(d), a) => (d, a),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "paged bitmap without device",
+                ))
+            }
+        };
+        // Evict if at capacity.
+        while self.cache.len() >= MAX_CACHED_PAGES {
+            let (evict_idx, words, was_dirty) = self.evict_lru().expect("nonempty cache");
+            if was_dirty {
+                Self::write_page(&dev, area_start, evict_idx, &words)?;
+            }
+        }
+        // Load the page.
+        let words = Self::read_page(&dev, area_start, page_idx)?;
+        self.insert_page(page_idx, words);
+        Ok(())
+    }
+
+    fn read_page(
+        dev: &FileDevice,
+        area_start: u64,
+        page_idx: u64,
+    ) -> io::Result<[u64; WORDS_PER_PAGE]> {
+        let mut blk = [0u8; BLOCK_SIZE];
+        dev.read_block(area_start + page_idx, &mut blk)?;
+        let mut words = [0u64; WORDS_PER_PAGE];
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = u64::from_le_bytes(blk[i * 8..i * 8 + 8].try_into().unwrap());
+        }
+        Ok(words)
+    }
+
+    fn write_page(
+        dev: &FileDevice,
+        area_start: u64,
+        page_idx: u64,
+        words: &[u64; WORDS_PER_PAGE],
+    ) -> io::Result<()> {
+        let mut blk = [0u8; BLOCK_SIZE];
+        for (i, w) in words.iter().enumerate() {
+            blk[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+        }
+        dev.write_block(area_start + page_idx, &blk)?;
+        Ok(())
+    }
+
+    /// Test a bit, paging in on demand.
+    pub fn test(&mut self, i: u64) -> io::Result<bool> {
+        debug_assert!(i < self.nbits);
+        let page = Self::page_idx(i);
+        self.ensure_cached(page)?;
+        Ok(self.test_cached(i))
+    }
+
+    /// Set a bit, paging in on demand.
+    pub fn set(&mut self, i: u64) -> io::Result<()> {
+        debug_assert!(i < self.nbits);
+        let page = Self::page_idx(i);
+        self.ensure_cached(page)?;
+        self.set_cached(i);
+        Ok(())
+    }
+
+    /// Clear a bit, paging in on demand.
+    pub fn clear(&mut self, i: u64) -> io::Result<()> {
+        debug_assert!(i < self.nbits);
+        let page = Self::page_idx(i);
+        self.ensure_cached(page)?;
+        self.clear_cached(i);
+        Ok(())
+    }
+
+    /// Allocate a free bit, paging in on demand.
+    pub fn alloc(&mut self) -> io::Result<Option<u64>> {
+        // Find a page with free space (loading unknown pages as needed).
+        let npages = self.bitmap_blocks;
+        if npages == 0 {
+            return Ok(None);
+        }
+        let start = self.cursor % npages;
+        for offset in 0..npages {
+            let page = (start + offset) % npages;
+            if self.free_counts[page as usize] == u32::MAX {
+                // Unknown: load to learn the true count.
+                self.ensure_cached(page)?;
+            }
+            if self.free_counts[page as usize] > 0 {
+                // Ensure cached (may have been evicted).
+                self.ensure_cached(page)?;
+                self.cursor = page + 1;
+                return Ok(self.alloc_in_page(page));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Allocate a specific bit if free, paging in on demand.
+    pub fn alloc_at(&mut self, block: u64) -> io::Result<bool> {
+        if block >= self.nbits {
+            return Ok(false);
+        }
+        let page = Self::page_idx(block);
+        self.ensure_cached(page)?;
+        Ok(self.alloc_at_cached(block))
+    }
+
+    /// Write all dirty pages to the device area. Does not clear the dirty
+    /// set (caller decides).
+    pub fn flush_dirty(&mut self) -> io::Result<()> {
+        let dev = self
+            .dev
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "paged bitmap without device"))?
+            .clone();
+        let area_start = self.area_start;
+        let dirty: Vec<u64> = self.dirty_pages.iter().copied().collect();
+        for page in dirty {
+            if let Some(words) = self.cache.get(&page) {
+                Self::write_page(&dev, area_start, page, words)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark all pages clean (after a successful flush).
+    pub fn mark_all_clean(&mut self) {
+        self.dirty_pages.clear();
+        self.dirty_words.clear();
+    }
+
+    /// S4: materialize into a fully-resident `Bitmap` (for commit).
+    /// Used on the commit path where correctness matters more than memory;
+    /// the open path (RSS-sensitive) uses paging.
+    pub fn to_bitmap(&mut self) -> io::Result<Bitmap> {
+        let dev = self
+            .dev
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "paged bitmap without device"))?
+            .clone();
+        let source_start = self.area_start;
+        let mut words = vec![0u64; ((self.nbits + 63) / 64) as usize];
+        for page in 0..self.bitmap_blocks {
+            if let Some(cached) = self.cache.get(&page) {
+                let base = page as usize * WORDS_PER_PAGE;
+                for (i, w) in cached.iter().enumerate() {
+                    if base + i < words.len() {
+                        words[base + i] = *w;
+                    }
+                }
+            } else {
+                let pw = Self::read_page(&dev, source_start, page)?;
+                let base = page as usize * WORDS_PER_PAGE;
+                for (i, w) in pw.iter().enumerate() {
+                    if base + i < words.len() {
+                        words[base + i] = *w;
+                    }
+                }
+            }
+        }
+        Ok(Bitmap::from_words(words, self.nbits, self.total_free))
     }
 }
 

@@ -73,7 +73,9 @@ fn do_create(image: &Path, backup: &Path) -> Result<(), String> {
 
     // All allocated blocks.
     let blocks: Vec<u64> = {
-        let mut v: Vec<u64> = fs.allocated_blocks().into_iter().collect();
+        let mut v: Vec<u64> = fs
+            .allocated_blocks()
+            .map_err(|e| format!("allocated_blocks: {e:?}"))?;
         v.sort_unstable();
         v
     };

@@ -13,7 +13,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::bitmap::Bitmap;
+use crate::bitmap::PagedBitmap;
 use crate::block::{BlockDevice, FileDevice};
 use crate::btree::{BTree, NodeId, NodeStore};
 use crate::checksum::checksum32;
@@ -694,10 +694,9 @@ impl Fs {
     /// Public for use by cownfs-backup restore-inc.
     pub fn write_bitmap_crcs(
         dev: &FileDevice,
-        area_bytes: &[u8],
-        bitmap_start: u64,
         bblocks: u64,
         sidecar_start: u64,
+        crcs: &[u32],
     ) -> Result<(), FsError> {
         use crate::BLOCK_SIZE;
         let cb = superblock::bitmap_crc_blocks(bblocks);
@@ -706,17 +705,8 @@ impl Fs {
         }
         let mut sidecar = vec![0u8; (cb as usize) * BLOCK_SIZE];
         sidecar[0..8].copy_from_slice(&superblock::BITMAP_CRC_MAGIC.to_le_bytes());
-        for i in 0..bblocks {
-            let start = (i as usize) * BLOCK_SIZE;
-            let end = start + BLOCK_SIZE;
-            // CRC the actual on-disk bytes (bitmap + persisted queue padding).
-            let mut block_data = [0u8; BLOCK_SIZE];
-            if start < area_bytes.len() {
-                let copy_end = end.min(area_bytes.len());
-                block_data[..copy_end - start].copy_from_slice(&area_bytes[start..copy_end]);
-            }
-            let crc = crate::checksum::checksum32(&block_data);
-            let off = 8 + (i as usize) * 4;
+        for (i, crc) in crcs.iter().enumerate().take(bblocks as usize) {
+            let off = 8 + i * 4;
             sidecar[off..off + 4].copy_from_slice(&crc.to_le_bytes());
         }
         for (i, chunk) in sidecar.chunks(BLOCK_SIZE).enumerate() {
@@ -724,7 +714,6 @@ impl Fs {
             blk[..chunk.len()].copy_from_slice(chunk);
             dev.write_block(sidecar_start + i as u64, &blk)?;
         }
-        let _ = bitmap_start; // reserved for future use
         Ok(())
     }
 
@@ -809,34 +798,50 @@ impl Fs {
         if blocks < reserved + 64 {
             return Err(FsError::Invalid("image too small to format".into()));
         }
-        let mut bitmap = Bitmap::new(blocks);
+        let mut bitmap = crate::bitmap::PagedBitmap::new(blocks, bblocks)
+            .with_device(Arc::clone(&dev), bitmap_start);
         for b in 0..reserved {
-            bitmap.set(b);
+            bitmap
+                .set(b)
+                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
         }
+        // S4: persist the total free count in the superblock (P3 counter).
+        bitmap.set_total_free(blocks - reserved);
         // R1 fix: each slot owns its bitmap area (slot s → area s).
         // Initialize both areas so either slot is readable.
-        store::write_bitmap(&dev, &bitmap, bitmap_start, bblocks)?;
-        store::write_bitmap(&dev, &bitmap, bitmap_start + bblocks, bblocks)?;
+        bitmap
+            .flush_dirty()
+            .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+        // Copy the flushed area to the second area.
+        {
+            let mut buf = [0u8; crate::BLOCK_SIZE];
+            for p in 0..bblocks {
+                use crate::block::BlockDevice;
+                dev.read_block(bitmap_start + p, &mut buf)
+                    .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+                dev.write_block(bitmap_start + bblocks + p, &buf)
+                    .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+            }
+        }
+        bitmap.mark_all_clean();
         // Mark the CRC sidecar areas with magic so open() knows this image
         // has bitmap CRCs (v3 images lack the magic → skip verification).
         Self::write_crc_magic(&dev, bitmap_start + 2 * bblocks, cb)?;
         Self::write_crc_magic(&dev, bitmap_start + 2 * bblocks + cb, cb)?;
         // Write initial CRCs for both bitmap areas.
-        let raw = bitmap.to_bytes();
-        Self::write_bitmap_crcs(
-            &dev,
-            &raw,
-            bitmap_start,
-            bblocks,
-            bitmap_start + 2 * bblocks,
-        )?;
-        Self::write_bitmap_crcs(
-            &dev,
-            &raw,
-            bitmap_start + bblocks,
-            bblocks,
-            bitmap_start + 2 * bblocks + cb,
-        )?;
+        // (Format has no fault injection; reading back is fine.)
+        {
+            use crate::block::BlockDevice;
+            let mut blk = [0u8; crate::BLOCK_SIZE];
+            let mut crcs = Vec::with_capacity(bblocks as usize);
+            for p in 0..bblocks {
+                dev.read_block(bitmap_start + p, &mut blk)
+                    .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+                crcs.push(crate::checksum::checksum32(&blk));
+            }
+            Self::write_bitmap_crcs(&dev, bblocks, bitmap_start + 2 * bblocks, &crcs)?;
+            Self::write_bitmap_crcs(&dev, bblocks, bitmap_start + 2 * bblocks + cb, &crcs)?;
+        }
         // R6: initialize the lease block (empty holder, epoch 0).
         crate::lease::write_lease(
             path,
@@ -1045,15 +1050,21 @@ impl Fs {
         let next_inode = sb.next_inode;
         let next_snap = sb.next_snap;
         let (mut bitmap, deferred) = Self::load_bitmap(&dev, &sb, active_slot)?;
+        // P4: share the device by Arc so reads bypass the Shared mutex.
+        let dev = Arc::new(dev);
+        // S4: attach the device to the paged bitmap for transparent paging.
+        // (load_bitmap set area_start; we add the device here.)
+        let area_start = sb.bitmap_start + active_slot as u64 * sb.bitmap_blocks;
+        bitmap = bitmap.with_device(Arc::clone(&dev), area_start);
         // R3 fix: free the persisted deferred-free queue. These blocks became
         // unreachable in the committed (or ancestor) generation; the in-memory
         // queue was lost on shutdown. Freeing them here prevents the
         // allocated-but-unreachable leak that fails check().
         for b in deferred {
-            bitmap.clear(b);
+            bitmap
+                .clear(b)
+                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
         }
-        // P4: share the device by Arc so reads bypass the Shared mutex.
-        let dev = Arc::new(dev);
         let shared = Arc::new(Mutex::new(Shared {
             dev: Arc::clone(&dev),
             bitmap,
@@ -1245,11 +1256,19 @@ impl Fs {
     }
 
     /// All allocated block numbers. Used for full replication sends.
-    pub fn allocated_blocks(&self) -> Vec<u64> {
-        let sh = self.shared.lock().unwrap();
-        (0..self.sb.block_count)
-            .filter(|&b| sh.bitmap.test(b))
-            .collect()
+    pub fn allocated_blocks(&self) -> Result<Vec<u64>, FsError> {
+        let mut sh = self.shared.lock().unwrap();
+        let mut out = Vec::new();
+        for b in 0..self.sb.block_count {
+            if sh
+                .bitmap
+                .test(b)
+                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?
+            {
+                out.push(b);
+            }
+        }
+        Ok(out)
     }
 
     pub fn generation(&self) -> u64 {
@@ -1483,9 +1502,13 @@ impl Fs {
             };
             for b in reserved..self.sb.block_count {
                 if reachable.contains(&b) {
-                    sh.bitmap.set(b);
+                    sh.bitmap
+                        .set(b)
+                        .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
                 } else {
-                    sh.bitmap.clear(b);
+                    sh.bitmap
+                        .clear(b)
+                        .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
                 }
             }
         }
@@ -1546,14 +1569,23 @@ impl Fs {
         dev: &FileDevice,
         sb: &superblock::Superblock,
         slot: usize,
-    ) -> Result<(crate::bitmap::Bitmap, Vec<u64>), FsError> {
+    ) -> Result<(crate::bitmap::PagedBitmap, Vec<u64>), FsError> {
+        // S4: do NOT read the full bitmap (RSS bound). The PagedBitmap
+        // pages in on demand; the P3 free counter comes from the
+        // superblock (persisted on commit).
         let base_start = sb.bitmap_start + slot as u64 * sb.bitmap_blocks;
-        let bitmap = store::read_bitmap(dev, sb.block_count, base_start, sb.bitmap_blocks)
-            .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+        // We need an Arc<FileDevice> for the PagedBitmap. The caller
+        // (open_with_sb) will replace the device; for now use a fresh open.
+        // Actually: open_with_sb creates the Arc right after, so we return
+        // the bitmap without a device and attach it there.
+        let mut bitmap = crate::bitmap::PagedBitmap::new(sb.block_count, sb.bitmap_blocks);
+        bitmap.set_total_free(sb.free_blocks);
         // R3 fix: load the persisted deferred-free queue from the bitmap
         // area's padding (after the bitmap bytes). These blocks are
         // unreachable from the committed generation; the caller frees them.
         let deferred = Self::load_deferred_queue(dev, sb, slot)?;
+        // Stash the area start for the caller.
+        bitmap.set_area_start(base_start);
         Ok((bitmap, deferred))
     }
 
@@ -1619,7 +1651,9 @@ impl Fs {
             //   They move to [1]; they become free when N+1 commits.
             let prev_freed = std::mem::take(&mut sh.pending_free[1]);
             for b in prev_freed {
-                sh.bitmap.clear(b);
+                sh.bitmap
+                    .clear(b)
+                    .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
             }
             sh.pending_free[1] = std::mem::take(&mut sh.pending_free[0]);
         }
@@ -1672,51 +1706,61 @@ impl Fs {
                     } else {
                         break;
                     };
-                    sh.bitmap.clear(b);
+                    sh.bitmap
+                        .clear(b)
+                        .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
                     to_free -= 1;
                 }
             }
         }
-        let raw = sh.bitmap.to_bytes();
+        // S4: materialize the bitmap to the target slot's area.
         // R1 fix: write to the *target superblock slot's* bitmap area.
         // Slot s owns area s (bitmap_start + s*blocks). The currently-active
         // slot's area is never touched, so a crash before the slot flip
         // leaves the committed generation's bitmap fully intact.
-        // (The old base_area ping-pong shared areas between slots, which
-        // was the R1 hole.)
         let write_start = self.sb.bitmap_start + target_slot as u64 * blocks;
+        // S4: materialize the paged bitmap to a full Bitmap for the commit
+        // write (correctness over memory on the commit path; the open path
+        // is where RSS matters).
+        let bitmap = sh
+            .bitmap
+            .to_bitmap()
+            .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+        let raw = bitmap.to_bytes();
         let mut buf = vec![0u8; blocks as usize * BLOCK_SIZE];
         let n = raw.len().min(buf.len());
         buf[..n].copy_from_slice(&raw[..n]);
-        // R3 fix: persist the deferred-free queue in the bitmap area's
-        // padding (after the bitmap bytes). On open, these blocks are freed
-        // — they're unreachable from the committed generation. Without this,
-        // the in-memory queue is lost on reopen, leaking the blocks.
-        // (Excess beyond padding was freed above.)
+        // R3: persist the deferred-free queue in the bitmap area's padding.
         {
             let q0 = &sh.pending_free[0];
             let q1 = &sh.pending_free[1];
             let total = q0.len() + q1.len();
             let off = n;
-            // Header: total count (u64). Then block numbers (u64 each).
-            // If the bitmap fills the area (no padding), skip the queue.
             if off + 8 <= buf.len() {
                 let avail = (buf.len() - (off + 8)) / 8;
                 let take = total.min(avail);
                 buf[off..off + 8].copy_from_slice(&(take as u64).to_le_bytes());
                 let mut pos = off + 8;
-                // Write [1] (older) first, then [0].
                 for b in q1.iter().chain(q0.iter()).take(take) {
                     buf[pos..pos + 8].copy_from_slice(&b.to_le_bytes());
                     pos += 8;
                 }
             }
         }
+        // Compute CRCs over the intended bytes.
+        let mut crcs = Vec::with_capacity(blocks as usize);
+        for chunk in buf.chunks_exact(BLOCK_SIZE) {
+            crcs.push(crate::checksum::checksum32(chunk));
+        }
         for (i, chunk) in buf.chunks_exact(BLOCK_SIZE).enumerate() {
             let mut blk = [0u8; BLOCK_SIZE];
             blk.copy_from_slice(chunk);
             sh.dev.write_block(write_start + i as u64, &blk)?;
         }
+        // Update the bitmap's area to the target (slot flip).
+        sh.bitmap.set_area_start(write_start);
+        // Update the bitmap's area to the target (slot flip).
+        sh.bitmap.set_area_start(write_start);
         // P1: sb.bitmap_full_gen/delta_gen no longer updated here (they're
         // legacy from the delta scheme; with per-slot areas and no deltas,
         // they're not needed for correctness).
@@ -1724,18 +1768,21 @@ impl Fs {
         // (bitmap_base_area is retained in the struct for format compat
         // but is no longer used for area selection.)
         *self.last_bitmap_write_bytes.lock().unwrap() = blocks * BLOCK_SIZE as u64;
-        sh.bitmap.clear_dirty();
+        sh.bitmap.mark_all_clean();
         drop(sh);
         *self.commits_since_checkpoint.lock().unwrap() = 0;
         // Update the CRC sidecar for the target slot's area (if CRCs present).
         if self.has_bitmap_crcs {
             let cb = superblock::bitmap_crc_blocks(blocks);
             if cb > 0 {
-                let bitmap_start = self.sb.bitmap_start + target_slot as u64 * blocks;
                 let sidecar_start = self.sb.bitmap_start + 2 * blocks + target_slot as u64 * cb;
-                let mut sh = self.shared.lock().unwrap();
-                // CRC the actual written bytes (bitmap + persisted queue).
-                Self::write_bitmap_crcs(&mut sh.dev, &buf, bitmap_start, blocks, sidecar_start)?;
+                let sh = self.shared.lock().unwrap();
+                // S4: use the CRCs computed during the streaming write
+                // (covers intended bytes, safe under write reordering).
+                // Note: the deferred queue is written after; its bytes are
+                // not CRC'd (matches the old behavior which CRC'd only the
+                // bitmap bytes passed in).
+                Self::write_bitmap_crcs(&sh.dev, blocks, sidecar_start, &crcs)?;
             }
         }
         Ok(())
@@ -1773,7 +1820,9 @@ impl Fs {
             let freed0 = std::mem::take(&mut sh.pending_free[0]);
             let freed1 = std::mem::take(&mut sh.pending_free[1]);
             for b in freed0.into_iter().chain(freed1) {
-                sh.bitmap.clear(b);
+                sh.bitmap
+                    .clear(b)
+                    .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
             }
         }
         // mkfs path: write bitmap to the *active* slot's area (no flip).
@@ -1890,6 +1939,8 @@ impl Fs {
         new_sb.live_extents = self.extents.store_handle().lock().unwrap().live() as u64;
         new_sb.live_snaps = self.snaps.store_handle().lock().unwrap().live() as u64;
         new_sb.has_live_counts = true;
+        // S4: persist the P3 free-block counter.
+        new_sb.free_blocks = self.shared.lock().unwrap().bitmap.free_count();
         Ok(Some(PreparedCommit {
             new_sb,
             slot: new_slot,
@@ -2227,7 +2278,13 @@ impl Fs {
     /// Simulates a lost free or bitmap corruption for reclaim testing.
     /// Not for production use.
     pub fn debug_set_bitmap_bit(&mut self, block: u64) {
-        self.shared.lock().unwrap().bitmap.set(block);
+        self.shared
+            .lock()
+            .unwrap()
+            .bitmap
+            .set(block)
+            .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))
+            .unwrap();
     }
 
     /// Full consistency check of the committed state.
@@ -2282,7 +2339,7 @@ impl Fs {
         }
 
         // Reconcile against the active bitmap area.
-        let sh = self.shared.lock().unwrap();
+        let mut sh = self.shared.lock().unwrap();
         let cb = superblock::bitmap_crc_blocks(self.sb.bitmap_blocks);
         // R6: the lease block sits at 2 and the bitmap starts at
         // `bitmap_start` (3 on R6+ images, 2 on legacy images).
@@ -2296,7 +2353,11 @@ impl Fs {
         // intentionally unreachable (they'll be freed on the next commit).
         // Exclude them from the unreachable check.
         for b in 0..self.sb.block_count {
-            if !sh.bitmap.test(b) {
+            if !sh
+                .bitmap
+                .test(b)
+                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?
+            {
                 continue;
             }
             allocated_blocks += 1;
@@ -2309,7 +2370,11 @@ impl Fs {
             }
         }
         for &b in &reachable {
-            if !sh.bitmap.test(b) {
+            if !sh
+                .bitmap
+                .test(b)
+                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?
+            {
                 return Err(FsError::Invalid(format!(
                     "reachable block {b} not marked allocated"
                 )));
@@ -2377,8 +2442,16 @@ impl Fs {
                 .copied()
                 .collect();
             for b in reserved..self.sb.block_count {
-                if sh.bitmap.test(b) && !reachable.contains(&b) && !deferred.contains(&b) {
-                    sh.bitmap.clear(b);
+                if sh
+                    .bitmap
+                    .test(b)
+                    .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?
+                    && !reachable.contains(&b)
+                    && !deferred.contains(&b)
+                {
+                    sh.bitmap
+                        .clear(b)
+                        .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
                     reclaimed += 1;
                 }
             }
@@ -2395,6 +2468,7 @@ impl Fs {
             .unwrap()
             .bitmap
             .alloc()
+            .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?
             .ok_or(FsError::NoSpace)?;
         self.txg_allocated.lock().unwrap().insert(blk);
         Ok(blk)
@@ -2405,10 +2479,17 @@ impl Fs {
     fn alloc_block_hint(&mut self, hint: u64) -> Result<u64, FsError> {
         let blk = {
             let mut sh = self.shared.lock().unwrap();
-            if sh.bitmap.alloc_at(hint) {
+            if sh
+                .bitmap
+                .alloc_at(hint)
+                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?
+            {
                 hint
             } else {
-                sh.bitmap.alloc().ok_or(FsError::NoSpace)?
+                sh.bitmap
+                    .alloc()
+                    .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?
+                    .ok_or(FsError::NoSpace)?
             }
         };
         self.txg_allocated.lock().unwrap().insert(blk);
@@ -4317,20 +4398,20 @@ mod tests {
         // Update the CRC sidecar so open() doesn't fail with BitmapCorrupt
         // (we're testing check(), not the CRC verification).
         {
-            use crate::bitmap::Bitmap;
             let bblocks = sb.bitmap_blocks;
             let cb = superblock::bitmap_crc_blocks(bblocks);
             if cb > 0 {
-                // Read the modified bitmap area.
-                let mut raw = vec![0u8; (bblocks as usize) * BLOCK_SIZE];
-                for i in 0..bblocks {
-                    dev.read_block(area_start + i, &mut blk).unwrap();
-                    let dst = (i as usize) * BLOCK_SIZE;
-                    raw[dst..dst + BLOCK_SIZE].copy_from_slice(&blk);
-                }
                 let bitmap_start = sb.bitmap_start + slot as u64 * bblocks;
                 let sidecar_start = sb.bitmap_start + 2 * bblocks + slot as u64 * cb;
-                Fs::write_bitmap_crcs(&dev, &raw, bitmap_start, bblocks, sidecar_start).unwrap();
+                // Compute CRCs by reading the area (test helper, no fault injection).
+                use crate::block::BlockDevice;
+                let mut blk = [0u8; BLOCK_SIZE];
+                let mut crcs = Vec::with_capacity(bblocks as usize);
+                for p in 0..bblocks {
+                    dev.read_block(bitmap_start + p, &mut blk).unwrap();
+                    crcs.push(crate::checksum::checksum32(&blk));
+                }
+                Fs::write_bitmap_crcs(&dev, bblocks, sidecar_start, &crcs).unwrap();
             }
         }
         dev.sync().unwrap();

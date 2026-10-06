@@ -199,11 +199,17 @@ fn do_send(
         }
         Some(_) => {
             eprintln!("stale or divergent state: falling back to full send");
-            blocks.extend(fs.allocated_blocks());
+            blocks.extend(
+                fs.allocated_blocks()
+                    .map_err(|e| format!("allocated_blocks: {e:?}"))?,
+            );
             false
         }
         None => {
-            blocks.extend(fs.allocated_blocks());
+            blocks.extend(
+                fs.allocated_blocks()
+                    .map_err(|e| format!("allocated_blocks: {e:?}"))?,
+            );
             false
         }
     };

@@ -110,7 +110,9 @@ pub struct Shared {
     /// the Shared mutex (positional pread/pwrite need no file-level lock).
     /// Writers still take the Shared lock for bitmap/device atomicity.
     pub dev: Arc<FileDevice>,
-    pub bitmap: crate::bitmap::Bitmap,
+    /// S4: paged bitmap (bounded memory). Pages load on demand from the
+    /// active bitmap area; dirty pages flush on commit.
+    pub bitmap: crate::bitmap::PagedBitmap,
     /// Blocks freed in the current (uncommitted) transaction ([0]) and the
     /// previous transaction ([1]). R3 fix: two-generation deferred free.
     ///
@@ -616,6 +618,7 @@ impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
             .unwrap()
             .bitmap
             .alloc()
+            .map_err(StoreError::Io)?
             .ok_or(StoreError::NoSpace)?;
         // Fresh blocks start a new generation. Reused blocks keep bumping it
         // so stale in-memory ids can never alias the new node.
@@ -783,16 +786,20 @@ mod tests {
                 n
             ));
             let dev = FileDevice::create(&path, blocks).unwrap();
-            let mut bitmap = Bitmap::new(blocks);
-            bitmap.set(0); // reserved
-            write_bitmap(&dev, &bitmap, 1, bitmap_blocks_for(blocks)).unwrap();
-            // Reserve the bitmap blocks themselves.
-            for b in 1..1 + bitmap_blocks_for(blocks) {
-                bitmap.set(b);
+            let dev = Arc::new(dev);
+            let bblocks = bitmap_blocks_for(blocks);
+            let mut bitmap =
+                crate::bitmap::PagedBitmap::new(blocks, bblocks).with_device(Arc::clone(&dev), 1);
+            bitmap.set(0).unwrap(); // reserved
+                                    // Reserve the bitmap blocks themselves.
+            for b in 1..1 + bblocks {
+                bitmap.set(b).unwrap();
             }
+            bitmap.flush_dirty().unwrap();
+            bitmap.mark_all_clean();
             TestDevice {
                 shared: Arc::new(Mutex::new(Shared {
-                    dev: Arc::new(dev),
+                    dev: Arc::clone(&dev),
                     bitmap,
                     pending_free: [Vec::new(), Vec::new()],
                     fault_point: None,
