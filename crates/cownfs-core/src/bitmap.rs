@@ -713,7 +713,12 @@ impl PagedBitmap {
             if self.free_counts[page as usize] > 0 {
                 // Ensure cached (may have been evicted).
                 self.ensure_cached(page)?;
-                self.cursor = page + 1;
+                // N13: keep the cursor on this page (don't advance to page+1).
+                // Consecutive allocations should try the same 128 MiB region
+                // first for locality; only move on when the page is full.
+                // (The old code did `self.cursor = page + 1`, scattering
+                // every WRITE's first block and every B-tree node.)
+                self.cursor = page;
                 return Ok(self.alloc_in_page(page));
             }
         }
