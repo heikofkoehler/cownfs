@@ -1735,43 +1735,49 @@ impl Fs {
         // slot's area is never touched, so a crash before the slot flip
         // leaves the committed generation's bitmap fully intact.
         let write_start = self.sb.bitmap_start + target_slot as u64 * blocks;
-        // S4: materialize the paged bitmap to a full Bitmap for the commit
-        // write (correctness over memory on the commit path; the open path
-        // is where RSS matters).
-        let bitmap = sh
-            .bitmap
-            .to_bitmap()
-            .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
-        let raw = bitmap.to_bytes();
-        let mut buf = vec![0u8; blocks as usize * BLOCK_SIZE];
-        let n = raw.len().min(buf.len());
-        buf[..n].copy_from_slice(&raw[..n]);
-        // R3: persist the deferred-free queue in the bitmap area's padding.
-        {
-            let q0 = &sh.pending_free[0];
-            let q1 = &sh.pending_free[1];
-            let total = q0.len() + q1.len();
-            let off = n;
-            if off + 8 <= buf.len() {
-                let avail = (buf.len() - (off + 8)) / 8;
-                let take = total.min(avail);
-                buf[off..off + 8].copy_from_slice(&(take as u64).to_le_bytes());
-                let mut pos = off + 8;
-                for b in q1.iter().chain(q0.iter()).take(take) {
-                    buf[pos..pos + 8].copy_from_slice(&b.to_le_bytes());
+        // N11: stream pages directly instead of materializing 3× the bitmap
+        // in memory (to_bitmap + to_bytes + buf). For each page: load words
+        // (from cache or disk), encode, write, CRC. O(bitmap) time but O(1)
+        // memory.
+        let mut crcs = Vec::with_capacity(blocks as usize);
+        for page_idx in 0..blocks {
+            let words = sh
+                .bitmap
+                .get_page_or_load(page_idx)
+                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+            let mut blk = [0u8; BLOCK_SIZE];
+            for (i, w) in words.iter().enumerate() {
+                blk[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+            }
+            // R3: on the last block, append the deferred-free queue to the
+            // padding after the bitmap data. Offset must match
+            // load_deferred_queue: bitmap_bytes = ceil(block_count/64)*8.
+            if page_idx + 1 == blocks {
+                let q0 = &sh.pending_free[0];
+                let q1 = &sh.pending_free[1];
+                let total = q0.len() + q1.len();
+                let bitmap_bytes = ((self.sb.block_count + 63) / 64) as usize * 8;
+                let off_in_block = bitmap_bytes % BLOCK_SIZE;
+                // The queue goes at bitmap_bytes; if it spans blocks, we'd
+                // need to handle it, but for now assume it fits in the last
+                // block's padding (matches old behavior where buf was
+                // blocks*BLOCK_SIZE and queue was at offset n=bitmap_bytes).
+                if off_in_block + 8 <= BLOCK_SIZE {
+                    let avail = (BLOCK_SIZE - (off_in_block + 8)) / 8;
+                    let take = total.min(avail);
+                    let mut pos = off_in_block;
+                    blk[pos..pos + 8].copy_from_slice(&(take as u64).to_le_bytes());
                     pos += 8;
+                    for b in q1.iter().chain(q0.iter()).take(take) {
+                        if pos + 8 <= BLOCK_SIZE {
+                            blk[pos..pos + 8].copy_from_slice(&b.to_le_bytes());
+                            pos += 8;
+                        }
+                    }
                 }
             }
-        }
-        // Compute CRCs over the intended bytes.
-        let mut crcs = Vec::with_capacity(blocks as usize);
-        for chunk in buf.chunks_exact(BLOCK_SIZE) {
-            crcs.push(crate::checksum::checksum32(chunk));
-        }
-        for (i, chunk) in buf.chunks_exact(BLOCK_SIZE).enumerate() {
-            let mut blk = [0u8; BLOCK_SIZE];
-            blk.copy_from_slice(chunk);
-            sh.dev.write_block(write_start + i as u64, &blk)?;
+            crcs.push(crate::checksum::checksum32(&blk));
+            sh.dev.write_block(write_start + page_idx, &blk)?;
         }
         // Update the bitmap's area to the target (slot flip).
         sh.bitmap.set_area_start(write_start);

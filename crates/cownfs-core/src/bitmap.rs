@@ -563,6 +563,14 @@ impl PagedBitmap {
         self.cache.get(&page_idx)
     }
 
+    /// Ensure a page is cached (loading from disk if needed) and return
+    /// its words. Used by the commit path to stream pages without
+    /// materializing the full bitmap (N11).
+    pub fn get_page_or_load(&mut self, page_idx: u64) -> io::Result<&[u64; WORDS_PER_PAGE]> {
+        self.ensure_cached(page_idx)?;
+        Ok(self.cache.get(&page_idx).expect("just cached"))
+    }
+
     /// Dirty page indices.
     pub fn dirty_page_indices(&self) -> Vec<u64> {
         self.dirty_pages.iter().copied().collect()
