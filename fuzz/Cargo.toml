@@ -41,3 +41,14 @@ test = false
 doc = false
 
 [workspace]
+[[bin]]
+name = "fuzz_referral"
+path = "fuzz_targets/fuzz_referral.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_backup"
+path = "fuzz_targets/fuzz_backup.rs"
+test = false
+doc = false

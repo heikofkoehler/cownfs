@@ -32,6 +32,11 @@ impl ReferralTable {
     /// Blank lines and `#` comments are ignored.
     pub fn load(path: &Path) -> std::io::Result<Self> {
         let text = std::fs::read_to_string(path)?;
+        Self::parse(&text)
+    }
+
+    /// Parse referral config from text. Exposed for fuzzing (T3).
+    pub fn parse(text: &str) -> std::io::Result<Self> {
         let mut t = Self::new();
         for (lineno, line) in text.lines().enumerate() {
             let line = line.trim();
