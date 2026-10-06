@@ -1,0 +1,61 @@
+name: Nightly (fuzz + loom + chaos)
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # 2am UTC daily
+  workflow_dispatch:      # manual trigger from Actions tab
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_rpc_frame
+          - fuzz_xdr_compound
+          - fuzz_decode_node
+          - fuzz_superblock
+          - fuzz_referral
+          - fuzz_backup
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/rustup@v1
+        with:
+          toolchain: nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz ${{ matrix.target }} (1h)
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=3600
+        working-directory: fuzz
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+
+  loom:
+    name: Loom concurrency models
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/rustup@v1
+        with:
+          toolchain: stable
+      - name: Run loom tests (release)
+        run: cargo test --release --test t4_loom
+        # Loom is CPU-intensive; may take 30+ min on 2-core GH runners
+
+  chaos:
+    name: T7 chaos (1h SIGKILL loop)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/rustup@v1
+        with:
+          toolchain: stable
+      - name: Run 1-hour chaos
+        run: cargo test --release --test t7_chaos t7_chaos_nightly -- --ignored --nocapture
+        timeout-minutes: 70
