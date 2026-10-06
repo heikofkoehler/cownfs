@@ -7,7 +7,7 @@ use cownfs_nfs::server;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: cownfs-server [--read-only] [--ds-addr <addr>] [--referrals <file>] [--node-id <id>] [--lease-ttl <secs>] [--snapshot-policy <spec>] [--txg-interval-ms <ms>] [--quota <uid>:<blocks>]... <image> [addr]");
+        eprintln!("usage: cownfs-server [--read-only] [--ds-addr <addr>] [--referrals <file>] [--node-id <id>] [--server-id <u32>] [--lease-ttl <secs>] [--snapshot-policy <spec>] [--txg-interval-ms <ms>] [--quota <uid>:<blocks>]... <image> [addr]");
         std::process::exit(1);
     }
     let read_only = args.iter().any(|a| a == "--read-only");
@@ -26,6 +26,33 @@ fn main() {
         .position(|a| a == "--node-id")
         .and_then(|i| args.get(i + 1))
         .cloned();
+    // Server id qualifying issued clientids/stateids
+    // (docs/v40-state-partitioning.md §4.2). Explicit --server-id wins;
+    // otherwise derive one from --node-id (FNV-1a hash, folded to 32 bits);
+    // otherwise 0 (single-server default). Primary/standby pairs in an HA
+    // setup must use distinct ids — prefer explicit --server-id there.
+    fn fnv1a_64(s: &str) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in s.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+    let server_id_arg = args
+        .iter()
+        .position(|a| a == "--server-id")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let server_id: u32 = server_id_arg
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| {
+            node_id
+                .as_ref()
+                .map(|n| ((fnv1a_64(n) ^ (fnv1a_64(n) >> 32)) as u32).max(1))
+        })
+        .unwrap_or(0);
     let log_level = args
         .iter()
         .position(|a| a == "--log-level")
@@ -76,6 +103,7 @@ fn main() {
                 && *a != "--ds-addr"
                 && *a != "--referrals"
                 && *a != "--node-id"
+                && *a != "--server-id"
                 && *a != "--lease-ttl"
                 && *a != "--log-level"
                 && *a != "--snapshot-policy"
@@ -97,6 +125,7 @@ fn main() {
                         .and_then(|i| args.get(i + 1))
                 && Some(*a) != snapshot_policy.as_ref()
                 && Some(*a) != txg_interval_arg.as_ref()
+                && Some(*a) != server_id_arg.as_ref()
                 && !quota_args.iter().any(|q| *a == q)
         })
         .collect();
@@ -174,6 +203,8 @@ fn main() {
     } else {
         server::Shared::new(fs)
     };
+    shared.set_server_id(server_id);
+    eprintln!("server-id {server_id} (qualifies clientids/stateids)");
     let shared = match ds_addr {
         Some(a) => shared.with_ds_addr(a),
         None => shared,

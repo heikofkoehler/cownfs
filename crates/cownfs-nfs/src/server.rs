@@ -301,6 +301,19 @@ impl Shared {
             .store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Set the server id used to qualify issued clientids/stateids
+    /// (docs/v40-state-partitioning.md §4.2). Must be called before the
+    /// server accepts clients. Every shard primary (and its standbys)
+    /// needs a distinct id; 0 is the single-server default.
+    pub fn set_server_id(&self, server_id: u32) {
+        self.state.lock().unwrap().set_server_id(server_id);
+    }
+
+    /// The server id this instance qualifies clientids/stateids with.
+    pub fn server_id(&self) -> u32 {
+        self.state.lock().unwrap().server_id()
+    }
+
     pub fn new_read_only(fs: Fs, image_path: Option<std::path::PathBuf>) -> Self {
         let txg = fs.txg();
         Shared {

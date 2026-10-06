@@ -64,21 +64,103 @@ pub struct StateManager {
     clients: HashMap<u64, ClientRecord>,
     opens: HashMap<(u64, Vec<u8>), OpenRecord>,
     locks: HashMap<(u64, Vec<u8>), LockRecord>,
-    next_clientid: u64,
-    next_stateid_other: u64,
+    /// Unique per shard primary (see docs/v40-state-partitioning.md §4.2).
+    /// Occupies the high 32 bits of every clientid this server issues, so
+    /// two servers never issue the same clientid and a standby never
+    /// reissues a dead primary's ids.
+    server_id: u32,
+    /// Random per process boot; embedded in every stateid's `other` field
+    /// so a stateid minted before a restart can never alias one minted
+    /// after (defense for the future state-log/WAL replay path).
+    boot_gen: u32,
+    /// Low 32 bits of the next clientid. Never 0 (0 clientid = invalid).
+    next_client_seq: u32,
+    next_stateid_seq: u32,
     lease_duration: Duration,
+}
+
+/// Generate a random boot generation from OS entropy, falling back to a
+/// time+pid mix if /dev/urandom is unavailable.
+fn random_boot_gen() -> u32 {
+    let mut b = [0u8; 4];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b))
+        .is_ok()
+    {
+        return u32::from_ne_bytes(b);
+    }
+    // Fallback: nanos since epoch mixed with pid. Only needs uniqueness
+    // across boots of one server, not cryptographic strength.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let pid = std::process::id() as u64;
+    let mut x = nanos ^ pid.wrapping_mul(0x9e3779b97f4a7c15);
+    x ^= x >> 29;
+    x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+    x ^= x >> 32;
+    x as u32
 }
 
 impl StateManager {
     pub fn new() -> Self {
+        Self::with_server_id(0)
+    }
+
+    /// Create a StateManager that qualifies all issued ids with `server_id`.
+    /// Every shard primary (and its standbys) must use a distinct server id;
+    /// see docs/v40-state-partitioning.md §4.2.
+    pub fn with_server_id(server_id: u32) -> Self {
         StateManager {
             clients: HashMap::new(),
             opens: HashMap::new(),
             locks: HashMap::new(),
-            next_clientid: 1,
-            next_stateid_other: 1,
+            server_id,
+            boot_gen: random_boot_gen(),
+            next_client_seq: 1,
+            next_stateid_seq: 1,
             lease_duration: LEASE_DURATION,
         }
+    }
+
+    /// Change the server id. Must be called before the server starts
+    /// accepting clients (no issued ids may exist yet).
+    pub fn set_server_id(&mut self, server_id: u32) {
+        assert!(
+            self.clients.is_empty(),
+            "set_server_id after clients were registered"
+        );
+        self.server_id = server_id;
+    }
+
+    /// The server id this manager qualifies ids with.
+    pub fn server_id(&self) -> u32 {
+        self.server_id
+    }
+
+    /// Extract the issuing server id from a clientid.
+    pub fn clientid_server_id(clientid: u64) -> u32 {
+        (clientid >> 32) as u32
+    }
+
+    /// Extract the issuing server id from a stateid's `other` field.
+    pub fn stateid_server_id(stateid: &StateId) -> u32 {
+        u32::from_be_bytes(stateid.other[0..4].try_into().unwrap())
+    }
+
+    /// Extract the boot generation from a stateid's `other` field.
+    pub fn stateid_boot_gen(stateid: &StateId) -> u32 {
+        u32::from_be_bytes(stateid.other[4..8].try_into().unwrap())
+    }
+
+    /// True if this stateid was minted by this server in this boot.
+    /// Used by the future standby/failover path to tell locally-minted
+    /// state from a previous incarnation's (which must fail clean with
+    /// STALE_STATEID, never alias).
+    pub fn owns_stateid(&self, stateid: &StateId) -> bool {
+        Self::stateid_server_id(stateid) == self.server_id
+            && Self::stateid_boot_gen(stateid) == self.boot_gen
     }
 
     /// For tests: use a short lease.
@@ -89,13 +171,14 @@ impl StateManager {
     }
 
     fn new_stateid(&mut self) -> StateId {
-        let other = self.next_stateid_other;
-        self.next_stateid_other += 1;
+        let seq = self.next_stateid_seq;
+        // Skip 0 on wrap; 0 is not special on the wire, this just keeps
+        // the sequence dense and avoids reusing the initial value.
+        self.next_stateid_seq = seq.wrapping_add(1).max(1);
         let mut b = [0u8; 12];
-        b[..8].copy_from_slice(&other.to_be_bytes());
-        // Last 4 bytes: random-ish (use other again)
-        let r = (other.wrapping_mul(0x9e3779b9) >> 32) as u32;
-        b[8..].copy_from_slice(&r.to_be_bytes());
+        b[0..4].copy_from_slice(&self.server_id.to_be_bytes());
+        b[4..8].copy_from_slice(&self.boot_gen.to_be_bytes());
+        b[8..12].copy_from_slice(&seq.to_be_bytes());
         StateId { seqid: 0, other: b }
     }
 
@@ -159,8 +242,12 @@ impl StateManager {
                 }
             }
             None => {
-                let id = self.next_clientid;
-                self.next_clientid += 1;
+                // Server-qualified clientid: high 32 bits = server id, low
+                // 32 bits = local sequence. Two servers never issue the
+                // same clientid; low bits never 0 (0 = invalid clientid).
+                let seq = self.next_client_seq;
+                self.next_client_seq = seq.wrapping_add(1).max(1);
+                let id = ((self.server_id as u64) << 32) | (seq as u64);
                 self.clients.insert(
                     id,
                     ClientRecord {
@@ -497,5 +584,100 @@ mod tests {
         // c2 locks non-overlapping [2000,3000) — should succeed.
         sm.lock(cid2, b"l2".to_vec(), 1, 2, 2000, 1000, Some(&o2.stateid))
             .unwrap();
+    }
+
+    // --- Server-qualified ids (docs/v40-state-partitioning.md §4.2) ---
+
+    #[test]
+    fn server_id_qualifies_clientids() {
+        let mut sm = StateManager::with_server_id(0x1234_5678);
+        let (cid1, _) = sm.setclientid([1u8; 8], b"c1".to_vec());
+        let (cid2, _) = sm.setclientid([2u8; 8], b"c2".to_vec());
+        // High 32 bits carry the server id; low 32 bits are the sequence.
+        assert_eq!(StateManager::clientid_server_id(cid1), 0x1234_5678);
+        assert_eq!(StateManager::clientid_server_id(cid2), 0x1234_5678);
+        assert_eq!(cid1 & 0xffff_ffff, 1);
+        assert_eq!(cid2 & 0xffff_ffff, 2);
+        assert_eq!(cid1 >> 32, 0x1234_5678);
+    }
+
+    #[test]
+    fn default_server_id_preserves_legacy_layout() {
+        // Server id 0 keeps the old wire shape: clientids are 1, 2, 3...
+        let mut sm = StateManager::new();
+        let (cid1, _) = sm.setclientid([1u8; 8], b"c1".to_vec());
+        let (cid2, _) = sm.setclientid([2u8; 8], b"c2".to_vec());
+        assert_eq!(cid1, 1);
+        assert_eq!(cid2, 2);
+    }
+
+    #[test]
+    fn two_servers_never_issue_same_clientid() {
+        // The failover hazard: a standby must never reissue the dead
+        // primary's clientids.
+        let mut primary = StateManager::with_server_id(7);
+        let mut standby = StateManager::with_server_id(8);
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..100 {
+            let (c1, _) = primary.setclientid([1u8; 8], format!("p{i}").into_bytes());
+            let (c2, _) = standby.setclientid([1u8; 8], format!("s{i}").into_bytes());
+            assert!(seen.insert(c1), "primary reissued clientid {c1:#x}");
+            assert!(
+                seen.insert(c2),
+                "standby aliased primary's clientid {c2:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn stateid_carries_server_id_and_boot_gen() {
+        let mut sm = StateManager::with_server_id(42);
+        let (cid, _) = sm.setclientid([1u8; 8], b"c1".to_vec());
+        sm.confirm(cid, [1u8; 8]);
+        let o = sm.open(1, cid, b"o1".to_vec(), 1, 3, 0).unwrap();
+        assert_eq!(StateManager::stateid_server_id(&o.stateid), 42);
+        assert!(sm.owns_stateid(&o.stateid));
+        // A stateid from another server is not ours.
+        let mut other = StateManager::with_server_id(43);
+        assert!(!other.owns_stateid(&o.stateid));
+    }
+
+    #[test]
+    fn stateid_does_not_alias_across_boots() {
+        // Two boots of the same server id get different boot generations,
+        // so a pre-restart stateid can never equal a post-restart one.
+        // (With overwhelming probability; /dev/urandom-backed.)
+        let mut boot1 = StateManager::with_server_id(9);
+        let mut boot2 = StateManager::with_server_id(9);
+        let (cid1, _) = boot1.setclientid([1u8; 8], b"c".to_vec());
+        let (cid2, _) = boot2.setclientid([1u8; 8], b"c".to_vec());
+        boot1.confirm(cid1, [1u8; 8]);
+        boot2.confirm(cid2, [1u8; 8]);
+        let o1 = boot1.open(1, cid1, b"o".to_vec(), 1, 3, 0).unwrap();
+        let o2 = boot2.open(1, cid2, b"o".to_vec(), 1, 3, 0).unwrap();
+        assert_ne!(
+            StateManager::stateid_boot_gen(&o1.stateid),
+            StateManager::stateid_boot_gen(&o2.stateid),
+            "boot generations collided"
+        );
+        assert_ne!(o1.stateid, o2.stateid);
+        assert!(boot1.owns_stateid(&o1.stateid));
+        assert!(!boot1.owns_stateid(&o2.stateid));
+        assert!(!boot2.owns_stateid(&o1.stateid));
+    }
+
+    #[test]
+    fn set_server_id_rejected_after_registration() {
+        let mut sm = StateManager::new();
+        sm.set_server_id(5);
+        assert_eq!(sm.server_id(), 5);
+        let (cid, _) = sm.setclientid([1u8; 8], b"c".to_vec());
+        assert_eq!(StateManager::clientid_server_id(cid), 5);
+        // Changing the id after ids were issued would break the
+        // no-aliasing invariant: must panic.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sm.set_server_id(6);
+        }));
+        assert!(r.is_err());
     }
 }
