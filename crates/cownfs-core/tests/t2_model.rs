@@ -44,6 +44,7 @@ fn disc(e: &FsError) -> &'static str {
         FsError::Fenced => "Fenced",
         FsError::IncompatibleFeature(_) => "IncompatibleFeature",
         FsError::ReadOnly => "ReadOnly",
+        FsError::Locked(_) => "Locked",
     }
 }
 

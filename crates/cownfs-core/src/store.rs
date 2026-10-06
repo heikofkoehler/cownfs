@@ -8,7 +8,8 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::bitmap::Bitmap;
 use crate::block::{BlockDevice, FileDevice};
@@ -297,7 +298,7 @@ fn decode_node<K: BlockCodec, V: BlockCodec>(
 }
 
 struct CacheEntry<K, V> {
-    node: Node<K, V>,
+    node: Arc<Node<K, V>>,
     gen: u32,
     dirty: bool,
     /// True once the entry's block belongs to the last committed
@@ -308,6 +309,15 @@ struct CacheEntry<K, V> {
     frozen: bool,
 }
 
+/// LRU state for cache eviction (interior mutability for `&self` methods).
+struct LruState {
+    /// Block indices in use order (index 0 = least recently used,
+    /// back = most recently used).
+    stack: Vec<u64>,
+    /// Maps a block index to its position in `stack` (O(1) hits).
+    index: HashMap<u64, usize>,
+}
+
 /// Block-backed [`NodeStore`]: nodes live in 4 KiB blocks, cached in memory
 /// and written back on [`flush`](NodeStore::flush).
 pub struct BlockArena<K, V> {
@@ -315,16 +325,14 @@ pub struct BlockArena<K, V> {
     /// P4: direct device handle for cache-miss reads, bypassing the
     /// Shared mutex. Cloned from `shared` at construction.
     dev: Arc<FileDevice>,
-    cache: HashMap<u64, CacheEntry<K, V>>,
+    /// Node cache with interior mutability: `get(&self)` takes a read lock
+    /// (parallel readers), `with_mut` takes a write lock. Cache-miss I/O
+    /// is done without holding the lock.
+    cache: RwLock<HashMap<u64, CacheEntry<K, V>>>,
     /// Indexed LRU for cache eviction.
-    /// `lru_stack` holds block indices in use order (index 0 = least
-    /// recently used, back = most recently used). `lru_index` maps a
-    /// block index to its position in `lru_stack`, making cache hits
-    /// O(1) (the old VecDeque `position()` scan was O(n)).
-    lru_stack: Vec<u64>,
-    lru_index: HashMap<u64, usize>,
+    lru: Mutex<LruState>,
     /// Blocks currently allocated to this arena's nodes (leak-check aid).
-    alloc_count: u64,
+    alloc_count: AtomicU64,
 }
 
 /// Maximum cached nodes per arena (A5: bounds memory; ~40 MiB for 10k nodes).
@@ -347,168 +355,168 @@ impl<K, V> BlockArena<K, V> {
         BlockArena {
             shared,
             dev,
-            cache: HashMap::new(),
-            lru_stack: Vec::new(),
-            lru_index: HashMap::new(),
-            alloc_count: 0,
+            cache: RwLock::new(HashMap::new()),
+            lru: Mutex::new(LruState {
+                stack: Vec::new(),
+                index: HashMap::new(),
+            }),
+            alloc_count: AtomicU64::new(0),
         }
     }
 
     /// Remove `idx` from the LRU position index (if present). O(1).
-    fn lru_remove(&mut self, idx: u64) {
-        if let Some(&pos) = self.lru_index.get(&idx) {
-            self.lru_remove_at(pos);
+    fn lru_remove(&self, idx: u64) {
+        let mut lru = self.lru.lock().unwrap();
+        if let Some(&pos) = lru.index.get(&idx) {
+            Self::lru_remove_at(&mut lru, pos);
         }
     }
 
-    /// Remove the entry at `pos` from `lru_stack`, fixing up the index
+    /// Remove the entry at `pos` from `lru.stack`, fixing up the index
     /// of the element swapped into its place. O(1).
-    fn lru_remove_at(&mut self, pos: usize) {
-        let idx = self.lru_stack[pos];
-        self.lru_index.remove(&idx);
-        let last = self.lru_stack.len() - 1;
+    fn lru_remove_at(lru: &mut LruState, pos: usize) {
+        let idx = lru.stack[pos];
+        lru.index.remove(&idx);
+        let last = lru.stack.len() - 1;
         if pos != last {
-            self.lru_stack.swap(pos, last);
-            let moved = self.lru_stack[pos];
-            self.lru_index.insert(moved, pos);
+            lru.stack.swap(pos, last);
+            let moved = lru.stack[pos];
+            lru.index.insert(moved, pos);
         }
-        self.lru_stack.pop();
+        lru.stack.pop();
     }
 
     /// Record a use of `idx` (move to most-recently-used). O(1).
-    fn lru_touch(&mut self, idx: u64) {
+    fn lru_touch(&self, idx: u64) {
         self.lru_remove(idx);
-        let pos = self.lru_stack.len();
-        self.lru_stack.push(idx);
-        self.lru_index.insert(idx, pos);
+        let mut lru = self.lru.lock().unwrap();
+        let pos = lru.stack.len();
+        lru.stack.push(idx);
+        lru.index.insert(idx, pos);
     }
 
     /// Evict the least-recently-used clean node from cache.
     /// Returns the evicted block index, or None if every cached node is
     /// dirty (callers then skip eviction; flush will clean them).
     /// Stale LRU entries (node freed without LRU removal) are cleaned up.
-    fn lru_evict_oldest_clean(&mut self) -> Option<u64> {
+    /// Caller must hold the cache write lock.
+    fn lru_evict_oldest_clean(&self, cache: &mut HashMap<u64, CacheEntry<K, V>>) -> Option<u64> {
+        let mut lru = self.lru.lock().unwrap();
         let mut pos = 0;
-        while pos < self.lru_stack.len() {
-            let idx = self.lru_stack[pos];
-            match self.cache.get(&idx) {
+        while pos < lru.stack.len() {
+            let idx = lru.stack[pos];
+            match cache.get(&idx) {
                 Some(entry) if entry.dirty => {
                     pos += 1; // dirty: cannot evict, try next oldest
                 }
                 Some(_) => {
                     // Oldest clean node: evict from LRU and cache.
-                    self.lru_remove_at(pos);
-                    self.cache.remove(&idx);
+                    Self::lru_remove_at(&mut lru, pos);
+                    cache.remove(&idx);
                     return Some(idx);
                 }
                 None => {
                     // Stale LRU entry (freed without removal): drop it and
                     // re-examine this position (swap moved a new element here).
-                    self.lru_remove_at(pos);
+                    Self::lru_remove_at(&mut lru, pos);
                 }
             }
         }
         None
     }
 
-    /// Allocate a fresh empty root and return the arena in an `Arc<Mutex>`.
-    pub fn new_tree(
-        shared: Arc<Mutex<Shared>>,
-        t: usize,
-    ) -> Result<(Arc<Mutex<Self>>, NodeId), StoreError>
+    /// Allocate a fresh empty root and return the arena in an `Arc`.
+    pub fn new_tree(shared: Arc<Mutex<Shared>>, t: usize) -> Result<(Arc<Self>, NodeId), StoreError>
     where
         K: BlockCodec + Ord + Clone,
         V: BlockCodec + Clone,
     {
-        let mut arena = Self::new(shared, t);
+        let arena = Self::new(shared, t);
         let root = arena.alloc(Node::leaf())?;
-        Ok((Arc::new(Mutex::new(arena)), root))
+        Ok((Arc::new(arena), root))
     }
 
     /// Load a node into the cache (verifying magic/checksum/generation).
-    fn load(&mut self, id: NodeId) -> Result<&CacheEntry<K, V>, StoreError>
+    /// Ensure the node is in cache, loading from disk on miss.
+    /// Cache-miss I/O is done without holding the cache lock, so parallel
+    /// readers are not blocked by a miss.
+    fn ensure_loaded(&self, id: NodeId) -> Result<(), StoreError>
     where
         K: BlockCodec,
         V: BlockCodec,
     {
-        if !self.cache.contains_key(&id.idx) {
-            let mut buf = [0u8; BLOCK_SIZE];
-            // P4: cache-miss I/O goes straight to the device, bypassing the
-            // Shared mutex (the arena's own lock is already held by the
-            // caller via BTree).
-            self.dev.read_block(id.idx, &mut buf)?;
-            let (node, gen) = decode_node::<K, V>(id.idx, &buf)?;
-            // A stale id (wrong generation) means a use-after-free bug: the
-            // block was recycled for another node. R4: return Corrupt instead
-            // of panicking (like a checksum failure).
-            if gen != id.gen {
-                return Err(StoreError::Corrupt {
-                    block: id.idx,
-                    what: "stale NodeId generation",
-                });
+        // Fast path: read lock, check cache.
+        {
+            let cache = self.cache.read().unwrap();
+            if let Some(e) = cache.get(&id.idx) {
+                // The generation check applies on cache hits too: the block may
+                // have been freed and reallocated since `id` was issued, in which
+                // case the cached entry belongs to a different node generation.
+                if e.gen != id.gen {
+                    return Err(StoreError::Corrupt {
+                        block: id.idx,
+                        what: "stale NodeId generation",
+                    });
+                }
+                return Ok(());
             }
-            // A5: LRU eviction if cache is full. Only evict clean nodes;
-            // dirty nodes must be flushed first. If all nodes are dirty,
-            // we skip eviction (cache grows temporarily; flush will clean
-            // them).
-            if self.cache.len() >= MAX_CACHE_NODES {
-                self.lru_evict_oldest_clean();
-            }
-            self.cache.insert(
-                id.idx,
-                CacheEntry {
-                    node,
-                    gen,
-                    dirty: false,
-                    frozen: true,
-                },
-            );
-            self.lru_touch(id.idx);
-        } else {
-            // The generation check applies on cache hits too: the block may
-            // have been freed and reallocated since `id` was issued, in which
-            // case the cached entry belongs to a different node generation.
-            // R4: return Corrupt instead of panicking. A panic while holding
-            // RwLock<Fs> would poison the lock, taking down the server.
-            let gen = self.cache[&id.idx].gen;
-            if gen != id.gen {
-                return Err(StoreError::Corrupt {
-                    block: id.idx,
-                    what: "stale NodeId generation",
-                });
-            }
-            // A5: move to most-recent on hit. O(1) via the position index
-            // (the old VecDeque `position()` scan was O(n)).
-            self.lru_touch(id.idx);
         }
-        Ok(&self.cache[&id.idx])
+        // Miss: do I/O without holding the lock.
+        // P4: cache-miss I/O goes straight to the device, bypassing the
+        // Shared mutex.
+        let mut buf = [0u8; BLOCK_SIZE];
+        self.dev.read_block(id.idx, &mut buf)?;
+        let (node, gen) = decode_node::<K, V>(id.idx, &buf)?;
+        // A stale id (wrong generation) means a use-after-free bug: the
+        // block was recycled for another node. R4: return Corrupt instead
+        // of panicking (like a checksum failure).
+        if gen != id.gen {
+            return Err(StoreError::Corrupt {
+                block: id.idx,
+                what: "stale NodeId generation",
+            });
+        }
+        // Insert under write lock (re-check for a racing loader).
+        {
+            let mut cache = self.cache.write().unwrap();
+            if !cache.contains_key(&id.idx) {
+                // A5: LRU eviction if cache is full. Only evict clean nodes;
+                // dirty nodes must be flushed first. If all nodes are dirty,
+                // we skip eviction (cache grows temporarily; flush will clean
+                // them).
+                if cache.len() >= MAX_CACHE_NODES {
+                    self.lru_evict_oldest_clean(&mut cache);
+                }
+                cache.insert(
+                    id.idx,
+                    CacheEntry {
+                        node: Arc::new(node),
+                        gen,
+                        dirty: false,
+                        frozen: true,
+                    },
+                );
+            }
+        }
+        // A5: move to most-recent on load. O(1) via the position index.
+        self.lru_touch(id.idx);
+        Ok(())
     }
 
-    fn load_mut(&mut self, id: NodeId) -> Result<&mut CacheEntry<K, V>, StoreError>
-    where
-        K: BlockCodec,
-        V: BlockCodec,
-    {
-        self.load(id)?;
-        let e = self.cache.get_mut(&id.idx).expect("just loaded");
-        e.dirty = true;
-        Ok(e)
-    }
-
-    fn free_block(&mut self, block: u64) {
-        self.cache.remove(&block);
-        if block == 12875 {}
+    fn free_block(&self, block: u64) {
+        self.cache.write().unwrap().remove(&block);
+        self.lru_remove(block);
         // Deferred: the bit is cleared at commit, after the new bitmap
         // area is written. See `Shared::pending_free`.
         self.shared.lock().unwrap().pending_free[0].push(block);
-        self.alloc_count -= 1;
+        self.alloc_count.fetch_sub(1, Ordering::Relaxed);
     }
     /// Seed the live-node count after opening an existing image. The arena
     /// starts empty; the nodes already on disk must be counted (via a
     /// reachability walk) or the first `take`/`free_block` after reopen
     /// underflows the counter and panics.
-    pub fn set_live(&mut self, n: usize) {
-        self.alloc_count = n as u64;
+    pub fn set_live(&self, n: usize) {
+        self.alloc_count.store(n as u64, Ordering::Relaxed);
     }
 
     /// Nodes reachable from any of `roots`, counted once (union).
@@ -516,10 +524,10 @@ impl<K, V> BlockArena<K, V> {
     /// the live trees (e.g. a root the live tree CoW-cloned away from
     /// after the snapshot was taken); those blocks are allocated and must
     /// be seeded, or releasing the snapshot later underflows the counter.
-    pub fn reachable_multi(&mut self, roots: &[NodeId]) -> Result<usize, StoreError>
+    pub fn reachable_multi(&self, roots: &[NodeId]) -> Result<usize, StoreError>
     where
-        K: BlockCodec,
-        V: BlockCodec,
+        K: BlockCodec + Clone,
+        V: BlockCodec + Clone,
     {
         let mut seen = std::collections::HashSet::new();
         let mut stack: Vec<NodeId> = roots.to_vec();
@@ -527,8 +535,8 @@ impl<K, V> BlockArena<K, V> {
             if !seen.insert((id.idx, id.gen)) {
                 continue;
             }
-            // Clone child ids to end the borrow before recursing.
-            let children = self.load(id)?.node.children.clone();
+            // Clone child ids (Arc derefs to Node).
+            let children = self.get(id)?.children.clone();
             stack.extend(children);
         }
         Ok(seen.len())
@@ -536,22 +544,22 @@ impl<K, V> BlockArena<K, V> {
 
     /// T1/deadlock fix: Two-phase flush to avoid AB-BA deadlock.
     ///
-    /// Phase 1 (prepare): Called with arena lock held. Encodes dirty nodes
-    /// and returns (block, data) pairs. Does NOT do I/O.
-    pub fn prepare_flush(&mut self) -> Vec<(u64, crate::Block)>
+    /// Phase 1 (prepare): Encodes dirty nodes and returns (block, data)
+    /// pairs. Does NOT do I/O. Takes a read lock on the cache.
+    pub fn prepare_flush(&self) -> Vec<(u64, crate::Block)>
     where
         K: BlockCodec,
         V: BlockCodec,
     {
-        let dirty: Vec<u64> = self
-            .cache
+        let cache = self.cache.read().unwrap();
+        let dirty: Vec<u64> = cache
             .iter()
             .filter(|(_, e)| e.dirty)
             .map(|(b, _)| *b)
             .collect();
         let mut out = Vec::with_capacity(dirty.len());
         for block in dirty {
-            if let Some(e) = self.cache.get(&block) {
+            if let Some(e) = cache.get(&block) {
                 let buf = encode_node(&e.node, e.gen);
                 out.push((block, buf));
             }
@@ -579,14 +587,15 @@ impl<K, V> BlockArena<K, V> {
     }
 
     /// Phase 3 (finish): Mark blocks clean and freeze cache.
-    /// Called with arena lock held, after I/O completes.
-    pub fn finish_flush(&mut self, blocks: &[u64]) {
+    /// Takes a write lock on the cache.
+    pub fn finish_flush(&self, blocks: &[u64]) {
+        let mut cache = self.cache.write().unwrap();
         for block in blocks {
-            if let Some(e) = self.cache.get_mut(block) {
+            if let Some(e) = cache.get_mut(block) {
                 e.dirty = false;
             }
         }
-        for e in self.cache.values_mut() {
+        for e in cache.values_mut() {
             e.frozen = true;
         }
     }
@@ -597,20 +606,61 @@ impl<K, V> BlockArena<K, V> {
     }
 }
 
-impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
-    fn get(&mut self, id: NodeId) -> Result<&Node<K, V>, StoreError> {
-        Ok(&self.load(id)?.node)
+impl<K: BlockCodec + Clone, V: BlockCodec + Clone> NodeStore<K, V> for BlockArena<K, V> {
+    fn get(&self, id: NodeId) -> Result<Arc<Node<K, V>>, StoreError> {
+        self.ensure_loaded(id)?;
+        let cache = self.cache.read().unwrap();
+        let e = cache.get(&id.idx).expect("just loaded");
+        debug_assert_eq!(e.gen, id.gen, "stale NodeId");
+        let arc = Arc::clone(&e.node);
+        drop(cache);
+        // A5: move to most-recent on hit. O(1) via the position index.
+        self.lru_touch(id.idx);
+        Ok(arc)
     }
 
-    fn get_mut(&mut self, id: NodeId) -> Result<&mut Node<K, V>, StoreError> {
-        Ok(&mut self.load_mut(id)?.node)
+    fn with_mut<R>(
+        &self,
+        id: NodeId,
+        f: impl FnOnce(&mut Node<K, V>) -> R,
+    ) -> Result<R, StoreError> {
+        self.ensure_loaded(id)?;
+        let mut cache = self.cache.write().unwrap();
+        let e = cache.get_mut(&id.idx).expect("just loaded");
+        if e.gen != id.gen {
+            return Err(StoreError::Corrupt {
+                block: id.idx,
+                what: "stale NodeId generation",
+            });
+        }
+        if e.frozen {
+            // Committed nodes must never be rewritten in place: the caller
+            // (ensure_unique) must copy-on-write instead. This is a
+            // programmer error, like a stale id.
+            return Err(StoreError::Corrupt {
+                block: id.idx,
+                what: "mutation of frozen (committed) node",
+            });
+        }
+        // Arc::make_mut clones if the node is shared (e.g. a reader holds
+        // an Arc from get); the clone goes into the slot, the reader's
+        // Arc is unaffected. ensure_unique guarantees the common case
+        // (unshared) mutates in place.
+        let node = Arc::make_mut(&mut e.node);
+        let result = f(node);
+        e.dirty = true;
+        drop(cache);
+        self.lru_touch(id.idx);
+        Ok(result)
     }
 
-    fn is_committed(&mut self, id: NodeId) -> Result<bool, StoreError> {
-        Ok(self.load(id)?.frozen)
+    fn is_committed(&self, id: NodeId) -> Result<bool, StoreError> {
+        self.ensure_loaded(id)?;
+        let cache = self.cache.read().unwrap();
+        Ok(cache.get(&id.idx).expect("just loaded").frozen)
     }
 
-    fn alloc(&mut self, node: Node<K, V>) -> Result<NodeId, StoreError> {
+    fn alloc(&self, node: Node<K, V>) -> Result<NodeId, StoreError> {
         debug_assert_eq!(node.refcount, 1);
         let block = self
             .shared
@@ -633,76 +683,93 @@ impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
                 1
             }
         };
-        self.cache.insert(
-            block,
-            CacheEntry {
-                node,
-                gen,
-                dirty: true,
-                frozen: false,
-            },
-        );
+        {
+            let mut cache = self.cache.write().unwrap();
+            // Evict if full (same policy as ensure_loaded).
+            if cache.len() >= MAX_CACHE_NODES {
+                self.lru_evict_oldest_clean(&mut cache);
+            }
+            cache.insert(
+                block,
+                CacheEntry {
+                    node: Arc::new(node),
+                    gen,
+                    dirty: true,
+                    frozen: false,
+                },
+            );
+        }
         // Track newly allocated nodes in the LRU (most-recent). They are
         // dirty so eviction will skip them until flushed.
         self.lru_touch(block);
-        self.alloc_count += 1;
+        self.alloc_count.fetch_add(1, Ordering::Relaxed);
         Ok(NodeId { idx: block, gen })
     }
 
-    fn take(&mut self, id: NodeId) -> Result<Node<K, V>, StoreError> {
-        let rc = self.load(id)?.node.refcount;
+    fn take(&self, id: NodeId) -> Result<Node<K, V>, StoreError> {
+        self.ensure_loaded(id)?;
+        let rc = {
+            let cache = self.cache.read().unwrap();
+            cache.get(&id.idx).expect("just loaded").node.refcount
+        };
         debug_assert_eq!(rc, 1, "take of shared node");
-        let entry = self.cache.remove(&id.idx).expect("just loaded");
+        let mut cache = self.cache.write().unwrap();
+        let entry = cache.remove(&id.idx).expect("just loaded");
+        drop(cache);
+        self.lru_remove(id.idx);
         self.shared.lock().unwrap().pending_free[0].push(id.idx);
-        self.alloc_count -= 1;
-        Ok(entry.node)
+        self.alloc_count.fetch_sub(1, Ordering::Relaxed);
+        // Caller owns the only reference (debug_asserted above).
+        Ok(Arc::try_unwrap(entry.node).unwrap_or_else(|a| (*a).clone()))
     }
 
-    fn inc_ref(&mut self, id: NodeId) -> Result<(), StoreError> {
-        self.load_mut(id)?.node.refcount += 1;
+    fn inc_ref(&self, id: NodeId) -> Result<(), StoreError> {
+        self.ensure_loaded(id)?;
+        let mut cache = self.cache.write().unwrap();
+        let e = cache.get_mut(&id.idx).expect("just loaded");
+        // Refcount is in-memory metadata; frozen nodes can have their
+        // refcount adjusted (it does not mark the block dirty for rewrite).
+        Arc::make_mut(&mut e.node).refcount += 1;
         Ok(())
     }
 
-    fn dec_ref(&mut self, id: NodeId) -> Result<(), StoreError> {
+    fn dec_ref(&self, id: NodeId) -> Result<(), StoreError> {
         // Iterative post-order release.
         let mut stack = vec![id];
         while let Some(nid) = stack.pop() {
-            let rc = {
-                let e = self.load_mut(nid)?;
-                e.node.refcount -= 1;
-                e.node.refcount
+            self.ensure_loaded(nid)?;
+            // Decrement; if it hits zero, extract children (without holding
+            // the lock across the recursive frees below).
+            let children = {
+                let mut cache = self.cache.write().unwrap();
+                let e = cache.get_mut(&nid.idx).expect("just loaded");
+                let node = Arc::make_mut(&mut e.node);
+                node.refcount -= 1;
+                if node.refcount == 0 {
+                    Some(node.children.clone())
+                } else {
+                    None
+                }
             };
-            if rc == 0 {
-                let entry = self.cache.remove(&nid.idx).expect("just loaded");
+            if let Some(children) = children {
                 // Queue children before freeing (their blocks are untouched).
-                stack.extend(entry.node.children.iter().copied());
+                stack.extend(children.iter().copied());
                 self.free_block(nid.idx);
             }
         }
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<bool, StoreError> {
-        // T1/deadlock fix: Do NOT hold the arena lock while acquiring the
-        // shared (device) lock. Collect dirty data first, then do I/O
-        // without the arena lock, then re-acquire to mark clean.
-        //
-        // This avoids the AB-BA deadlock where:
-        // - write() holds shared → wants arena
-        // - flush() holds arena → wants shared
+    fn flush(&self) -> Result<bool, StoreError> {
+        // T1/deadlock fix: Do NOT hold the cache lock while doing I/O.
+        // Collect dirty data first, then do I/O without the lock,
+        // then re-acquire to mark clean.
         let prepared = self.prepare_flush();
         if prepared.is_empty() {
             return Ok(false);
         }
-        // Drop the &mut borrow by scoping; the caller (BTree::flush) must
-        // not hold the arena MutexGuard across this I/O. We do the I/O
-        // here but the trait signature requires &mut self. The actual fix
-        // is in BTree::flush() which now uses the two-phase API.
-        //
-        // For now, do the I/O with a re-entrant shared lock acquisition.
-        // The shared lock is a Mutex, not re-entrant, so we must ensure
-        // no one else holds it. This is safe because flush() is called
-        // from commit_async which is the only flusher.
+        // Do the I/O without holding the cache lock. The device handle
+        // (self.dev) does not require the cache lock.
         for (block, buf) in &prepared {
             self.dev.write_block(*block, buf)?;
         }
@@ -711,17 +778,17 @@ impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
     }
 
     /// Prepare flush: encode dirty nodes, return (block, data) pairs.
-    /// Caller must NOT hold the arena lock during the subsequent I/O.
-    fn prepare_flush(&mut self) -> Vec<(u64, [u8; BLOCK_SIZE])> {
-        let dirty: Vec<u64> = self
-            .cache
+    /// Caller must NOT hold the cache lock during the subsequent I/O.
+    fn prepare_flush(&self) -> Vec<(u64, [u8; BLOCK_SIZE])> {
+        let cache = self.cache.read().unwrap();
+        let dirty: Vec<u64> = cache
             .iter()
             .filter(|(_, e)| e.dirty)
             .map(|(b, _)| *b)
             .collect();
         let mut out = Vec::with_capacity(dirty.len());
         for block in dirty {
-            let e = &self.cache[&block];
+            let e = &cache[&block];
             let buf = encode_node(&e.node, e.gen);
             out.push((block, buf));
         }
@@ -729,13 +796,14 @@ impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
     }
 
     /// Finish flush: mark blocks clean and freeze the cache.
-    fn finish_flush(&mut self, blocks: &[u64]) {
+    fn finish_flush(&self, blocks: &[u64]) {
+        let mut cache = self.cache.write().unwrap();
         for block in blocks {
-            if let Some(e) = self.cache.get_mut(block) {
+            if let Some(e) = cache.get_mut(block) {
                 e.dirty = false;
             }
         }
-        for e in self.cache.values_mut() {
+        for e in cache.values_mut() {
             e.frozen = true;
         }
     }
@@ -744,19 +812,19 @@ impl<K: BlockCodec, V: BlockCodec> NodeStore<K, V> for BlockArena<K, V> {
         Some(self.shared.clone())
     }
 
-    fn live(&mut self) -> usize {
-        self.alloc_count as usize
+    fn live(&self) -> usize {
+        self.alloc_count.load(Ordering::Relaxed) as usize
     }
 
-    fn reachable(&mut self, root: NodeId) -> Result<usize, StoreError> {
+    fn reachable(&self, root: NodeId) -> Result<usize, StoreError> {
         let mut seen = std::collections::HashSet::new();
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {
             if !seen.insert((id.idx, id.gen)) {
                 continue;
             }
-            // Clone child ids to end the borrow before recursing.
-            let children = self.load(id)?.node.children.clone();
+            // Clone child ids (Arc derefs to Node).
+            let children = self.get(id)?.children.clone();
             stack.extend(children);
         }
         Ok(seen.len())
@@ -811,8 +879,8 @@ mod tests {
         pub fn arena<K: BlockCodec + Ord + Clone, V: BlockCodec + Clone>(
             &self,
             t: usize,
-        ) -> Arc<Mutex<BlockArena<K, V>>> {
-            Arc::new(Mutex::new(BlockArena::new(Arc::clone(&self.shared), t)))
+        ) -> Arc<BlockArena<K, V>> {
+            Arc::new(BlockArena::new(Arc::clone(&self.shared), t))
         }
     }
 
@@ -855,17 +923,17 @@ mod tests {
     fn arena_alloc_get_persists() {
         let td = TestDevice::new(256);
         let arena = td.arena::<u64, u64>(4);
-        let mut a = arena.lock().unwrap();
+        let a = Arc::clone(&arena);
         let id = a.alloc(Node::leaf()).unwrap();
-        a.get_mut(id).unwrap().keys.push(1);
-        a.get_mut(id).unwrap().vals.push(2);
+        a.with_mut(id, |n| n.keys.push(1)).unwrap();
+        a.with_mut(id, |n| n.vals.push(2)).unwrap();
         a.flush().unwrap();
         drop(a);
 
         // Re-read through a fresh arena over the same device: the node must
         // come back from disk with its refcount.
         let arena2 = td.arena::<u64, u64>(4);
-        let mut b = arena2.lock().unwrap();
+        let b = Arc::clone(&arena2);
         let n = b.get(id).unwrap();
         assert_eq!(n.keys, vec![1u64]);
         assert_eq!(n.refcount, 1);
@@ -888,7 +956,7 @@ mod tests {
         // the generation), then try to load via the old NodeId.
         let td = TestDevice::new(64);
         let arena = td.arena::<u64, u64>(4);
-        let mut a = arena.lock().unwrap();
+        let a = Arc::clone(&arena);
 
         // Allocate a node.
         let node = Node {
@@ -925,9 +993,9 @@ mod tests {
         // If not reused, the block is free and load will fail differently
         // (but still not panic).
         let arena2 = td.arena::<u64, u64>(4);
-        let mut b = arena2.lock().unwrap();
+        let b = Arc::clone(&arena2);
         // Evict from cache to force disk read.
-        b.cache.clear();
+        b.cache.write().unwrap().clear();
         let stale_id = NodeId {
             idx: id1.idx,
             gen: gen1,

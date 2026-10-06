@@ -697,7 +697,10 @@ impl Fs {
     /// Creates `<image>.lock` and holds a non-blocking exclusive flock.
     /// Returns None for read-only opens (multiple readers allowed).
     /// Fails if another writer holds the lock.
-    fn acquire_open_lock(path: &std::path::Path, read_only: bool) -> Result<Option<std::fs::File>, FsError> {
+    fn acquire_open_lock(
+        path: &std::path::Path,
+        read_only: bool,
+    ) -> Result<Option<std::fs::File>, FsError> {
         if read_only {
             return Ok(None);
         }
@@ -1133,14 +1136,14 @@ impl Fs {
             fault_point: None,
         }));
 
-        let ia: Arc<Mutex<BlockArena<u64, Inode>>> =
-            Arc::new(Mutex::new(BlockArena::new(Arc::clone(&shared), T_INODE)));
-        let da: Arc<Mutex<BlockArena<DirKey, DirEnt>>> =
-            Arc::new(Mutex::new(BlockArena::new(Arc::clone(&shared), T_DIR)));
-        let ea: Arc<Mutex<BlockArena<ExtentKey, Extent>>> =
-            Arc::new(Mutex::new(BlockArena::new(Arc::clone(&shared), T_EXTENT)));
-        let sa: Arc<Mutex<BlockArena<u64, SnapRecord>>> =
-            Arc::new(Mutex::new(BlockArena::new(Arc::clone(&shared), T_SNAP)));
+        let ia: Arc<BlockArena<u64, Inode>> =
+            Arc::new(BlockArena::new(Arc::clone(&shared), T_INODE));
+        let da: Arc<BlockArena<DirKey, DirEnt>> =
+            Arc::new(BlockArena::new(Arc::clone(&shared), T_DIR));
+        let ea: Arc<BlockArena<ExtentKey, Extent>> =
+            Arc::new(BlockArena::new(Arc::clone(&shared), T_EXTENT));
+        let sa: Arc<BlockArena<u64, SnapRecord>> =
+            Arc::new(BlockArena::new(Arc::clone(&shared), T_SNAP));
 
         let inodes = InodeTree::open(
             Arc::clone(&ia),
@@ -1178,10 +1181,10 @@ impl Fs {
         // counts (O(1)) instead of the O(tree) `reachable_multi` walk.
         // Legacy images (pre-S3) have no counts → fall back to the walk.
         if sb.has_live_counts {
-            ia.lock().unwrap().set_live(sb.live_inodes as usize);
-            da.lock().unwrap().set_live(sb.live_dirs as usize);
-            ea.lock().unwrap().set_live(sb.live_extents as usize);
-            sa.lock().unwrap().set_live(sb.live_snaps as usize);
+            ia.set_live(sb.live_inodes as usize);
+            da.set_live(sb.live_dirs as usize);
+            ea.set_live(sb.live_extents as usize);
+            sa.set_live(sb.live_snaps as usize);
         } else {
             // Seed each arena's live-node count from the on-disk trees; without
             // this the first take/free after reopen underflows the counter.
@@ -1206,14 +1209,14 @@ impl Fs {
                     gen: rec.root_gens[2],
                 });
             }
-            let n_inodes = ia.lock().unwrap().reachable_multi(&inode_roots)?;
-            let n_dirs = da.lock().unwrap().reachable_multi(&dir_roots)?;
-            let n_extents = ea.lock().unwrap().reachable_multi(&extent_roots)?;
+            let n_inodes = ia.reachable_multi(&inode_roots)?;
+            let n_dirs = da.reachable_multi(&dir_roots)?;
+            let n_extents = ea.reachable_multi(&extent_roots)?;
             let n_snaps = snaps.count_reachable()?;
-            ia.lock().unwrap().set_live(n_inodes);
-            da.lock().unwrap().set_live(n_dirs);
-            ea.lock().unwrap().set_live(n_extents);
-            sa.lock().unwrap().set_live(n_snaps);
+            ia.set_live(n_inodes);
+            da.set_live(n_dirs);
+            ea.set_live(n_extents);
+            sa.set_live(n_snaps);
         }
 
         let mut fs = Fs {
@@ -2003,10 +2006,10 @@ impl Fs {
         new_sb.generation += 1;
         // S3: persist per-arena live counts so open() skips the O(tree)
         // reachability walk.
-        new_sb.live_inodes = self.inodes.store_handle().lock().unwrap().live() as u64;
-        new_sb.live_dirs = self.dirs.store_handle().lock().unwrap().live() as u64;
-        new_sb.live_extents = self.extents.store_handle().lock().unwrap().live() as u64;
-        new_sb.live_snaps = self.snaps.store_handle().lock().unwrap().live() as u64;
+        new_sb.live_inodes = self.inodes.store_handle().live() as u64;
+        new_sb.live_dirs = self.dirs.store_handle().live() as u64;
+        new_sb.live_extents = self.extents.store_handle().live() as u64;
+        new_sb.live_snaps = self.snaps.store_handle().live() as u64;
         new_sb.has_live_counts = true;
         // S4: persist the P3 free-block counter.
         new_sb.free_blocks = self.shared.lock().unwrap().bitmap.free_count();
@@ -3596,7 +3599,7 @@ impl Fs {
             // Let competing writes settle, then confirm we still hold it.
             std::thread::sleep(std::time::Duration::from_millis(100));
             let confirmed = crate::lease::read_lease(&self.image_path, blk)
-                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))? 
+                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?
                 .map(|s| s.holder_name() == node_id && s.epoch == my_epoch)
                 .unwrap_or(false);
             // Re-acquire flock for the unlock at function end.
