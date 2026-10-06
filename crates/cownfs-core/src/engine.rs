@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::bitmap::Bitmap;
 use crate::block::{BlockDevice, FileDevice};
-use crate::btree::{BTree, NodeId};
+use crate::btree::{BTree, NodeId, NodeStore};
 use crate::checksum::checksum32;
 use crate::store::{self, BlockArena, BlockCodec, Shared, StoreError};
 use crate::superblock::{self, Superblock};
@@ -611,8 +611,11 @@ pub struct Fs {
     /// scanning inodes; updated on write/create/remove/truncate.
     quota_usage: std::collections::HashMap<u32, u64>,
     /// Extended attributes: (ino, name) -> value. Backed by the hidden
-    /// `.xattrs` file in the root directory; loaded on open.
+    /// `.xattrs` file in the root directory; S3: loaded lazily on first
+    /// access (see `ensure_xattrs`).
     xattrs: std::collections::HashMap<(u64, Vec<u8>), Vec<u8>>,
+    /// S3: whether `xattrs` has been loaded from the backing file.
+    xattrs_loaded: bool,
     /// Commits since the last full bitmap checkpoint (for delta bitmap).
     /// P1: Mutex for commit_async(&self).
     commits_since_checkpoint: std::sync::Mutex<u64>,
@@ -872,7 +875,10 @@ impl Fs {
             txg: Arc::new(TxgCoord::new()),
             quotas: std::collections::HashMap::new(),
             quota_usage: std::collections::HashMap::new(),
+            // S3: xattrs load lazily on first access (see ensure_xattrs).
+            // Fresh format: nothing to load.
             xattrs: std::collections::HashMap::new(),
+            xattrs_loaded: true,
             commits_since_checkpoint: std::sync::Mutex::new(0),
             last_bitmap_write_bytes: std::sync::Mutex::new(0),
             dirty_bytes: std::sync::atomic::AtomicU64::new(0),
@@ -1096,37 +1102,47 @@ impl Fs {
             },
             sb.snap_len as usize,
         );
-        // Seed each arena's live-node count from the on-disk trees; without
-        // this the first take/free after reopen underflows the counter.
-        // The seed must union the live roots with every snapshot record's
-        // pinned roots: a snapshot keeps tree blocks alive that the live
-        // tree has CoW-cloned away from, and those blocks are allocated
-        // (releasing the snapshot later frees them).
-        let mut inode_roots = vec![inodes.root_id()];
-        let mut dir_roots = vec![dirs.root_id()];
-        let mut extent_roots = vec![extents.root_id()];
-        for (_, rec) in snaps.to_sorted_vec()? {
-            inode_roots.push(NodeId {
-                idx: rec.roots[0],
-                gen: rec.root_gens[0],
-            });
-            dir_roots.push(NodeId {
-                idx: rec.roots[1],
-                gen: rec.root_gens[1],
-            });
-            extent_roots.push(NodeId {
-                idx: rec.roots[2],
-                gen: rec.root_gens[2],
-            });
+        // S3: seed each arena's live-node count from the persisted superblock
+        // counts (O(1)) instead of the O(tree) `reachable_multi` walk.
+        // Legacy images (pre-S3) have no counts → fall back to the walk.
+        if sb.has_live_counts {
+            ia.lock().unwrap().set_live(sb.live_inodes as usize);
+            da.lock().unwrap().set_live(sb.live_dirs as usize);
+            ea.lock().unwrap().set_live(sb.live_extents as usize);
+            sa.lock().unwrap().set_live(sb.live_snaps as usize);
+        } else {
+            // Seed each arena's live-node count from the on-disk trees; without
+            // this the first take/free after reopen underflows the counter.
+            // The seed must union the live roots with every snapshot record's
+            // pinned roots: a snapshot keeps tree blocks alive that the live
+            // tree has CoW-cloned away from, and those blocks are allocated
+            // (releasing the snapshot later frees them).
+            let mut inode_roots = vec![inodes.root_id()];
+            let mut dir_roots = vec![dirs.root_id()];
+            let mut extent_roots = vec![extents.root_id()];
+            for (_, rec) in snaps.to_sorted_vec()? {
+                inode_roots.push(NodeId {
+                    idx: rec.roots[0],
+                    gen: rec.root_gens[0],
+                });
+                dir_roots.push(NodeId {
+                    idx: rec.roots[1],
+                    gen: rec.root_gens[1],
+                });
+                extent_roots.push(NodeId {
+                    idx: rec.roots[2],
+                    gen: rec.root_gens[2],
+                });
+            }
+            let n_inodes = ia.lock().unwrap().reachable_multi(&inode_roots)?;
+            let n_dirs = da.lock().unwrap().reachable_multi(&dir_roots)?;
+            let n_extents = ea.lock().unwrap().reachable_multi(&extent_roots)?;
+            let n_snaps = snaps.count_reachable()?;
+            ia.lock().unwrap().set_live(n_inodes);
+            da.lock().unwrap().set_live(n_dirs);
+            ea.lock().unwrap().set_live(n_extents);
+            sa.lock().unwrap().set_live(n_snaps);
         }
-        let n_inodes = ia.lock().unwrap().reachable_multi(&inode_roots)?;
-        let n_dirs = da.lock().unwrap().reachable_multi(&dir_roots)?;
-        let n_extents = ea.lock().unwrap().reachable_multi(&extent_roots)?;
-        let n_snaps = snaps.count_reachable()?;
-        ia.lock().unwrap().set_live(n_inodes);
-        da.lock().unwrap().set_live(n_dirs);
-        ea.lock().unwrap().set_live(n_extents);
-        sa.lock().unwrap().set_live(n_snaps);
 
         let mut fs = Fs {
             shared,
@@ -1152,8 +1168,11 @@ impl Fs {
             snapshot_pinned: std::collections::HashSet::new(),
             txg: Arc::new(TxgCoord::new()),
             quotas: std::collections::HashMap::new(),
+            // S3: filled in below (persisted table or rebuild).
             quota_usage: std::collections::HashMap::new(),
+            // S3: xattrs load lazily on first access (see ensure_xattrs).
             xattrs: std::collections::HashMap::new(),
+            xattrs_loaded: false,
             commits_since_checkpoint: std::sync::Mutex::new(0),
             last_bitmap_write_bytes: std::sync::Mutex::new(0),
             dirty_bytes: std::sync::atomic::AtomicU64::new(0),
@@ -1165,8 +1184,32 @@ impl Fs {
             commit_mutex: std::sync::Mutex::new(()),
         };
         fs.rebuild_pinned()?;
-        fs.rebuild_quota_usage()?;
-        fs.load_xattrs()?;
+        // S3: quota usage comes from the persisted table when available;
+        // otherwise fall back to the O(inodes) rebuild (legacy images,
+        // corrupt table, or UID overflow).
+        let quota_rebuilt = match superblock::read_quota_table(&dev, active_slot) {
+            Some(Ok(map)) => {
+                fs.quota_usage = map;
+                false
+            }
+            _ => {
+                fs.rebuild_quota_usage()?;
+                true
+            }
+        };
+        if quota_rebuilt {
+            // Persist the rebuilt table so the next open is O(1). Best
+            // effort: a read-only open must not fail here... actually a
+            // read-only FS can't write; skip the write if read_only.
+            if !read_only {
+                // Write to the active slot's padding.
+                let sh = fs.shared.lock().unwrap();
+                let usage = fs.quota_usage.clone();
+                // Ignore errors: the table is a pure optimization.
+                let _ = superblock::write_quota_table(&sh.dev, active_slot, &usage);
+            }
+        }
+        // S3: xattrs load lazily on first access (ensure_xattrs).
         Ok(fs)
     }
 
@@ -1840,6 +1883,13 @@ impl Fs {
         let new_slot = 1 - self.active_slot;
         let mut new_sb = self.sb.clone();
         new_sb.generation += 1;
+        // S3: persist per-arena live counts so open() skips the O(tree)
+        // reachability walk.
+        new_sb.live_inodes = self.inodes.store_handle().lock().unwrap().live() as u64;
+        new_sb.live_dirs = self.dirs.store_handle().lock().unwrap().live() as u64;
+        new_sb.live_extents = self.extents.store_handle().lock().unwrap().live() as u64;
+        new_sb.live_snaps = self.snaps.store_handle().lock().unwrap().live() as u64;
+        new_sb.has_live_counts = true;
         Ok(Some(PreparedCommit {
             new_sb,
             slot: new_slot,
@@ -1859,6 +1909,8 @@ impl Fs {
         {
             let sh = self.shared.lock().unwrap();
             superblock::write_slot(&sh.dev, prepared.slot, &prepared.new_sb)?;
+            // S3: persist the quota usage table in the slot's padding.
+            superblock::write_quota_table(&sh.dev, prepared.slot, &self.quota_usage)?;
             sh.dev.sync()?;
         }
         Ok(())
@@ -2030,9 +2082,20 @@ impl Fs {
 
     // -- xattrs ------------------------------------------------------------
 
+    /// S3: load xattrs from the backing file on first access.
+    fn ensure_xattrs(&mut self) -> Result<(), FsError> {
+        if self.xattrs_loaded {
+            return Ok(());
+        }
+        self.load_xattrs()?;
+        self.xattrs_loaded = true;
+        Ok(())
+    }
+
     /// Set an extended attribute on an inode.
     pub fn setxattr(&mut self, ino: u64, name: &[u8], value: &[u8]) -> Result<(), FsError> {
         self.check_writable()?;
+        self.ensure_xattrs()?;
         // Verify the inode exists.
         self.getattr(ino)?;
         if name.is_empty() || name.len() > 255 {
@@ -2047,13 +2110,15 @@ impl Fs {
     }
 
     /// Get an extended attribute. Returns None if not set.
-    pub fn getxattr(&self, ino: u64, name: &[u8]) -> Result<Option<Vec<u8>>, FsError> {
+    pub fn getxattr(&mut self, ino: u64, name: &[u8]) -> Result<Option<Vec<u8>>, FsError> {
+        self.ensure_xattrs()?;
         self.getattr(ino)?;
         Ok(self.xattrs.get(&(ino, name.to_vec())).cloned())
     }
 
     /// List xattr names on an inode.
-    pub fn listxattrs(&self, ino: u64) -> Result<Vec<Vec<u8>>, FsError> {
+    pub fn listxattrs(&mut self, ino: u64) -> Result<Vec<Vec<u8>>, FsError> {
+        self.ensure_xattrs()?;
         self.getattr(ino)?;
         Ok(self
             .xattrs
@@ -2066,6 +2131,7 @@ impl Fs {
     /// Remove an extended attribute. Returns None if not set.
     pub fn removexattr(&mut self, ino: u64, name: &[u8]) -> Result<bool, FsError> {
         self.check_writable()?;
+        self.ensure_xattrs()?;
         self.getattr(ino)?;
         let removed = self.xattrs.remove(&(ino, name.to_vec())).is_some();
         if removed {

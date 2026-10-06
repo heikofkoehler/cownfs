@@ -960,7 +960,7 @@ impl Driver {
 impl Driver {
     /// Cross-check the full observable state: namespace, file bytes,
     /// symlink targets, xattrs, quota usage, and snapshot contents.
-    fn verify(&self) -> Result<(), String> {
+    fn verify(&mut self) -> Result<(), String> {
         for (ino, node) in &self.w.nodes {
             let attr = self
                 .fs

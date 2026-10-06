@@ -38,8 +38,9 @@ pub fn bitmap_crc_blocks(bitmap_blocks: u64) -> u64 {
     bytes.div_ceil(crate::BLOCK_SIZE as u64)
 }
 
-const HDR_LEN: usize = 280;
-/// R7: legacy header length (pre-feature-flags). Decode accepts both.
+const HDR_LEN: usize = 312;
+/// R7: legacy header lengths. Decode accepts 312 (current) and 256
+/// (pre-R7); the 280-byte R7 intermediate was never deployed.
 const HDR_LEN_LEGACY: usize = 256;
 const OFF_CHECKSUM: usize = 64;
 
@@ -104,6 +105,16 @@ pub struct Superblock {
     pub ro_compat: u64,
     /// Unknown `incompat` bits refuse the open entirely.
     pub incompat: u64,
+    /// S3: per-arena live node counts, persisted on every commit so open()
+    /// doesn't need the O(tree) `reachable_multi` seeding walk.
+    pub live_inodes: u64,
+    pub live_dirs: u64,
+    pub live_extents: u64,
+    pub live_snaps: u64,
+    /// Not serialized: true if the on-disk header predates S3 live counts
+    /// (legacy 256-byte header). Open falls back to the reachability walk.
+    #[allow(dead_code)]
+    pub has_live_counts: bool,
 }
 
 impl Superblock {
@@ -140,6 +151,11 @@ impl Superblock {
         hdr[256..264].copy_from_slice(&self.compat.to_le_bytes());
         hdr[264..272].copy_from_slice(&self.ro_compat.to_le_bytes());
         hdr[272..280].copy_from_slice(&self.incompat.to_le_bytes());
+        // S3: per-arena live counts.
+        hdr[280..288].copy_from_slice(&self.live_inodes.to_le_bytes());
+        hdr[288..296].copy_from_slice(&self.live_dirs.to_le_bytes());
+        hdr[296..304].copy_from_slice(&self.live_extents.to_le_bytes());
+        hdr[304..312].copy_from_slice(&self.live_snaps.to_le_bytes());
         // Checksum covers the header with the checksum field zeroed.
         let sum = checksum(&hdr);
         hdr[OFF_CHECKSUM..OFF_CHECKSUM + 8].copy_from_slice(&sum.to_le_bytes());
@@ -209,6 +225,15 @@ impl Superblock {
             compat: if legacy { 0 } else { u64_at(256)? },
             ro_compat: if legacy { 0 } else { u64_at(264)? },
             incompat: if legacy { 0 } else { u64_at(272)? },
+            // S3: legacy images have no live counts → 0 (caller falls back
+            // to the reachability walk when all four are zero... see open).
+            // Actually: 0 is a valid count (empty FS), so we seed from the
+            // walk only when the image predates S3 (see `has_live_counts`).
+            live_inodes: if legacy { 0 } else { u64_at(280)? },
+            live_dirs: if legacy { 0 } else { u64_at(288)? },
+            live_extents: if legacy { 0 } else { u64_at(296)? },
+            live_snaps: if legacy { 0 } else { u64_at(304)? },
+            has_live_counts: !legacy,
         })
     }
 
@@ -247,6 +272,11 @@ impl Superblock {
             compat: 0,
             ro_compat: 0,
             incompat: 0,
+            live_inodes: 0,
+            live_dirs: 0,
+            live_extents: 0,
+            live_snaps: 0,
+            has_live_counts: true,
         }
     }
 }
@@ -358,4 +388,89 @@ pub fn commit_generation(
     sb.generation += 1;
     write_slot(dev, *active, sb)?;
     dev.sync()
+}
+
+// ---- S3: quota usage table in the superblock block padding ----
+//
+// The 4 KiB superblock block holds the 312-byte header; the quota table
+// lives at offset 1024. Format:
+//   [1024..1032]: magic b"QUOTA\0\0\0"
+//   [1032..1040]: u64 entry count, or u64::MAX = "too many UIDs, rebuild"
+//   [1040..]: entries, 12 bytes each: u32 LE uid, u64 LE blocks
+//   after entries: u32 LE CRC32C of the table bytes [1024..end]
+const QUOTA_OFF: usize = 1024;
+const QUOTA_MAGIC: [u8; 8] = *b"QUOTA\0\0\0";
+const QUOTA_ENTRY: usize = 12;
+const QUOTA_MAX: usize = 200; // 200*12 = 2400 bytes, fits in the block
+
+/// Sentinel: quota table overflowed; the opener must rebuild from the trees.
+const QUOTA_REBUILD: u64 = u64::MAX;
+
+/// Write the quota usage table into the superblock block's padding.
+/// Called on every commit (alongside the slot write).
+pub fn write_quota_table(
+    dev: &impl BlockDevice,
+    slot: usize,
+    usage: &std::collections::HashMap<u32, u64>,
+) -> io::Result<()> {
+    let mut blk = [0u8; BLOCK_SIZE];
+    dev.read_block(SLOT_BLOCKS[slot], &mut blk)?;
+    // Preserve the header (written by write_slot); fill the quota area.
+    blk[QUOTA_OFF..QUOTA_OFF + 8].copy_from_slice(&QUOTA_MAGIC);
+    if usage.len() > QUOTA_MAX {
+        blk[QUOTA_OFF + 8..QUOTA_OFF + 16].copy_from_slice(&QUOTA_REBUILD.to_le_bytes());
+    } else {
+        let mut entries: Vec<(&u32, &u64)> = usage.iter().collect();
+        entries.sort_by_key(|(uid, _)| *uid);
+        blk[QUOTA_OFF + 8..QUOTA_OFF + 16].copy_from_slice(&(entries.len() as u64).to_le_bytes());
+        let mut off = QUOTA_OFF + 16;
+        for (uid, blocks) in entries {
+            blk[off..off + 4].copy_from_slice(&uid.to_le_bytes());
+            blk[off + 4..off + 12].copy_from_slice(&blocks.to_le_bytes());
+            off += QUOTA_ENTRY;
+        }
+        let crc = crate::checksum::checksum32(&blk[QUOTA_OFF..off]);
+        blk[off..off + 4].copy_from_slice(&crc.to_le_bytes());
+    }
+    dev.write_block(SLOT_BLOCKS[slot], &blk)?;
+    Ok(())
+}
+
+/// Read the quota usage table. Returns `None` if absent/corrupt (caller
+/// falls back to rebuilding from the inode tree), or `Some(Err(()))` if
+/// the sentinel requests a rebuild.
+pub fn read_quota_table(
+    dev: &impl BlockDevice,
+    slot: usize,
+) -> Option<Result<std::collections::HashMap<u32, u64>, ()>> {
+    let mut blk = [0u8; BLOCK_SIZE];
+    dev.read_block(SLOT_BLOCKS[slot], &mut blk).ok()?;
+    if blk[QUOTA_OFF..QUOTA_OFF + 8] != QUOTA_MAGIC {
+        return None;
+    }
+    let count = u64::from_le_bytes(blk[QUOTA_OFF + 8..QUOTA_OFF + 16].try_into().ok()?);
+    if count == QUOTA_REBUILD {
+        return Some(Err(()));
+    }
+    let count = count as usize;
+    if count > QUOTA_MAX {
+        return None;
+    }
+    let end = QUOTA_OFF + 16 + count * QUOTA_ENTRY;
+    if end + 4 > BLOCK_SIZE {
+        return None;
+    }
+    let crc = u32::from_le_bytes(blk[end..end + 4].try_into().ok()?);
+    if crc != crate::checksum::checksum32(&blk[QUOTA_OFF..end]) {
+        return None;
+    }
+    let mut map = std::collections::HashMap::new();
+    let mut off = QUOTA_OFF + 16;
+    for _ in 0..count {
+        let uid = u32::from_le_bytes(blk[off..off + 4].try_into().ok()?);
+        let blocks = u64::from_le_bytes(blk[off + 4..off + 12].try_into().ok()?);
+        map.insert(uid, blocks);
+        off += QUOTA_ENTRY;
+    }
+    Some(Ok(map))
 }

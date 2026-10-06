@@ -47,7 +47,7 @@ fn do_set(image: &Path, path: &str, name: &str, value: &str) -> Result<(), Strin
 }
 
 fn do_get(image: &Path, path: &str, name: &str) -> Result<(), String> {
-    let fs = Fs::open(image).map_err(|e| format!("open: {e:?}"))?;
+    let mut fs = Fs::open(image).map_err(|e| format!("open: {e:?}"))?;
     let ino = resolve(&fs, path)?;
     match fs
         .getxattr(ino, name.as_bytes())
@@ -62,7 +62,7 @@ fn do_get(image: &Path, path: &str, name: &str) -> Result<(), String> {
 }
 
 fn do_list(image: &Path, path: &str) -> Result<(), String> {
-    let fs = Fs::open(image).map_err(|e| format!("open: {e:?}"))?;
+    let mut fs = Fs::open(image).map_err(|e| format!("open: {e:?}"))?;
     let ino = resolve(&fs, path)?;
     let names = fs.listxattrs(ino).map_err(|e| format!("list: {e:?}"))?;
     for n in names {

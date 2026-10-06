@@ -51,6 +51,7 @@ fn persists_across_reopen() {
     drop(fs);
 
     let fs = Fs::open(&img).unwrap();
+    let mut fs = fs;
     assert_eq!(
         fs.getxattr(ino, b"user.key").unwrap(),
         Some(b"value123".to_vec())
