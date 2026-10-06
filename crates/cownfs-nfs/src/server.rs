@@ -124,6 +124,8 @@ fn fs_to_nfs(e: FsError) -> u32 {
         // R7: refusing to open (incompat) or mutating a read-only FS.
         FsError::IncompatibleFeature(_) => NFS4ERR_SERVERFAULT,
         FsError::ReadOnly => NFS4ERR_ROFS,
+        // P0: image locked by another writer.
+        FsError::Locked(_) => NFS4ERR_SERVERFAULT,
     }
 }
 
