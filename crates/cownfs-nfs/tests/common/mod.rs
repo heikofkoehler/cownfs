@@ -130,7 +130,7 @@ fn spawn_concurrent_server_inner(blocks: u64, read_only: bool) -> TestServer {
     // Create Shared here so tests can arm faults / tweak config (T9, P9).
     let fs2 = Fs::open(&img).expect("open test image for shared");
     let shared = if read_only {
-        cownfs_nfs::server::Shared::new_read_only(fs2)
+        cownfs_nfs::server::Shared::new_read_only(fs2, Some(img.clone()))
     } else {
         cownfs_nfs::server::Shared::new(fs2)
     };
@@ -204,7 +204,7 @@ pub fn spawn_read_only_server_on(img: &std::path::Path) -> TestServer {
     let addr = listener.local_addr().expect("listener local addr");
     let fs = Fs::open(img).expect("open test image");
     let uuid = fs.uuid();
-    let shared = cownfs_nfs::server::Shared::new_read_only(fs);
+    let shared = cownfs_nfs::server::Shared::new_read_only(fs, Some(img.to_path_buf()));
     let shared_srv = shared.clone();
     std::thread::spawn(move || {
         let _ = cownfs_nfs::server::serve_concurrent(listener, shared_srv);

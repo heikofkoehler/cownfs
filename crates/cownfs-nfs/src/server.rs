@@ -145,6 +145,11 @@ pub struct Shared {
     pub ds_addr: Option<String>,
     /// When true, mutating ops return NFS4ERR_ROFS. Used for read replicas.
     pub read_only: bool,
+    /// P0: image path for read-only reload. If set, a read-only server
+    /// periodically checks for a newer on-disk generation and re-opens.
+    pub image_path: Option<std::path::PathBuf>,
+    /// P0: throttles reload checks (max once per 5s).
+    last_reload_check: std::sync::Arc<Mutex<std::time::Instant>>,
     /// NFSv4.0 referral table: directory inode -> list of targets.
     /// Empty disables referrals.
     pub referrals: Arc<crate::referrals::ReferralTable>,
@@ -271,6 +276,8 @@ impl Shared {
             layouts: Arc::new(Mutex::new(crate::layouts::LayoutTable::new())),
             ds_addr: None,
             read_only: false,
+            image_path: None,
+            last_reload_check: std::sync::Arc::new(Mutex::new(std::time::Instant::now())),
             referrals: Arc::new(crate::referrals::ReferralTable::new()),
             metrics: crate::metrics::Metrics::new(),
             throttle: Arc::new(crate::throttle::Throttle::new(
@@ -294,7 +301,7 @@ impl Shared {
             .store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub fn new_read_only(fs: Fs) -> Self {
+    pub fn new_read_only(fs: Fs, image_path: Option<std::path::PathBuf>) -> Self {
         let txg = fs.txg();
         Shared {
             fs: Arc::new(RwLock::new(fs)),
@@ -305,6 +312,8 @@ impl Shared {
             layouts: Arc::new(Mutex::new(crate::layouts::LayoutTable::new())),
             ds_addr: None,
             read_only: true,
+            image_path,
+            last_reload_check: std::sync::Arc::new(Mutex::new(std::time::Instant::now())),
             referrals: Arc::new(crate::referrals::ReferralTable::new()),
             metrics: crate::metrics::Metrics::new(),
             throttle: Arc::new(crate::throttle::Throttle::new(
@@ -330,6 +339,47 @@ impl Shared {
     pub fn with_referrals(mut self, table: crate::referrals::ReferralTable) -> Self {
         self.referrals = Arc::new(table);
         self
+    }
+
+    /// P0: for read-only servers, check if the on-disk generation is newer
+    /// than the in-memory one, and if so, re-open the image. Throttled to
+    /// max once per 5 seconds. Called before handling requests.
+    pub fn maybe_reload(&self) {
+        if !self.read_only {
+            return;
+        }
+        let path = match &self.image_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        // Throttle: max once per 5s.
+        {
+            let mut last = self.last_reload_check.lock().unwrap();
+            if last.elapsed() < std::time::Duration::from_secs(5) {
+                return;
+            }
+            *last = std::time::Instant::now();
+        }
+        // Read on-disk generation via a lightweight superblock open.
+        // We use Fs::open which handles the full init; if the generation
+        // hasn't changed, we drop it immediately (cheap: just superblock reads).
+        let current_gen = self.fs.read().unwrap().generation();
+        // Open a new Fs to check the on-disk generation.
+        // Note: Fs::open takes the exclusive lock, but for read-only it
+        // returns None (no lock), so this is safe on a live primary.
+        match cownfs_core::engine::Fs::open(&path) {
+            Ok(new_fs) => {
+                let new_gen = new_fs.generation();
+                if new_gen > current_gen {
+                    // New generation available; swap it in.
+                    *self.fs.write().unwrap() = new_fs;
+                }
+                // Else: drop new_fs, keep current.
+            }
+            Err(_) => {
+                // If open fails (e.g., primary is writing), keep current.
+            }
+        }
     }
 }
 
@@ -2413,6 +2463,9 @@ fn serve_connection(stream: TcpStream, shared: &Shared) -> Result<(), ServerErro
         }
         rr.feed(&buf[..n]);
         while let Some(record) = rr.next_record()? {
+            // P0: read-only servers reload if the primary wrote a new generation.
+            // Throttled to max once per 5s inside maybe_reload().
+            shared.maybe_reload();
             if debug_rpc {
                 eprintln!("RPC> {} bytes: {}", record.len(), hex(&record));
             }

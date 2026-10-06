@@ -170,7 +170,7 @@ fn main() {
             .unwrap_or_default(),
     );
     let shared = if read_only {
-        server::Shared::new_read_only(fs)
+        server::Shared::new_read_only(fs, Some(std::path::PathBuf::from(&positional[0])))
     } else {
         server::Shared::new(fs)
     };

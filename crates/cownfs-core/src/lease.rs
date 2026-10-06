@@ -29,6 +29,12 @@ use crate::BLOCK_SIZE;
 /// R6+ images).
 pub const LEASE_BLOCK: u64 = 2;
 
+/// P0: grace period after lease expiry before a new holder can acquire.
+/// Ensures the old holder has stopped writing (its commits will be fenced,
+/// but in-flight data block writes need time to cease).
+/// Set to 10s: enough for in-flight writes to drain, short enough for tests.
+pub const LEASE_GRACE_SECS: u64 = 10;
+
 /// Lease block magic: `b"COWLEASE"`.
 const LEASE_MAGIC: [u8; 8] = *b"COWLEASE";
 

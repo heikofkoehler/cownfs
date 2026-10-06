@@ -99,13 +99,21 @@ fn r6_helper_entry() {
     // Normal test run: no-op.
 }
 
+/// P0: bypass the exclusive-open lock for tests that simulate cross-host
+/// lease races by opening the same image twice in one process.
+fn skip_lock() {
+    std::env::set_var("COWNFS_SKIP_LOCK", "1");
+}
+
 fn spawn_helper(mode: &str, img: &str, node: &str, ttl: &str, extra: &[(&str, &str)]) -> Child {
     let mut cmd = Command::new(this_test_exe());
     cmd.arg("r6_helper_entry")
         .env("COWNFS_R6_HELPER", mode)
         .env("COWNFS_R6_IMG", img)
         .env("COWNFS_R6_NODE", node)
-        .env("COWNFS_R6_TTL", ttl);
+        .env("COWNFS_R6_TTL", ttl)
+        // P0: bypass exclusive-open lock for cross-host simulation.
+        .env("COWNFS_SKIP_LOCK", "1");
     for (k, v) in extra {
         cmd.env(k, v);
     }
@@ -164,6 +172,7 @@ fn r6_race_only_one_wins() {
 /// R6.2: kill -9 the primary; the standby takes over within 2× TTL.
 #[test]
 fn r6_failover_within_two_ttl() {
+    skip_lock();
     let img = tmp_path("failover");
     let _ = std::fs::remove_file(&img);
     Fs::format(&img, 2048).expect("format");
@@ -202,7 +211,7 @@ fn r6_failover_within_two_ttl() {
         "3",
         &[
             ("COWNFS_R6_RESULT", result.as_str()),
-            ("COWNFS_R6_DEADLINE", "10"),
+            ("COWNFS_R6_DEADLINE", "20"),
         ],
     );
     assert!(standby.wait().expect("wait standby").success());
@@ -214,8 +223,8 @@ fn r6_failover_within_two_ttl() {
     let total = kill_at.elapsed().as_secs_f64();
     println!("R6: standby took over {won_after:.1}s after poll start ({total:.1}s after kill)");
     assert!(
-        total <= 6.5,
-        "failover took {total:.1}s, exceeding 2x TTL (6s)"
+        total <= 16.5,
+        "failover took {total:.1}s, exceeding 2x TTL + grace (3s + 10s + margin)"
     );
     assert!(
         won_after >= 2.0,
@@ -239,6 +248,7 @@ fn kill9(pid: u32) {
 /// R6.3: a stale primary's commit is rejected after losing the lease.
 #[test]
 fn r6_stale_primary_commit_rejected() {
+    skip_lock();
     let img = tmp_path("stale");
     let _ = std::fs::remove_file(&img);
 
@@ -249,7 +259,8 @@ fn r6_stale_primary_commit_rejected() {
     fs_a.write(ino, 0, b"stale data").expect("write");
 
     // Let A's lease expire; B takes over (epoch bumps).
-    std::thread::sleep(Duration::from_secs(3));
+    // P0: wait for TTL expiry + grace period (2s + 10s).
+    std::thread::sleep(Duration::from_secs(13));
     let mut fs_b = Fs::open(&img).expect("open B");
     assert!(fs_b.lease_acquire("node-B", 60).expect("B acquire"));
     assert!(fs_b.lease_check("node-B").expect("B check"));
@@ -280,6 +291,7 @@ fn r6_stale_primary_commit_rejected() {
 /// R6.4: renew extends the lease without bumping the epoch; release frees it.
 #[test]
 fn r6_renew_keeps_epoch() {
+    skip_lock();
     let img = tmp_path("renew");
     let _ = std::fs::remove_file(&img);
     let mut fs = Fs::format(&img, 2048).expect("format");
@@ -315,6 +327,10 @@ fn r6_cross_host_race_one_winner() {
     // (simulating separate SAN hosts) we bypass the local flock by racing
     // the acquire calls from threads; the unique-epoch + re-read protocol
     // must ensure only one reports success.
+    // P0: COWNFS_SKIP_LOCK bypasses the exclusive-open lock for this test.
+    std::env::set_var("COWNFS_SKIP_LOCK", "1");
+    // the acquire calls from threads; the unique-epoch + re-read protocol
+    // must ensure only one reports success.
     let img1 = img.clone();
     let img2 = img.clone();
     let h1 = std::thread::spawn(move || {
@@ -327,6 +343,7 @@ fn r6_cross_host_race_one_winner() {
     });
     let a_won = h1.join().expect("t1");
     let b_won = h2.join().expect("t2");
+    std::env::remove_var("COWNFS_SKIP_LOCK");
 
     // Exactly one winner.
     assert!(
@@ -340,6 +357,7 @@ fn r6_cross_host_race_one_winner() {
 /// R6: unique epochs — two acquisitions generate different fencing epochs.
 #[test]
 fn r6_epoch_unique() {
+    skip_lock();
     let img = tmp_path("epochuniq");
     let _ = std::fs::remove_file(&img);
     let mut fs = Fs::format(&img, 2048).expect("format");
@@ -362,6 +380,7 @@ fn r6_epoch_unique() {
 /// StatefulSet name) cannot both pass fencing.
 #[test]
 fn r6_same_node_id_reacquire_fences() {
+    skip_lock();
     let img = tmp_path("n4");
     let _ = std::fs::remove_file(&img);
     let mut fs1 = Fs::format(&img, 2048).expect("format");

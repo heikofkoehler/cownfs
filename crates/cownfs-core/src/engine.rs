@@ -701,6 +701,11 @@ impl Fs {
         if read_only {
             return Ok(None);
         }
+        // Test escape hatch: COWNFS_SKIP_LOCK=1 bypasses the exclusive lock.
+        // Used by r6_lease tests that simulate cross-host races with threads.
+        if std::env::var("COWNFS_SKIP_LOCK").is_ok() {
+            return Ok(None);
+        }
         let lock_path = {
             let mut p = path.as_os_str().to_owned();
             p.push(".lock");
@@ -3558,6 +3563,16 @@ impl Fs {
 
             if st.is_live(now) && st.holder_name() != node_id {
                 return Ok(false);
+            }
+            // P0: grace period — if the lease expired recently, don't allow
+            // a new holder to acquire yet. The old holder may still have
+            // in-flight writes; the fencing epoch will stop its commits, but
+            // we need time for data block writes to cease.
+            if !st.is_live(now) && st.expiry > 0 {
+                let expired_for = now.saturating_sub(st.expiry);
+                if expired_for < crate::lease::LEASE_GRACE_SECS {
+                    return Ok(false);
+                }
             }
 
             st.holder = crate::lease::node_id_bytes(node_id);

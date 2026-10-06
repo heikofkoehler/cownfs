@@ -216,14 +216,15 @@ fn do_send(
 
     // Always send superblock slots and the active bitmap area: the
     // replica's roots, generation, and allocator advance with the data.
-    let (sb, _) = superblock::open(&dev).map_err(|e| format!("read sb: {e:?}"))?;
+    // P0: use the active slot (not sb.bitmap_area, which is legacy).
+    // With S4 per-slot areas, active area = bitmap_start + slot*blocks.
+    let (sb, active_slot) = superblock::open(&dev).map_err(|e| format!("read sb: {e:?}"))?;
     let bitmap_start = sb.bitmap_start;
     let bitmap_blocks = sb.bitmap_blocks;
-    let bitmap_area = sb.bitmap_area;
     for slot in SLOT_BLOCKS {
         blocks.insert(slot);
     }
-    let area_start = bitmap_start + bitmap_area * bitmap_blocks;
+    let area_start = bitmap_start + active_slot as u64 * bitmap_blocks;
     for b in area_start..area_start + bitmap_blocks {
         blocks.insert(b);
     }
@@ -234,8 +235,8 @@ fn do_send(
         use cownfs_core::superblock::bitmap_crc_blocks;
         let cb = bitmap_crc_blocks(bitmap_blocks);
         // Sidecar layout (engine.rs): sidecar_start = bitmap_start +
-        // 2*bblocks + slot*cb, where slot == bitmap_area for the active area.
-        let sidecar_start = bitmap_start + 2 * bitmap_blocks + bitmap_area * cb;
+        // 2*bblocks + slot*cb, where slot == active_slot for the active area.
+        let sidecar_start = bitmap_start + 2 * bitmap_blocks + active_slot as u64 * cb;
         for b in sidecar_start..sidecar_start + cb {
             blocks.insert(b);
         }
