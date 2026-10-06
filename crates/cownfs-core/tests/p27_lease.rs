@@ -45,8 +45,9 @@ fn lease_expires() {
     assert!(fs.lease_acquire("node1", 1).unwrap());
     assert!(fs.lease_check("node1").unwrap());
 
-    // Wait for expiry.
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Wait for expiry + grace period (LEASE_GRACE_SECS=10; the old holder
+    // may still have in-flight writes).
+    std::thread::sleep(std::time::Duration::from_secs(12));
     assert!(!fs.lease_check("node1").unwrap());
 
     // Node2 can now take over.
