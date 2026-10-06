@@ -7,7 +7,7 @@ use cownfs_nfs::server;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: cownfs-server [--read-only] [--ds-addr <addr>] [--referrals <file>] [--node-id <id>] [--server-id <u32>] [--lease-ttl <secs>] [--snapshot-policy <spec>] [--txg-interval-ms <ms>] [--grace-period-secs <s>] [--state-log-addr <addr>] [--tail-state <addr>] [--promote-on-primary-loss] [--max-clients <n>] [--overflow-addr <addr>] [--quota <uid>:<blocks>]... <image> [addr]");
+        eprintln!("usage: cownfs-server [--read-only] [--ds-addr <addr>] [--referrals <file>] [--node-id <id>] [--server-id <u32>] [--lease-ttl <secs>] [--snapshot-policy <spec>] [--txg-interval-ms <ms>] [--grace-period-secs <s>] [--state-log-addr <addr>] [--tail-state <addr>] [--promote-on-primary-loss] [--max-clients <n>] [--overflow-addr <addr>] [--state-wal <path>] [--quota <uid>:<blocks>]... <image> [addr]");
         std::process::exit(1);
     }
     let read_only = args.iter().any(|a| a == "--read-only");
@@ -131,6 +131,14 @@ fn main() {
         .position(|a| a == "--overflow-addr")
         .and_then(|i| args.get(i + 1))
         .cloned();
+    // --state-wal <path>: persistent state WAL (§4.4 step 6). Mutations are
+    // fsynced to the WAL; on restart the WAL is replayed instead of
+    // forcing clients through reclaim.
+    let state_wal_path: Option<String> = args
+        .iter()
+        .position(|a| a == "--state-wal")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
     // --quota uid:blocks (repeatable).
     let quota_args: Vec<String> = args
         .iter()
@@ -163,6 +171,7 @@ fn main() {
                 && *a != "--promote-on-primary-loss"
                 && *a != "--max-clients"
                 && *a != "--overflow-addr"
+                && *a != "--state-wal"
                 && *a != "--quota"
         })
         .collect();
@@ -186,6 +195,7 @@ fn main() {
                 && Some(*a) != tail_state.as_ref()
                 && Some(*a) != max_clients_arg.as_ref()
                 && Some(*a) != overflow_addr.as_ref()
+                && Some(*a) != state_wal_path.as_ref()
                 && !quota_args.iter().any(|q| *a == q)
         })
         .collect();
@@ -273,6 +283,31 @@ fn main() {
     if let Some(addr) = overflow_addr {
         shared.set_overflow_addr(addr.clone());
         eprintln!("admission control overflow -> {addr}");
+    }
+    // Persistent state WAL (§4.4 step 6). If the WAL exists, adopt its
+    // identity and replay it; otherwise write a fresh header.
+    if let Some(wal_path) = state_wal_path {
+        let wal_path = std::path::PathBuf::from(wal_path);
+        let (mut wal, existing) =
+            cownfs_nfs::state_wal::StateWal::open(&wal_path).expect("open state WAL");
+        match existing {
+            Some((wal_server_id, wal_boot_gen)) => {
+                // Adopt the WAL's identity so replayed stateids stay valid.
+                shared.set_server_id(wal_server_id);
+                shared.state.set_boot_gen(wal_boot_gen);
+                let n = cownfs_nfs::state_wal::StateWal::replay(&wal_path, &shared.state)
+                    .expect("replay state WAL");
+                eprintln!(
+                    "state WAL replayed: {n} records (server-id {wal_server_id}, boot_gen {wal_boot_gen})"
+                );
+            }
+            None => {
+                wal.write_header(shared.state.server_id(), shared.state.boot_gen())
+                    .expect("write WAL header");
+                eprintln!("state WAL initialized at {}", wal_path.display());
+            }
+        }
+        shared.state.set_wal(wal);
     }
     // RFC 7530 §8.4: every (re)start enters the grace period so clients can
     // reclaim pre-restart state. 0 disables it (tests/development).

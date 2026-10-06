@@ -456,6 +456,9 @@ pub struct StateManager {
     /// At the cap, new SETCLIENTID gets NFS4ERR_DELAY; re-establishment of
     /// known clients is always allowed.
     max_clients: std::sync::atomic::AtomicUsize,
+    /// Persistent state WAL (§4.4 step 6). Appended on every log_append;
+    /// replayed on restart instead of reclaiming. Locked alone, never nested.
+    wal: Mutex<Option<crate::state_wal::StateWal>>,
 }
 
 /// Generate a random boot generation from OS entropy, falling back to a
@@ -507,6 +510,7 @@ impl StateManager {
             lease_duration,
             log: Mutex::new(StateLog::new()),
             max_clients: std::sync::atomic::AtomicUsize::new(0),
+            wal: Mutex::new(None),
         }
     }
 
@@ -537,8 +541,16 @@ impl StateManager {
 
     /// Append a mutation record to the state log. Returns the sequence number.
     /// Called by the primary on every state mutation; the standby tails these.
+    /// If a persistent WAL is attached (§4.4 step 6), the record is also
+    /// fsynced to the WAL before returning.
     fn log_append(&self, record: StateLogRecord) -> u64 {
-        self.log.lock().unwrap().append(record)
+        let seq = self.log.lock().unwrap().append(record.clone());
+        if let Some(wal) = self.wal.lock().unwrap().as_mut() {
+            if let Err(e) = wal.append(seq, &record) {
+                eprintln!("state WAL append failed: {e}");
+            }
+        }
+        seq
     }
 
     /// Read log records with seq >= `from_seq`. Returns (records, oldest_seq).
@@ -1421,6 +1433,12 @@ impl StateManager {
     pub fn at_client_cap(&self) -> bool {
         let max = self.max_clients();
         max > 0 && self.client_count() >= max
+    }
+
+    /// Attach a persistent state WAL (§4.4 step 6). From this point, every
+    /// log_append is also fsynced to the WAL.
+    pub fn set_wal(&self, wal: crate::state_wal::StateWal) {
+        *self.wal.lock().unwrap() = Some(wal);
     }
 }
 

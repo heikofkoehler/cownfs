@@ -212,7 +212,12 @@ point where dead-client state lingers too long.
    fresh mounts (LOOKUP on root → NFS4ERR_MOVED, fs_locations advertises
    the overflow target). Tests: p64_admission + 2 unit tests.
 6. **Optional: persistent state WAL** (§4.4). Fast restart without a
-   standby.
+   standby. DONE (2026-10-06): `--state-wal <path>`; every log_append is
+   fsynced to the WAL (header: magic+server_id+boot_gen, then seq+len+record);
+   on restart the server adopts the WAL's identity and replays via
+   apply_record instead of forcing reclaim. Tests: p65_wal (kill -9,
+   restart, same clientid + old stateid CLOSE works), WAL roundtrip unit
+   test. 47 NFS lib + 49 core lib green.
 
 ## 8. Open questions
 
