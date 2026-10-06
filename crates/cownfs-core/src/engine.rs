@@ -761,22 +761,16 @@ impl Fs {
             let dst_start = (i as usize) * BLOCK_SIZE;
             sidecar[dst_start..dst_start + BLOCK_SIZE].copy_from_slice(&blk);
         }
-        // Read bitmap and verify each block's CRC.
-        let mut bitmap_raw = vec![0u8; (bblocks as usize) * BLOCK_SIZE];
+        // Read bitmap and verify each block's CRC, streaming (N10: avoid
+        // allocating the full bitmap; 512 MiB at 16 TiB).
         for i in 0..bblocks {
             dev.read_block(bitmap_start + i, &mut blk)?;
-            let dst_start = (i as usize) * BLOCK_SIZE;
-            bitmap_raw[dst_start..dst_start + BLOCK_SIZE].copy_from_slice(&blk);
-        }
-        for i in 0..bblocks {
-            let start = (i as usize) * BLOCK_SIZE;
-            let block_data = &bitmap_raw[start..start + BLOCK_SIZE];
             let expected = u32::from_le_bytes(
                 sidecar[8 + (i as usize) * 4..8 + (i as usize) * 4 + 4]
                     .try_into()
                     .unwrap(),
             );
-            let actual = crate::checksum::checksum32(block_data);
+            let actual = crate::checksum::checksum32(&blk);
             if expected != actual {
                 return Err(FsError::BitmapCorrupt);
             }
