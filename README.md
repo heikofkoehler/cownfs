@@ -158,7 +158,7 @@ All workspace tests pass (`cargo test --workspace`) except `p4_parallel_reads_sc
 
 ### Known gaps
 
-- **P4 scaling gate**: `p4_parallel_reads_scale` requires 16 cores to verify 8× read scaling; fails RED on smaller hosts by design (not weakened). Needs `Arc<Node>` sharded cache redesign (blocked on trait API change).
+- **P4 scaling gate**: `p4_parallel_reads_scale` requires 16 cores to verify 8× read scaling; fails RED on smaller hosts by design (not weakened). The `Arc<Node>` sharded-cache redesign has landed (de85c04); what remains is the 16-core validation run.
 - **S3 exact gate**: 10M-inode mount <1s not yet verified (current test: 20K inodes in 2.05ms).
 - **T7 nightly**: 1-hour SIGKILL chaos run is `--ignored` by default; runs via nightly CI.
 - **Multi-hour soak** (100M operations) and fio-over-mounted-NFS haven't run — no mount privileges in this environment.
