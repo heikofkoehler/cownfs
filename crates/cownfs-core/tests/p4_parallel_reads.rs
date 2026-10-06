@@ -157,16 +157,19 @@ fn p4_parallel_reads_scale() {
     let parallelism = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(2) as f64;
-    // The plan's bar is 8x with 16 readers on a machine that can run them
-    // in parallel. On a smaller box we cannot test 8x (even pure memcpy
-    // tops out ~1.7x on 2 cores here); instead we assert the ratio is
-    // comfortably above 1.0x, which is what a globally-serialized read
-    // path would give. The property under test is "no global lock".
-    let required = if parallelism >= 16.0 { 8.0 } else { 1.25 };
-    println!("P4: available parallelism {parallelism}, required ratio {required:.2}x");
+    // P4 authoritative gate (prs-plan-v2): 16 readers scale >= 8x vs 1 reader
+    // on cached data. UNCONDITIONAL — no adaptive relaxation.
+    // This gate requires a 16-core machine to measure. On smaller hardware
+    // the gate is RED (cannot be validated), not weakened.
     assert!(
-        ratio >= required,
-        "P4 FAILED: 16-thread scaling {ratio:.2}x < required {required:.2}x \
+        parallelism >= 16.0,
+        "P4 GATE RED: 8x scaling requires 16 cores to measure (have {parallelism}). \
+         Run on a 16-core machine; do not weaken the assertion."
+    );
+    println!("P4: available parallelism {parallelism}, required ratio 8.00x");
+    assert!(
+        ratio >= 8.0,
+        "P4 FAILED: 16-thread scaling {ratio:.2}x < required 8.00x \
          (1-thread {t1:.1} B/s, 16-thread {t16:.1} B/s)"
     );
 
