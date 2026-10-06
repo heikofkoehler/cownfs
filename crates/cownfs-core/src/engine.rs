@@ -1940,6 +1940,11 @@ impl Fs {
         // T9: new transaction, old errors are stale. A persistent failure
         // will set the error again on the next background attempt.
         t.error = None;
+        // Allocate a fresh txg id for this dirty mark. The id must not have
+        // been acknowledged as synced by an earlier empty cycle: otherwise
+        // wait() would return immediately and the new data would never reach
+        // disk (FILE_SYNC returning OK for non-durable data).
+        t.current += 1;
         t.current
     }
 
@@ -1995,7 +2000,13 @@ impl Fs {
         self.check_fenced()?;
         if !self.txg.state.lock().unwrap().dirty {
             let mut t = self.txg.state.lock().unwrap();
-            t.synced = t.current;
+            // The closed txg is empty, so it is vacuously durable. Advance
+            // synced only to the closed txg (t.syncing), NOT to t.current:
+            // a dirty mark arriving after this point allocates a fresh id
+            // (see mark_txg_dirty) and must wait for a real sync.
+            if let Some(syncing) = t.syncing {
+                t.synced = t.synced.max(syncing);
+            }
             drop(t);
             self.txg.cv.notify_all();
             return Ok(None);
@@ -2015,8 +2026,14 @@ impl Fs {
         new_sb.has_live_counts = true;
         // S4: persist the P3 free-block counter.
         new_sb.free_blocks = self.shared.lock().unwrap().bitmap.free_count();
-        // E2: capture the syncing txg (set by commit_async at the flush point).
-        let txg = self.txg.state.lock().unwrap().syncing.unwrap_or(0);
+        // E2: the txg being synced. Normally set by commit_async at the flush
+        // point; if sync_txg is called directly (background sync disabled),
+        // fall back to t.current, which mark_txg_dirty allocated for this
+        // dirty mark.
+        let txg = {
+            let t = self.txg.state.lock().unwrap();
+            t.syncing.unwrap_or(t.current)
+        };
         Ok(Some(PreparedCommit {
             new_sb,
             slot: new_slot,
@@ -2065,8 +2082,9 @@ impl Fs {
         }
         let mut t = self.txg.state.lock().unwrap();
         // E2: mark the specific txg as synced (not t.current, which has
-        // already advanced). Clear the syncing flag.
-        t.synced = prepared.txg;
+        // already advanced). Clear the syncing flag. Use max: a newer empty
+        // cycle may have already advanced synced past this txg.
+        t.synced = t.synced.max(prepared.txg);
         t.syncing = None;
         t.dirty = false;
         t.error = None;
@@ -3824,6 +3842,43 @@ mod tests {
 
         // Waiting on an already-synced txg returns immediately.
         fs.txg().wait(txg).unwrap();
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn txg_empty_cycles_dont_fake_durability() {
+        // Regression: empty commit cycles must not acknowledge a later dirty
+        // mark as synced. Previously prepare_sync's not-dirty branch set
+        // synced=current, so a FILE_SYNC write after idle got wait() returning
+        // immediately without the data reaching disk (lost on kill -9).
+        let (mut fs, path) = test_fs(512);
+        // Simulate idle: empty commit cycles (background thread ticks).
+        for _ in 0..5 {
+            fs.commit_async().unwrap();
+            assert!(!fs.sync_txg().unwrap(), "empty cycle should be a no-op");
+        }
+        // Dirty the fs and mark.
+        let ino = fs.create(ROOT_INO, b"f", 0o644, 1000, 1000).unwrap();
+        fs.write(ino, 0, b"data").unwrap();
+        let txg = fs.mark_txg_dirty();
+        // wait() must block until a real sync happens.
+        let coord = fs.txg();
+        let h = std::thread::spawn(move || {
+            coord.wait(txg).unwrap();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !h.is_finished(),
+            "wait() returned without a real sync: data would be lost on crash"
+        );
+        // Real sync: commit_async stages, sync_txg persists.
+        fs.commit_async().unwrap();
+        assert!(fs.sync_txg().unwrap());
+        h.join().unwrap();
+        // And the data is actually durable.
+        drop(fs);
+        let fs2 = Fs::open(&path).unwrap();
+        assert!(fs2.lookup(ROOT_INO, b"f").unwrap().is_some());
         std::fs::remove_file(&path).unwrap();
     }
 
