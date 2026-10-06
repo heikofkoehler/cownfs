@@ -158,11 +158,16 @@ pub fn read_lease(path: &Path, block: u64) -> io::Result<Option<LeaseState>> {
         .as_slice()
         .try_into()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "short lease block read"))?;
-    // CRC mismatch on a magic-bearing block = corruption, not absence.
+    // N7: CRC mismatch on a magic-bearing block means a torn write
+    // (crash during lease update), not fatal corruption. Treat as "no
+    // lease" so the image remains openable; the next acquirer will
+    // overwrite the torn block. A torn lease must not make the image
+    // unopenable (including for fsck).
     if arr[0..8] == LEASE_MAGIC {
-        return LeaseState::decode(arr)
-            .map(Some)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "lease block CRC mismatch"));
+        match LeaseState::decode(arr) {
+            Some(st) => return Ok(Some(st)),
+            None => return Ok(None),
+        }
     }
     Ok(None)
 }
