@@ -151,7 +151,9 @@ fn s4_many_dirty_pages_no_corruption() {
     // Each allocation in a different 128 MiB region touches a different page.
     for i in 0..100 {
         let name = format!("f{i:03}");
-        let ino = fs.create(ROOT_INO, name.as_bytes(), 0o644, 0, 0).expect("create");
+        let ino = fs
+            .create(ROOT_INO, name.as_bytes(), 0o644, 0, 0)
+            .expect("create");
         // Write 1 MiB (256 blocks) to force allocation.
         let data = vec![i as u8; 1024 * 1024];
         fs.write(ino, 0, &data).expect("write");

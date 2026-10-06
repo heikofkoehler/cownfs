@@ -282,7 +282,9 @@ fn r6_stale_primary_commit_rejected() {
     drop(fs_a);
     fs_b.lease_release("node-B").expect("B release");
     let mut fs_a2 = Fs::open(&img).expect("reopen A");
-    assert!(fs_a2.lease_acquire("node-A", 60).expect("A acquire after reopen"));
+    assert!(fs_a2
+        .lease_acquire("node-A", 60)
+        .expect("A acquire after reopen"));
     fs_a2.commit().expect("commit after reopen works");
 
     let _ = std::fs::remove_file(&img);

@@ -3,12 +3,12 @@
 //! No external crates: the wire format is implemented from scratch so the
 //! protocol surface stays minimal and auditable.
 
+pub mod backup_parse;
 pub mod layouts;
 pub mod log;
 pub mod metrics;
 pub mod nfs4;
 pub mod referrals;
-pub mod backup_parse;
 pub mod rpc;
 pub mod server;
 pub mod sessions;

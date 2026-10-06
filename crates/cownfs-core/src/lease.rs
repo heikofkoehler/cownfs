@@ -131,8 +131,8 @@ struct AlignedBuf {
 
 impl AlignedBuf {
     fn new() -> Self {
-        let layout = std::alloc::Layout::from_size_align(BLOCK_SIZE, BLOCK_SIZE)
-            .expect("4K layout");
+        let layout =
+            std::alloc::Layout::from_size_align(BLOCK_SIZE, BLOCK_SIZE).expect("4K layout");
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!ptr.is_null(), "alloc_zeroed failed");
         Self { ptr, layout }

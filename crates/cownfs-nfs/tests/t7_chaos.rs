@@ -228,7 +228,8 @@ fn t7_chaos_8gib() {
             let mut local = Vec::new();
             for i in 0..25 {
                 let name = format!("mt{tid}_{i:03}");
-                let ino = common::create_file(&mut c, &uuid, clientid, ROOT_INO, name.as_bytes(), 0o644);
+                let ino =
+                    common::create_file(&mut c, &uuid, clientid, ROOT_INO, name.as_bytes(), 0o644);
                 let data = format!("mt-data-{tid}-{i}-{}", Instant::now().elapsed().as_nanos());
                 let data_bytes = data.into_bytes();
 

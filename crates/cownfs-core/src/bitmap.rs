@@ -298,11 +298,10 @@ impl PagedBitmap {
             // MAX, which would never decrement and break the free invariant).
             for (page_idx, words) in self.cache.iter() {
                 let mut free = 0u32;
-                let bits_in_page = BITS_PER_PAGE
-                    .min(self.nbits.saturating_sub(page_idx * BITS_PER_PAGE));
+                let bits_in_page =
+                    BITS_PER_PAGE.min(self.nbits.saturating_sub(page_idx * BITS_PER_PAGE));
                 for (wi, w) in words.iter().enumerate() {
-                    let word_bits =
-                        64u64.min(bits_in_page.saturating_sub(wi as u64 * 64));
+                    let word_bits = 64u64.min(bits_in_page.saturating_sub(wi as u64 * 64));
                     if word_bits == 64 {
                         free += w.count_zeros();
                     } else if word_bits > 0 {
