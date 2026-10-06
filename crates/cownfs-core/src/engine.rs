@@ -533,6 +533,9 @@ struct TxgInner {
     /// If sync failed, the error. Waiters wake with this error.
     /// Cleared on the next successful sync.
     error: Option<String>,
+    /// E2: the txg currently being synced (closed at flush point).
+    /// None if no sync in progress.
+    syncing: Option<u64>,
 }
 
 impl TxgCoord {
@@ -543,6 +546,7 @@ impl TxgCoord {
                 synced: 0,
                 dirty: false,
                 error: None,
+                syncing: None,
             }),
             cv: Condvar::new(),
         }
@@ -671,6 +675,9 @@ pub struct SetAttrs {
 pub struct PreparedCommit {
     pub(crate) new_sb: superblock::Superblock,
     pub(crate) slot: usize,
+    /// E2: the txg being synced. Set at the flush point (commit_async);
+    /// new writes after that join the next txg.
+    pub(crate) txg: u64,
 }
 
 impl Fs {
@@ -1662,19 +1669,12 @@ impl Fs {
     fn persist_bitmap(&self, _area_start: u64) -> Result<(), FsError> {
         {
             let mut sh = self.shared.lock().unwrap();
-            // R3 fix: two-generation deferred free.
-            // - [1] holds blocks freed in the previous generation (N-1).
-            //   They are safe to mark free now: after this commit (N+1),
-            //   the fallback will be N, and N-1 will be unreachable.
-            // - [0] holds blocks freed in the current generation (N).
-            //   They move to [1]; they become free when N+1 commits.
-            let prev_freed = std::mem::take(&mut sh.pending_free[1]);
-            for b in prev_freed {
-                sh.bitmap
-                    .clear(b)
-                    .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
-            }
-            sh.pending_free[1] = std::mem::take(&mut sh.pending_free[0]);
+            // E1: Do NOT rotate here. Rotation happens in finish_sync, once
+            // per slot flip. Rotating on every commit_async is unsafe because
+            // commit_async can be called multiple times without a flip
+            // (e.g., NFS COMMIT), freeing blocks prematurely.
+            // The bitmap written to the new slot keeps deferred blocks marked
+            // as allocated; they are freed in-memory after the flip.
         }
         // R1 fix: always write a full checkpoint, never a delta.
         //
@@ -1699,38 +1699,16 @@ impl Fs {
         let blocks = self.sb.bitmap_blocks;
         let mut sh = self.shared.lock().unwrap();
         // R3: the deferred queue is persisted in bitmap area padding. If the
-        // queue exceeds padding (or there's no padding), free [1] blocks now
-        // (safe: 2 gens old, writing to new slot pre-flip) rather than
-        // leaking them on reopen. Do this before capturing raw.
+        // E1: if the deferred-free queue exceeds the padding, DO NOT free
+        // blocks immediately. That would make blocks referenced by the
+        // newest durable generation allocatable, corrupting on crash.
+        // Instead, keep them queued in memory; they remain marked as
+        // allocated (safe, just temporarily wasted space). The next commit
+        // will retry persisting them.
+        // (The old code freed overflow here, which is the E1 bug.)
         {
-            let bitmap_bytes = ((self.sb.block_count + 63) / 64) as usize * 8;
-            let area_bytes = blocks as usize * BLOCK_SIZE;
-            let avail = if bitmap_bytes + 8 <= area_bytes {
-                (area_bytes - (bitmap_bytes + 8)) / 8
-            } else {
-                0
-            };
-            let total = sh.pending_free[0].len() + sh.pending_free[1].len();
-            if total > avail {
-                // Free from [1] (older) first; if still over, free from [0].
-                // [0] blocks are 1 gen old, but we're committing now and
-                // writing to the new slot pre-flip, so freeing is safe
-                // (crash before flip falls back to old slot's bitmap).
-                let mut to_free = total - avail;
-                while to_free > 0 {
-                    let b = if !sh.pending_free[1].is_empty() {
-                        sh.pending_free[1].pop().unwrap()
-                    } else if !sh.pending_free[0].is_empty() {
-                        sh.pending_free[0].pop().unwrap()
-                    } else {
-                        break;
-                    };
-                    sh.bitmap
-                        .clear(b)
-                        .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
-                    to_free -= 1;
-                }
-            }
+            // No-op: the queue stays in memory if it doesn't fit.
+            // The streaming write below persists what fits.
         }
         // S4: materialize the bitmap to the target slot's area.
         // R1 fix: write to the *target superblock slot's* bitmap area.
@@ -1938,10 +1916,17 @@ impl Fs {
         // unconditional dirty=true caused spurious generation advances
         // on empty commits, which could leave the two superblock slots
         // with divergent generations.
+        // E2: close the txg at the flush point (ZFS-style). Increment
+        // `current` so new writes join the next txg; the syncing txg is
+        // the old `current` value. This prevents a WRITE in the gap
+        // between phases from being acknowledged as durable when it isn't.
+        let syncing = t.current;
+        t.current += 1;
+        t.syncing = Some(syncing);
         if flushed {
             t.dirty = true;
         }
-        Ok(t.current)
+        Ok(syncing)
     }
 
     /// P1 Phase 1: Prepare the commit (under write lock).
@@ -1973,9 +1958,12 @@ impl Fs {
         new_sb.has_live_counts = true;
         // S4: persist the P3 free-block counter.
         new_sb.free_blocks = self.shared.lock().unwrap().bitmap.free_count();
+        // E2: capture the syncing txg (set by commit_async at the flush point).
+        let txg = self.txg.state.lock().unwrap().syncing.unwrap_or(0);
         Ok(Some(PreparedCommit {
             new_sb,
             slot: new_slot,
+            txg,
         }))
     }
 
@@ -2004,9 +1992,25 @@ impl Fs {
     pub fn finish_sync(&mut self, prepared: PreparedCommit) -> Result<bool, FsError> {
         self.active_slot = prepared.slot;
         self.sb = prepared.new_sb;
+        // E1: rotate the deferred-free queue once per slot flip (not per
+        // commit_async). Blocks in [1] were freed two generations ago;
+        // neither slot references them now, so they can be marked free.
+        // Blocks in [0] (freed in the just-committed generation) move to [1].
+        {
+            let mut sh = self.shared.lock().unwrap();
+            let prev_freed = std::mem::take(&mut sh.pending_free[1]);
+            for b in prev_freed {
+                sh.bitmap
+                    .clear(b)
+                    .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+            }
+            sh.pending_free[1] = std::mem::take(&mut sh.pending_free[0]);
+        }
         let mut t = self.txg.state.lock().unwrap();
-        t.synced = t.current;
-        t.current += 1;
+        // E2: mark the specific txg as synced (not t.current, which has
+        // already advanced). Clear the syncing flag.
+        t.synced = prepared.txg;
+        t.syncing = None;
         t.dirty = false;
         t.error = None;
         drop(t);
@@ -3754,8 +3758,8 @@ mod tests {
 
     #[test]
     fn txg_coalesces_concurrent_writes() {
-        // Many commit_async calls before a sync share one txg id;
-        // one sync_txg makes them all durable.
+        // E2: each commit_async closes the txg at the flush point (ZFS-style).
+        // Sequential commit_async + sync_txg pairs get sequential txg ids.
         let (mut fs, path) = test_fs(512);
         let mut ids = Vec::new();
         for i in 0..10 {
@@ -3764,11 +3768,12 @@ mod tests {
                 .create(ROOT_INO, name.as_bytes(), 0o644, 1000, 1000)
                 .unwrap();
             fs.write(ino, 0, b"x").unwrap();
-            ids.push(fs.commit_async().unwrap());
+            let id = fs.commit_async().unwrap();
+            ids.push(id);
+            fs.sync_txg().unwrap();
         }
-        // All in the same open txg.
-        assert!(ids.windows(2).all(|w| w[0] == w[1]));
-        fs.sync_txg().unwrap();
+        // E2: each commit_async gets a distinct txg id (closed at flush).
+        assert!(ids.windows(2).all(|w| w[0] + 1 == w[1]));
         let gen = fs.generation();
         drop(fs);
         let fs2 = Fs::open(&path).unwrap();
