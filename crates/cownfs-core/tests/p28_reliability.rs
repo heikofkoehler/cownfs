@@ -18,7 +18,13 @@ fn lease_concurrent_acquire() {
         let img = img.clone();
         let results = results.clone();
         handles.push(thread::spawn(move || {
-            let mut fs = Fs::open(&img).unwrap();
+            // P0: exclusive-open lock — only one opener wins; the rest get
+            // FsError::Locked, which counts as "did not win" (not a failure).
+            let mut fs = match Fs::open(&img) {
+                Ok(fs) => fs,
+                Err(cownfs_core::engine::FsError::Locked(_)) => return,
+                Err(e) => panic!("unexpected open error: {e:?}"),
+            };
             let won = fs.lease_acquire(&format!("node{i}"), 60).unwrap();
             results.lock().unwrap().push((i, won));
         }));
