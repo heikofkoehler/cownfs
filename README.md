@@ -114,9 +114,9 @@ flowchart TD
 
 ## Status
 
-**Working prototype, not production.** Updated 2026-10-04.
+**Working prototype, not production.** Updated 2026-10-05.
 
-245 tests pass across the workspace (`cargo test --workspace --no-fail-fast`); 24 failures are known and under investigation (see below). Zero compiler warnings, `cargo fmt --check` clean.
+All workspace tests pass (`cargo test --workspace`) except `p4_parallel_reads_scale`, which is a RED gate requiring 16 cores to measure 8× scaling (this host has 2). Zero compiler warnings, `cargo fmt --check` clean.
 
 ### Recently landed
 
@@ -144,8 +144,8 @@ flowchart TD
 
 ### Known gaps
 
-- **Test failures (24)**: `p39_delta_bitmap`, `p48_fault_inject`, `p49_chaos`, `p53_bitmap_crc`, `p59_crash_fuzz`, `p7_crash`, `p7_reclaim`, `t0_r1_delta_crash`, and others fail — mostly around the R1 bitmap-area redesign and crash-consistency paths. Under investigation; the failures pre-date the Phase-1 work.
-- **SIGKILL chaos test** (`p50_sigkill_chaos`) still fails intermittently with stale generation errors and stays ignored; the library-level chaos test covers the path.
+- **P4 scaling gate**: `p4_parallel_reads_scale` requires 16 cores to verify 8× read scaling; fails RED on smaller hosts by design (not weakened).
+- **T7 nightly**: 1-hour SIGKILL chaos run is `--ignored` by default; needs CI substrate.
 - **Multi-hour soak** (100M operations) and fio-over-mounted-NFS haven't run — no mount privileges in this environment.
 - **Perf gate** is currently red: `commit_p99` regressed ~25% vs baseline after the bitmap CRC work. Needs an optimize-or-rebaseline decision.
 - **Paged bitmap** core is done but not yet integrated into `Fs` (18 call sites still use the in-memory bitmap).

@@ -189,3 +189,46 @@ fn t7_chaos_nightly() {
     }
     println!("T7 nightly: {cycles} kill cycles in 1h, zero failures");
 }
+
+/// P1: kill -9 crash test on an image over 8 GiB (exercises S4 paging).
+/// Uses the same ledger/fsck verification as the main chaos loop.
+#[test]
+fn t7_chaos_8gib() {
+    let img = tmp_img("chaos-8gib");
+    let uuid = {
+        // 8 GiB = 2M blocks (sparse, no disk usage). >64 bitmap pages.
+        let mut fs = Fs::format(&img, 8u64 * 1024 * 1024 * 1024 / 4096).expect("format 8GiB");
+        fs.commit().expect("commit");
+        fs.uuid()
+    };
+
+    let mut port = 20500;
+    let mut ledger = Vec::new();
+    for cycle in 0..2 {
+        port += 1;
+        let mut server = spawn_server_proc(&img, port);
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+        // Do writes; they go into the ledger as durable.
+        let new_entries = do_writes(&addr, &uuid, cycle * 10, 10);
+        ledger.extend(new_entries);
+
+        // Kill -9 at a random point.
+        kill9(&mut server);
+
+        // Restart and verify ledger.
+        port += 1;
+        let mut server2 = spawn_server_proc(&img, port);
+        let addr2: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        verify_ledger(&addr2, &uuid, &ledger);
+
+        let _ = server2.kill();
+        let _ = server2.wait();
+
+        // Fsck must be clean.
+        let fs = Fs::open(&img).expect("open for fsck");
+        fs.check().expect("fsck clean after 8GiB kill cycle");
+    }
+
+    let _ = std::fs::remove_file(&img);
+}
