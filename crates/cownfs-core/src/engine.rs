@@ -99,6 +99,9 @@ pub enum FsError {
     /// R7: filesystem opened read-only (unknown ro_compat flag, or
     /// explicit read-only open); mutation refused.
     ReadOnly,
+    /// P0: image is already open for writing by another process on this
+    /// host (exclusive-open lock). Multiple writers are not allowed.
+    Locked(String),
 }
 
 impl std::fmt::Display for FsError {
@@ -120,6 +123,7 @@ impl std::fmt::Display for FsError {
             FsError::NoSpace => write!(f, "no space left on device"),
             FsError::Invalid(s) => write!(f, "invalid: {s}"),
             FsError::Corrupt(s) => write!(f, "corrupt: {s}"),
+            FsError::Locked(s) => write!(f, "locked: {s}"),
         }
     }
 }
@@ -585,6 +589,10 @@ pub struct Fs {
     dev: Arc<FileDevice>,
     /// R6: image path, for lease-block I/O (separate O_DIRECT fd).
     image_path: std::path::PathBuf,
+    /// P0: exclusive-open lock file (<image>.lock). Held for the Fs
+    /// lifetime when opened for writing; prevents multiple writers on
+    /// the same host. None for read-only opens.
+    _lock_file: Option<std::fs::File>,
     /// R6: lease block number, if this image has one (R6+ formats).
     /// None on legacy images (detected by missing lease magic).
     lease_block: Option<u64>,
@@ -684,6 +692,34 @@ pub struct PreparedCommit {
 
 impl Fs {
     // -- lifecycle ---------------------------------------------------------
+
+    /// P0: acquire an exclusive open lock for writing.
+    /// Creates `<image>.lock` and holds a non-blocking exclusive flock.
+    /// Returns None for read-only opens (multiple readers allowed).
+    /// Fails if another writer holds the lock.
+    fn acquire_open_lock(path: &std::path::Path, read_only: bool) -> Result<Option<std::fs::File>, FsError> {
+        if read_only {
+            return Ok(None);
+        }
+        let lock_path = {
+            let mut p = path.as_os_str().to_owned();
+            p.push(".lock");
+            std::path::PathBuf::from(p)
+        };
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+        use fs2::FileExt;
+        file.try_lock_exclusive().map_err(|_| {
+            FsError::Locked(format!(
+                "image {} is already open for writing",
+                path.display()
+            ))
+        })?;
+        Ok(Some(file))
+    }
 
     /// Write the CRC sidecar magic to the given area (cb blocks).
     fn write_crc_magic(dev: &FileDevice, sidecar_start: u64, cb: u64) -> Result<(), FsError> {
@@ -792,6 +828,8 @@ impl Fs {
 
     /// Format a fresh filesystem image with an empty root directory.
     pub fn format(path: &Path, blocks: u64) -> Result<Self, FsError> {
+        // P0: exclusive-open lock (fails if another writer holds it).
+        let lock_file = Self::acquire_open_lock(path, false)?;
         let dev = FileDevice::create(path, blocks)?;
         // P4: share the device by Arc so reads bypass the Shared mutex.
         let dev = Arc::new(dev);
@@ -871,6 +909,7 @@ impl Fs {
             shared: Arc::clone(&shared),
             dev: Arc::clone(&dev),
             image_path: path.to_path_buf(),
+            _lock_file: lock_file,
             lease_block: Some(crate::lease::LEASE_BLOCK),
             lease_epoch: None,
             read_only: false,
@@ -1053,6 +1092,8 @@ impl Fs {
         has_bitmap_crcs: bool,
         read_only: bool,
     ) -> Result<Self, FsError> {
+        // P0: exclusive-open lock (fails if another writer holds it).
+        let lock_file = Self::acquire_open_lock(path, read_only)?;
         let next_inode = sb.next_inode;
         let next_snap = sb.next_snap;
         let (mut bitmap, deferred) = Self::load_bitmap(&dev, &sb, active_slot)?;
@@ -1174,6 +1215,7 @@ impl Fs {
             shared,
             dev: Arc::clone(&dev),
             image_path: path.to_path_buf(),
+            _lock_file: lock_file,
             // R6: detect the lease block by its magic. Legacy images
             // (block 2 = bitmap) have no magic → lease ops are unsupported.
             lease_block: match crate::lease::read_lease(path, crate::lease::LEASE_BLOCK) {

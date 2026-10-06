@@ -55,3 +55,39 @@ fn lease_expires() {
     drop(fs);
     std::fs::remove_file(&img).ok();
 }
+
+/// P0: exclusive-open lock — two writers cannot open the same image.
+#[test]
+fn p0_exclusive_open_lock() {
+    let img = std::env::temp_dir().join(format!(
+        "cownfs-excl-{}-{}.img",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&img);
+    let lock_path = {
+        let mut p = img.as_os_str().to_owned();
+        p.push(".lock");
+        std::path::PathBuf::from(p)
+    };
+    let _ = std::fs::remove_file(&lock_path);
+
+    let fs1 = cownfs_core::engine::Fs::format(&img, 1024).expect("first format");
+
+    // Second writer open must fail.
+    match cownfs_core::engine::Fs::open(&img) {
+        Ok(_) => panic!("second writer open should fail"),
+        Err(cownfs_core::engine::FsError::Locked(_)) => {} // expected
+        Err(e) => panic!("wrong error: {e:?}"),
+    }
+
+    drop(fs1);
+    // After first writer drops, second writer can open.
+    let _fs2 = cownfs_core::engine::Fs::open(&img).expect("open after drop");
+
+    let _ = std::fs::remove_file(&img);
+    let _ = std::fs::remove_file(&lock_path);
+}
