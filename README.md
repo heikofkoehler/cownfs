@@ -114,7 +114,7 @@ flowchart TD
 
 ## Status
 
-**Working prototype, not production.** Updated 2026-10-05.
+**Working prototype, not production.** Updated 2026-10-06.
 
 All workspace tests pass (`cargo test --workspace`) except `p4_parallel_reads_scale`, which is a RED gate requiring 16 cores to measure 8× scaling (this host has 2). Zero compiler warnings, `cargo fmt --check` clean.
 
@@ -125,6 +125,13 @@ All workspace tests pass (`cargo test --workspace`) except `p4_parallel_reads_sc
 - **R2 — boot verifier**: server generates a random verifier at startup, returned in COMMIT replies; clients detect server restarts.
 - **R3 — deferred-free queues**: two-generation deferred free — blocks freed in generation N are only marked free after N+1 commits, preserving snapshot fallback.
 - **R4 — stale generation safety**: stale `NodeId` accesses now return typed `StoreError::Corrupt` instead of panicking.
+- **R6 — leader lease fencing**: robust leader lease on a dedicated block (not superblock). Unique fencing epoch (timestamp+pid+counter) on every acquire; write-delay-re-read protocol for cross-host races; commit path re-checks epoch (fenced nodes get `Fenced` error). 10s grace period after expiry before new holder can acquire.
+- **R7 — read-only mode**: `Fs::open` respects read-only flag; read-only servers periodically reload the superblock to see new generations from the primary.
+
+**Data safety (P0):**
+- **Exclusive-open lock**: `<image>.lock` with non-blocking `flock`; second writer gets `FsError::Locked`. Same-host protection; cross-host relies on R6 fencing.
+- **Replicate bitmap fix**: uses active slot (not legacy `sb.bitmap_area`) for bitmap area and CRC sidecar.
+- **Tools respect lock**: `fsck`/`mkfs` via `Fs::open` won't run on a live image.
 
 **Performance & scale (Phase 1):**
 - **P3 — O(1) free space**: `Bitmap` maintains an incremental `free_count`; `free_block_count()` no longer scans the bitmap.
@@ -132,7 +139,14 @@ All workspace tests pass (`cargo test --workspace`) except `p4_parallel_reads_sc
 - **R5 — duplicate request cache**: per-connection DRC keyed by RPC xid; retransmitted COMPOUNDs get the cached reply instead of re-executing non-idempotent ops.
 - **P9 — dirty-data backpressure**: WRITEs get `NFS4ERR_DELAY` when uncommitted dirty bytes exceed the threshold (default 256 MiB), bounding memory.
 - **T9 — NFS fault tests**: wire-level fault injection — arm fault points on the running server, verify `NFS4ERR_IO`, server survival, and retry success.
+- **S4 — paged bitmap**: `PagedBitmap` wired into `Shared`; 16 TiB RSS test passes at 5.5 MiB. Bitmap CRC verification and commit stream pages (no 3× materialization).
 - **Test fixes**: client decoder now consumes COMMIT's 8-byte verifier (was misaligning multi-op compounds); DATA_SYNC4 expectation corrected for the R2 FILE_SYNC upgrade.
+
+**Testing (Phase 2):**
+- **T4 — loom models**: TxgCoord wait/notify/error protocol + P1 commit-split model (E2 txg close at flush, specific txg publish, no early ack). Run with `RUSTFLAGS="--cfg loom" cargo test --release --test t4_loom`.
+- **T7 — chaos**: multi-threaded kill-9 test (4 writers, FILE_SYNC + COMMIT hammer) on 8 GiB image; ledger verification. 1-hour nightly version is `--ignored`.
+- **T3 — fuzz**: 6 targets (rpc_frame, xdr_compound, decode_node, superblock, referral, backup); 1-hour runs via nightly CI.
+- **Nightly CI**: GitHub Actions workflow (`.github/workflows/nightly.yml`) runs fuzz (6×1h), loom, and T7 chaos daily at 2am UTC.
 
 **Earlier:**
 - **Crash safety**: per-block CRC32C sidecars on the allocation bitmap with fallback to the older superblock generation on corruption; post-unlink commit so reopen-after-crash can't resurrect deleted files; fixed a spurious transaction-group dirty flag that caused nondeterministic generation advances.
@@ -144,11 +158,11 @@ All workspace tests pass (`cargo test --workspace`) except `p4_parallel_reads_sc
 
 ### Known gaps
 
-- **P4 scaling gate**: `p4_parallel_reads_scale` requires 16 cores to verify 8× read scaling; fails RED on smaller hosts by design (not weakened).
-- **T7 nightly**: 1-hour SIGKILL chaos run is `--ignored` by default; needs CI substrate.
+- **P4 scaling gate**: `p4_parallel_reads_scale` requires 16 cores to verify 8× read scaling; fails RED on smaller hosts by design (not weakened). Needs `Arc<Node>` sharded cache redesign (blocked on trait API change).
+- **S3 exact gate**: 10M-inode mount <1s not yet verified (current test: 20K inodes in 2.05ms).
+- **T7 nightly**: 1-hour SIGKILL chaos run is `--ignored` by default; runs via nightly CI.
 - **Multi-hour soak** (100M operations) and fio-over-mounted-NFS haven't run — no mount privileges in this environment.
 - **Perf gate** is currently red: `commit_p99` regressed ~25% vs baseline after the bitmap CRC work. Needs an optimize-or-rebaseline decision.
-- **Paged bitmap** core is done but not yet integrated into `Fs` (18 call sites still use the in-memory bitmap).
 - **Quotas** are accounting only, keyed by client-asserted UID — a resource feature, not a security boundary.
 - **Auth**: `AUTH_SYS` only. No Kerberos, no transport encryption. See `docs/security-decisions.md`.
 
