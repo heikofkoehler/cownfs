@@ -600,7 +600,7 @@ pub struct Fs {
     /// frees them; they return to `pending_free` once no snapshot (and
     /// not the live tree) references them. Rebuilt from the snapshot
     /// records on open; purely in-memory.
-    snapshot_pinned: std::collections::HashSet<u64>,
+    snapshot_pinned: Option<std::collections::HashSet<u64>>,
     /// Transaction group coordination. Shared via Arc so the background
     /// sync thread and waiters can coordinate without the Fs lock.
     txg: Arc<TxgCoord>,
@@ -876,7 +876,7 @@ impl Fs {
             snaps: SnapTree::open(sa, sroot, 0),
             next_inode: ROOT_INO + 1,
             next_snap: 1,
-            snapshot_pinned: std::collections::HashSet::new(),
+            snapshot_pinned: None,
             txg: Arc::new(TxgCoord::new()),
             quotas: std::collections::HashMap::new(),
             quota_usage: std::collections::HashMap::new(),
@@ -1176,7 +1176,7 @@ impl Fs {
             snaps,
             next_inode,
             next_snap,
-            snapshot_pinned: std::collections::HashSet::new(),
+            snapshot_pinned: None,
             txg: Arc::new(TxgCoord::new()),
             quotas: std::collections::HashMap::new(),
             // S3: filled in below (persisted table or rebuild).
@@ -1194,7 +1194,8 @@ impl Fs {
             sync_count: std::sync::atomic::AtomicU64::new(0),
             commit_mutex: std::sync::Mutex::new(()),
         };
-        fs.rebuild_pinned()?;
+        // S3: snapshot_pinned is lazy (None) — rebuilt on first use via
+        // ensure_pinned(). No O(snapshots*extents) walk on the mount path.
         // S3: quota usage comes from the persisted table when available;
         // otherwise fall back to the O(inodes) rebuild (legacy images,
         // corrupt table, or UID overflow).
@@ -1236,8 +1237,30 @@ impl Fs {
                 }
             }
         }
-        self.snapshot_pinned = pinned;
+        self.snapshot_pinned = Some(pinned);
         Ok(())
+    }
+
+    /// Ensure the snapshot-pinned set is built (lazy; S3 avoids the O(everything)
+    /// walk on open). Rebuilds from snapshot records on first use.
+    fn ensure_pinned(&mut self) -> Result<(), FsError> {
+        if self.snapshot_pinned.is_none() {
+            self.rebuild_pinned()?;
+        }
+        Ok(())
+    }
+
+    /// Check if a block is pinned by a snapshot. If the pinned set hasn't
+    /// been built yet (lazy), builds it. On build failure, conservatively
+    /// returns true (treat as pinned; don't free).
+    fn is_pinned(&mut self, blk: u64) -> bool {
+        if self.ensure_pinned().is_err() {
+            return true;
+        }
+        self.snapshot_pinned
+            .as_ref()
+            .map(|s| s.contains(&blk))
+            .unwrap_or(true)
     }
 
     /// Filesystem UUID (for filehandles).
@@ -2502,7 +2525,7 @@ impl Fs {
     /// snapshot keep their bit set until the last pinning snapshot is
     /// deleted (see `snapshot_delete`).
     fn free_block(&mut self, blk: u64) {
-        if self.snapshot_pinned.contains(&blk) {
+        if self.is_pinned(blk) {
             // Pinned by a snapshot: keep the bit set. The block is
             // reclaimed in `snapshot_delete` when the last pinning
             // snapshot goes away.
@@ -3066,10 +3089,13 @@ impl Fs {
             // A3: in-place overwrite if the block was allocated in the current
             // txg (not yet committed, so no crash-safety issue) and is not
             // pinned by a snapshot. Otherwise CoW (allocate new).
+            // S3: ensure the lazy pinned set is built before checking.
+            self.ensure_pinned()?;
+            let pinned = self.snapshot_pinned.as_ref().unwrap();
             match old {
                 Some(ext)
                     if self.txg_allocated.lock().unwrap().contains(&ext.blk)
-                        && !self.snapshot_pinned.contains(&ext.blk) =>
+                        && !pinned.contains(&ext.blk) =>
                 {
                     // In-place: reuse the block.
                     let blk = ext.blk;
@@ -3250,9 +3276,12 @@ impl Fs {
         }
         // Pin the snapshot's data blocks: the live tree may overwrite
         // them, but they must not be reallocated until this snapshot dies.
+        // S3: ensure the lazy set is built first.
+        self.ensure_pinned()?;
+        let pinned = self.snapshot_pinned.as_mut().unwrap();
         for (_, ext) in self.extents.to_sorted_vec()? {
             for b in ext.blk..ext.blk + ext.len as u64 {
-                self.snapshot_pinned.insert(b);
+                pinned.insert(b);
             }
         }
         Ok(id)
@@ -3304,6 +3333,7 @@ impl Fs {
     /// `pending_free` for reclamation at commit.
     fn reclaim_pinned(&mut self, deleted_blocks: Vec<u64>) -> Result<(), FsError> {
         self.rebuild_pinned()?;
+        let pinned = self.snapshot_pinned.as_ref().unwrap();
         let mut live: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for (_, ext) in self.extents.to_sorted_vec()? {
             for b in ext.blk..ext.blk + ext.len as u64 {
@@ -3311,7 +3341,7 @@ impl Fs {
             }
         }
         for blk in deleted_blocks {
-            if !self.snapshot_pinned.contains(&blk) && !live.contains(&blk) {
+            if !pinned.contains(&blk) && !live.contains(&blk) {
                 self.shared.lock().unwrap().pending_free[0].push(blk);
             }
         }
