@@ -119,6 +119,10 @@ pub struct Superblock {
     /// (legacy 256-byte header). Open falls back to the reachability walk.
     #[allow(dead_code)]
     pub has_live_counts: bool,
+    /// Not serialized: true if the on-disk header has the free_blocks
+    /// field (320-byte header). Older headers (256/312 bytes) decode with
+    /// free_blocks=0; open recomputes via popcount (N8).
+    pub has_free_blocks: bool,
 }
 
 impl Superblock {
@@ -252,6 +256,7 @@ impl Superblock {
             // S4: S3-era images (312 bytes) have no free_blocks → 0.
             free_blocks: if has_free_blocks { u64_at(312)? } else { 0 },
             has_live_counts: !legacy,
+            has_free_blocks,
         })
     }
 
@@ -296,6 +301,7 @@ impl Superblock {
             live_snaps: 0,
             free_blocks: 0,
             has_live_counts: true,
+            has_free_blocks: true,
         }
     }
 }

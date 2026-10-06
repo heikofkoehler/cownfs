@@ -308,6 +308,39 @@ impl PagedBitmap {
         self.total_free = n;
     }
 
+    /// Recompute the total free count by reading all bitmap pages from
+    /// disk and popcounting. Used on open for pre-S4 images whose
+    /// superblock has no persisted free_blocks (N8). O(bitmap), but only
+    /// runs once on upgrade.
+    pub fn recompute_free_count(&mut self) -> io::Result<u64> {
+        let (dev, area_start) = match (self.dev.clone(), self.area_start) {
+            (Some(d), a) => (d, a),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "paged bitmap without device",
+                ))
+            }
+        };
+        let mut total_free = 0u64;
+        // bitmap_blocks is the number of 4KiB blocks in the bitmap area.
+        // Each block holds 32768 bits.
+        for page_idx in 0..self.bitmap_blocks {
+            let words = Self::read_page(&dev, area_start, page_idx)?;
+            for w in words {
+                // Count zero bits (free blocks). Each word has 64 bits.
+                total_free += w.count_zeros() as u64;
+            }
+        }
+        // The bitmap may have padding bits beyond nbits; subtract them.
+        let total_bits = self.bitmap_blocks * 32768;
+        if total_bits > self.nbits {
+            total_free -= total_bits - self.nbits;
+        }
+        self.total_free = total_free;
+        Ok(total_free)
+    }
+
     pub fn len(&self) -> u64 {
         self.nbits
     }

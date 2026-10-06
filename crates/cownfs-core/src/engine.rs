@@ -1056,6 +1056,15 @@ impl Fs {
         // (load_bitmap set area_start; we add the device here.)
         let area_start = sb.bitmap_start + active_slot as u64 * sb.bitmap_blocks;
         bitmap = bitmap.with_device(Arc::clone(&dev), area_start);
+        // N8: pre-S4 images (256/312-byte headers) have no persisted
+        // free_blocks. Recompute via popcount so df/reporting is correct.
+        // This is O(bitmap) but only runs once on upgrade; the next commit
+        // persists the correct value.
+        if !sb.has_free_blocks {
+            bitmap
+                .recompute_free_count()
+                .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+        }
         // R3 fix: free the persisted deferred-free queue. These blocks became
         // unreachable in the committed (or ancestor) generation; the in-memory
         // queue was lost on shutdown. Freeing them here prevents the
