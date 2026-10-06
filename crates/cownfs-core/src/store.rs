@@ -126,6 +126,11 @@ pub struct Shared {
     /// On `persist_bitmap` (for gen N+1): mark [1] (freed in N-1) as free,
     /// move [0] (freed in N) to [1], clear [0].
     pub pending_free: [Vec<u64>; 2],
+    /// Last generation used for each block (in-memory). When a block is
+    /// reallocated, the generation is bumped from this map (not just from
+    /// disk, which may have unflushed stale data). Prevents stale NodeId
+    /// aliasing across free/reallocate cycles.
+    pub last_gen: HashMap<u64, u32>,
     /// Armed deterministic crash point (P7). Checked at commit boundaries.
     pub fault_point: Option<crate::engine::FaultPoint>,
 }
@@ -662,26 +667,30 @@ impl<K: BlockCodec + Clone, V: BlockCodec + Clone> NodeStore<K, V> for BlockAren
 
     fn alloc(&self, node: Node<K, V>) -> Result<NodeId, StoreError> {
         debug_assert_eq!(node.refcount, 1);
-        let block = self
-            .shared
-            .lock()
-            .unwrap()
-            .bitmap
-            .alloc()
-            .map_err(StoreError::Io)?
-            .ok_or(StoreError::NoSpace)?;
-        // Fresh blocks start a new generation. Reused blocks keep bumping it
-        // so stale in-memory ids can never alias the new node.
-        let gen = {
-            let mut buf = [0u8; BLOCK_SIZE];
-            // Best-effort: read the previous header for its generation.
-            // (A short read on a never-written block yields zeros.)
-            let _ = self.dev.read_block(block, &mut buf);
-            if u16::from_le_bytes([buf[0], buf[1]]) == NODE_MAGIC {
-                u32::from_le_bytes(buf[8..12].try_into().unwrap()).wrapping_add(1)
-            } else {
-                1
-            }
+        let (block, gen) = {
+            let mut shared = self.shared.lock().unwrap();
+            let block = shared
+                .bitmap
+                .alloc()
+                .map_err(StoreError::Io)?
+                .ok_or(StoreError::NoSpace)?;
+            // Generation: bump from the in-memory last_gen (authoritative for
+            // unflushed blocks) or from disk (for blocks not in memory).
+            // This prevents stale NodeId aliasing when a block is freed and
+            // reallocated before the free is flushed to disk.
+            let disk_gen = {
+                let mut buf = [0u8; BLOCK_SIZE];
+                let _ = self.dev.read_block(block, &mut buf);
+                if u16::from_le_bytes([buf[0], buf[1]]) == NODE_MAGIC {
+                    u32::from_le_bytes(buf[8..12].try_into().unwrap())
+                } else {
+                    0
+                }
+            };
+            let mem_gen = shared.last_gen.get(&block).copied().unwrap_or(0);
+            let gen = disk_gen.max(mem_gen).wrapping_add(1);
+            shared.last_gen.insert(block, gen);
+            (block, gen)
         };
         {
             let mut cache = self.cache.write().unwrap();
@@ -870,6 +879,7 @@ mod tests {
                     dev: Arc::clone(&dev),
                     bitmap,
                     pending_free: [Vec::new(), Vec::new()],
+                    last_gen: HashMap::new(),
                     fault_point: None,
                 })),
                 path,

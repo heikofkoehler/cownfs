@@ -905,6 +905,7 @@ impl Fs {
             dev: Arc::clone(&dev),
             bitmap,
             pending_free: [Vec::new(), Vec::new()],
+            last_gen: std::collections::HashMap::new(),
             fault_point: None,
         }));
 
@@ -1133,6 +1134,7 @@ impl Fs {
             dev: Arc::clone(&dev),
             bitmap,
             pending_free: [Vec::new(), Vec::new()],
+            last_gen: std::collections::HashMap::new(),
             fault_point: None,
         }));
 
