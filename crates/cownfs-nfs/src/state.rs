@@ -67,6 +67,339 @@ pub struct LockRecord {
 /// state touches exactly one bucket and needs only that bucket's lock.
 const NUM_BUCKETS: usize = 64;
 
+/// State mutation log record (v40-state-partitioning §4.3, step 4).
+/// Every state *mutation* appends one of these to the in-memory log;
+/// a standby tails the log and applies the records to stay warm.
+/// Lease renewals are deliberately not logged.
+#[derive(Debug, Clone)]
+pub enum StateLogRecord {
+    ClientConfirmed {
+        clientid: u64,
+        verifier: [u8; 8],
+        name: Vec<u8>,
+    },
+    ClientExpired {
+        clientid: u64,
+    },
+    Open {
+        clientid: u64,
+        owner: Vec<u8>,
+        file_ino: u64,
+        share_access: u32,
+        share_deny: u32,
+        stateid: StateId,
+        seqid: u32,
+    },
+    Close {
+        stateid: StateId,
+    },
+    OpenDowngrade {
+        stateid: StateId,
+        share_access: u32,
+        share_deny: u32,
+        seqid: u32,
+    },
+    Lock {
+        clientid: u64,
+        owner: Vec<u8>,
+        file_ino: u64,
+        offset: u64,
+        length: u64,
+        locktype: u32,
+        stateid: StateId,
+        seqid: u32,
+    },
+    Unlock {
+        stateid: StateId,
+        offset: u64,
+        length: u64,
+        seqid: u32,
+    },
+}
+
+/// Maximum log records retained in memory. A standby that falls more than
+/// this far behind must resync (not implemented in v1; it errors).
+const MAX_LOG_RECORDS: usize = 1_000_000;
+
+impl StateLogRecord {
+    /// Discriminant for the wire format.
+    fn tag(&self) -> u8 {
+        match self {
+            StateLogRecord::ClientConfirmed { .. } => 1,
+            StateLogRecord::ClientExpired { .. } => 2,
+            StateLogRecord::Open { .. } => 3,
+            StateLogRecord::Close { .. } => 4,
+            StateLogRecord::OpenDowngrade { .. } => 5,
+            StateLogRecord::Lock { .. } => 6,
+            StateLogRecord::Unlock { .. } => 7,
+        }
+    }
+
+    /// Encode to a byte vector (simple binary format for the tail stream).
+    pub fn encode(&self) -> Vec<u8> {
+        fn u64b(out: &mut Vec<u8>, v: u64) {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        fn u32b(out: &mut Vec<u8>, v: u32) {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        fn bytes(out: &mut Vec<u8>, b: &[u8]) {
+            u32b(out, b.len() as u32);
+            out.extend_from_slice(b);
+        }
+        fn sid(out: &mut Vec<u8>, s: &StateId) {
+            out.extend_from_slice(&s.seqid.to_be_bytes());
+            out.extend_from_slice(&s.other);
+        }
+        let mut out = Vec::new();
+        out.push(self.tag());
+        match self {
+            StateLogRecord::ClientConfirmed {
+                clientid,
+                verifier,
+                name,
+            } => {
+                u64b(&mut out, *clientid);
+                out.extend_from_slice(verifier);
+                bytes(&mut out, name);
+            }
+            StateLogRecord::ClientExpired { clientid } => {
+                u64b(&mut out, *clientid);
+            }
+            StateLogRecord::Open {
+                clientid,
+                owner,
+                file_ino,
+                share_access,
+                share_deny,
+                stateid,
+                seqid,
+            } => {
+                u64b(&mut out, *clientid);
+                bytes(&mut out, owner);
+                u64b(&mut out, *file_ino);
+                u32b(&mut out, *share_access);
+                u32b(&mut out, *share_deny);
+                sid(&mut out, stateid);
+                u32b(&mut out, *seqid);
+            }
+            StateLogRecord::Close { stateid } => {
+                sid(&mut out, stateid);
+            }
+            StateLogRecord::OpenDowngrade {
+                stateid,
+                share_access,
+                share_deny,
+                seqid,
+            } => {
+                sid(&mut out, stateid);
+                u32b(&mut out, *share_access);
+                u32b(&mut out, *share_deny);
+                u32b(&mut out, *seqid);
+            }
+            StateLogRecord::Lock {
+                clientid,
+                owner,
+                file_ino,
+                offset,
+                length,
+                locktype,
+                stateid,
+                seqid,
+            } => {
+                u64b(&mut out, *clientid);
+                bytes(&mut out, owner);
+                u64b(&mut out, *file_ino);
+                u64b(&mut out, *offset);
+                u64b(&mut out, *length);
+                u32b(&mut out, *locktype);
+                sid(&mut out, stateid);
+                u32b(&mut out, *seqid);
+            }
+            StateLogRecord::Unlock {
+                stateid,
+                offset,
+                length,
+                seqid,
+            } => {
+                sid(&mut out, stateid);
+                u64b(&mut out, *offset);
+                u64b(&mut out, *length);
+                u32b(&mut out, *seqid);
+            }
+        }
+        out
+    }
+
+    /// Decode from a byte slice. Returns (record, bytes_consumed).
+    pub fn decode(buf: &[u8]) -> Option<(Self, usize)> {
+        if buf.is_empty() {
+            return None;
+        }
+        let tag = buf[0];
+        let mut pos = 1usize;
+        let mut u64b = |buf: &[u8], pos: &mut usize| -> Option<u64> {
+            if buf.len() < *pos + 8 {
+                return None;
+            }
+            let v = u64::from_be_bytes(buf[*pos..*pos + 8].try_into().ok()?);
+            *pos += 8;
+            Some(v)
+        };
+        let mut u32b = |buf: &[u8], pos: &mut usize| -> Option<u32> {
+            if buf.len() < *pos + 4 {
+                return None;
+            }
+            let v = u32::from_be_bytes(buf[*pos..*pos + 4].try_into().ok()?);
+            *pos += 4;
+            Some(v)
+        };
+        let mut bytes = |buf: &[u8], pos: &mut usize| -> Option<Vec<u8>> {
+            let len = u32b(buf, pos)? as usize;
+            if buf.len() < *pos + len {
+                return None;
+            }
+            let v = buf[*pos..*pos + len].to_vec();
+            *pos += len;
+            Some(v)
+        };
+        let mut sid = |buf: &[u8], pos: &mut usize| -> Option<StateId> {
+            let seqid = u32b(buf, pos)?;
+            if buf.len() < *pos + 12 {
+                return None;
+            }
+            let mut other = [0u8; 12];
+            other.copy_from_slice(&buf[*pos..*pos + 12]);
+            *pos += 12;
+            Some(StateId { seqid, other })
+        };
+        let rec = match tag {
+            1 => {
+                let clientid = u64b(buf, &mut pos)?;
+                if buf.len() < pos + 8 {
+                    return None;
+                }
+                let mut verifier = [0u8; 8];
+                verifier.copy_from_slice(&buf[pos..pos + 8]);
+                pos += 8;
+                let name = bytes(buf, &mut pos)?;
+                StateLogRecord::ClientConfirmed {
+                    clientid,
+                    verifier,
+                    name,
+                }
+            }
+            2 => {
+                let clientid = u64b(buf, &mut pos)?;
+                StateLogRecord::ClientExpired { clientid }
+            }
+            3 => {
+                let clientid = u64b(buf, &mut pos)?;
+                let owner = bytes(buf, &mut pos)?;
+                let file_ino = u64b(buf, &mut pos)?;
+                let share_access = u32b(buf, &mut pos)?;
+                let share_deny = u32b(buf, &mut pos)?;
+                let stateid = sid(buf, &mut pos)?;
+                let seqid = u32b(buf, &mut pos)?;
+                StateLogRecord::Open {
+                    clientid,
+                    owner,
+                    file_ino,
+                    share_access,
+                    share_deny,
+                    stateid,
+                    seqid,
+                }
+            }
+            4 => {
+                let stateid = sid(buf, &mut pos)?;
+                StateLogRecord::Close { stateid }
+            }
+            5 => {
+                let stateid = sid(buf, &mut pos)?;
+                let share_access = u32b(buf, &mut pos)?;
+                let share_deny = u32b(buf, &mut pos)?;
+                let seqid = u32b(buf, &mut pos)?;
+                StateLogRecord::OpenDowngrade {
+                    stateid,
+                    share_access,
+                    share_deny,
+                    seqid,
+                }
+            }
+            6 => {
+                let clientid = u64b(buf, &mut pos)?;
+                let owner = bytes(buf, &mut pos)?;
+                let file_ino = u64b(buf, &mut pos)?;
+                let offset = u64b(buf, &mut pos)?;
+                let length = u64b(buf, &mut pos)?;
+                let locktype = u32b(buf, &mut pos)?;
+                let stateid = sid(buf, &mut pos)?;
+                let seqid = u32b(buf, &mut pos)?;
+                StateLogRecord::Lock {
+                    clientid,
+                    owner,
+                    file_ino,
+                    offset,
+                    length,
+                    locktype,
+                    stateid,
+                    seqid,
+                }
+            }
+            7 => {
+                let stateid = sid(buf, &mut pos)?;
+                let offset = u64b(buf, &mut pos)?;
+                let length = u64b(buf, &mut pos)?;
+                let seqid = u32b(buf, &mut pos)?;
+                StateLogRecord::Unlock {
+                    stateid,
+                    offset,
+                    length,
+                    seqid,
+                }
+            }
+            _ => return None,
+        };
+        Some((rec, pos))
+    }
+}
+
+/// In-memory state mutation log.
+struct StateLog {
+    /// (sequence number, record), in order. Sequence numbers start at 1.
+    records: std::collections::VecDeque<(u64, StateLogRecord)>,
+    next_seq: u64,
+}
+
+impl StateLog {
+    fn new() -> Self {
+        StateLog {
+            records: std::collections::VecDeque::new(),
+            next_seq: 1,
+        }
+    }
+
+    /// Append a record, returning its sequence number.
+    fn append(&mut self, record: StateLogRecord) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.records.push_back((seq, record));
+        while self.records.len() > MAX_LOG_RECORDS {
+            self.records.pop_front();
+        }
+        seq
+    }
+
+    /// Oldest retained sequence number, or next_seq if empty.
+    fn oldest_seq(&self) -> u64 {
+        self.records
+            .front()
+            .map(|(s, _)| *s)
+            .unwrap_or(self.next_seq)
+    }
+}
+
 /// Per-bucket state: all client/open/lock records for the clientids that
 /// hash to this bucket.
 struct Bucket {
@@ -109,11 +442,16 @@ pub struct StateManager {
     /// Random per process boot; embedded in every stateid's `other` field
     /// so a stateid minted before a restart can never alias one minted
     /// after (defense for the future state-log/WAL replay path).
-    boot_gen: u32,
+    /// A standby adopts the primary's (server_id, boot_gen) when tailing
+    /// (§4.3 step 4) so it owns the primary's stateids on failover.
+    boot_gen: AtomicU32,
     /// Low 32 bits of issued clientids. Never 0 (0 clientid = invalid).
     next_client_seq: AtomicU32,
     next_stateid_seq: AtomicU32,
     lease_duration: Duration,
+    /// State mutation log (§4.3 step 4). Appended on every mutation;
+    /// tailed by the standby. Locked alone, never nested.
+    log: Mutex<StateLog>,
 }
 
 /// Generate a random boot generation from OS entropy, falling back to a
@@ -159,10 +497,11 @@ impl StateManager {
             conflict: Mutex::new(()),
             grace_until: Mutex::new(None),
             server_id: AtomicU32::new(server_id),
-            boot_gen: random_boot_gen(),
+            boot_gen: AtomicU32::new(random_boot_gen()),
             next_client_seq: AtomicU32::new(1),
             next_stateid_seq: AtomicU32::new(1),
             lease_duration,
+            log: Mutex::new(StateLog::new()),
         }
     }
 
@@ -189,6 +528,181 @@ impl StateManager {
             Some(t) => t > Instant::now(),
             None => false,
         }
+    }
+
+    /// Append a mutation record to the state log. Returns the sequence number.
+    /// Called by the primary on every state mutation; the standby tails these.
+    fn log_append(&self, record: StateLogRecord) -> u64 {
+        self.log.lock().unwrap().append(record)
+    }
+
+    /// Read log records with seq >= `from_seq`. Returns (records, oldest_seq).
+    /// If `from_seq` is older than the oldest retained record, returns an
+    /// error (the tailer has fallen too far behind).
+    pub fn log_since(&self, from_seq: u64) -> Result<(Vec<(u64, StateLogRecord)>, u64), NfsError> {
+        let log = self.log.lock().unwrap();
+        let oldest = log.oldest_seq();
+        if from_seq < oldest {
+            return Err(NfsError::Status(NFS4ERR_INVAL));
+        }
+        let out: Vec<_> = log
+            .records
+            .iter()
+            .filter(|(s, _)| *s >= from_seq)
+            .cloned()
+            .collect();
+        Ok((out, oldest))
+    }
+
+    /// Current log sequence number (next to be assigned).
+    pub fn log_next_seq(&self) -> u64 {
+        self.log.lock().unwrap().next_seq
+    }
+
+    /// Oldest retained log sequence number (for the tail server).
+    pub fn log_oldest_seq(&self) -> u64 {
+        self.log.lock().unwrap().oldest_seq()
+    }
+
+    /// Apply a tailed log record (standby side). Replicates the primary's
+    /// mutation without re-validating: the primary already checked.
+    /// Idempotent for the record types we generate.
+    pub fn apply_record(&self, record: &StateLogRecord) {
+        match record {
+            StateLogRecord::ClientConfirmed {
+                clientid,
+                verifier,
+                name,
+            } => {
+                let idx = Self::bucket_idx(*clientid);
+                let mut b = self.buckets[idx].lock().unwrap();
+                let c = b.clients.entry(*clientid).or_insert_with(|| ClientRecord {
+                    verifier: *verifier,
+                    name: name.clone(),
+                    confirmed: false,
+                    lease_expiry: Instant::now() + self.lease_duration,
+                });
+                c.confirmed = true;
+                c.lease_expiry = Instant::now() + self.lease_duration;
+                self.names.lock().unwrap().insert(name.clone(), *clientid);
+            }
+            StateLogRecord::ClientExpired { clientid } => {
+                self.remove_client(*clientid);
+            }
+            StateLogRecord::Open {
+                clientid,
+                owner,
+                file_ino,
+                share_access,
+                share_deny,
+                stateid,
+                seqid,
+            } => {
+                let idx = Self::bucket_idx(*clientid);
+                let mut b = self.buckets[idx].lock().unwrap();
+                b.opens.insert(
+                    (*clientid, owner.clone()),
+                    OpenRecord {
+                        clientid: *clientid,
+                        owner: owner.clone(),
+                        file_ino: *file_ino,
+                        stateid: stateid.clone(),
+                        share_access: *share_access,
+                        share_deny: *share_deny,
+                        seqid: *seqid,
+                    },
+                );
+            }
+            StateLogRecord::Close { stateid } => {
+                // Find and remove the open with this stateid.
+                for bucket in &self.buckets {
+                    let mut b = bucket.lock().unwrap();
+                    if let Some(key) = b
+                        .opens
+                        .iter()
+                        .find(|(_, r)| r.stateid == *stateid)
+                        .map(|(k, _)| k.clone())
+                    {
+                        b.opens.remove(&key);
+                        break;
+                    }
+                }
+            }
+            StateLogRecord::OpenDowngrade {
+                stateid,
+                share_access,
+                share_deny,
+                seqid,
+            } => {
+                for bucket in &self.buckets {
+                    let mut b = bucket.lock().unwrap();
+                    if let Some(r) = b.opens.values_mut().find(|r| r.stateid == *stateid) {
+                        r.share_access = *share_access;
+                        r.share_deny = *share_deny;
+                        r.seqid = *seqid;
+                        break;
+                    }
+                }
+            }
+            StateLogRecord::Lock {
+                clientid,
+                owner,
+                file_ino,
+                offset,
+                length,
+                locktype,
+                stateid,
+                seqid,
+            } => {
+                let idx = Self::bucket_idx(*clientid);
+                let mut b = self.buckets[idx].lock().unwrap();
+                b.locks.insert(
+                    (*clientid, owner.clone()),
+                    LockRecord {
+                        clientid: *clientid,
+                        owner: owner.clone(),
+                        file_ino: *file_ino,
+                        stateid: stateid.clone(),
+                        offset: *offset,
+                        length: *length,
+                        locktype: *locktype,
+                        seqid: *seqid,
+                    },
+                );
+            }
+            StateLogRecord::Unlock {
+                stateid,
+                offset,
+                length,
+                ..
+            } => {
+                for bucket in &self.buckets {
+                    let mut b = bucket.lock().unwrap();
+                    if let Some(key) = b
+                        .locks
+                        .iter()
+                        .find(|(_, r)| {
+                            r.stateid == *stateid && r.offset == *offset && r.length == *length
+                        })
+                        .map(|(k, _)| k.clone())
+                    {
+                        b.locks.remove(&key);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Remove a client and all its state (helper for apply/expiry).
+    fn remove_client(&self, clientid: u64) {
+        let idx = Self::bucket_idx(clientid);
+        let mut b = self.buckets[idx].lock().unwrap();
+        if let Some(c) = b.clients.remove(&clientid) {
+            self.names.lock().unwrap().remove(&c.name);
+        }
+        b.opens.retain(|(cid, _), _| *cid != clientid);
+        b.locks.retain(|(cid, _), _| *cid != clientid);
     }
 
     /// Bucket index for a clientid. The low 32 bits are a per-server
@@ -235,6 +749,17 @@ impl StateManager {
         self.server_id.load(Ordering::Relaxed)
     }
 
+    /// Adopt a boot generation (standby tailing the primary's log, §4.3).
+    /// Must be called before any local state exists.
+    pub fn set_boot_gen(&self, boot_gen: u32) {
+        self.boot_gen.store(boot_gen, Ordering::Relaxed);
+    }
+
+    /// The boot generation this manager stamps into stateids.
+    pub fn boot_gen(&self) -> u32 {
+        self.boot_gen.load(Ordering::Relaxed)
+    }
+
     /// Extract the issuing server id from a clientid.
     pub fn clientid_server_id(clientid: u64) -> u32 {
         (clientid >> 32) as u32
@@ -256,7 +781,7 @@ impl StateManager {
     /// STALE_STATEID, never alias).
     pub fn owns_stateid(&self, stateid: &StateId) -> bool {
         Self::stateid_server_id(stateid) == self.server_id()
-            && Self::stateid_boot_gen(stateid) == self.boot_gen
+            && Self::stateid_boot_gen(stateid) == self.boot_gen.load(Ordering::Relaxed)
     }
 
     /// For tests: use a short lease.
@@ -268,7 +793,7 @@ impl StateManager {
         let seq = Self::alloc_seq(&self.next_stateid_seq);
         let mut b = [0u8; 12];
         b[0..4].copy_from_slice(&self.server_id().to_be_bytes());
-        b[4..8].copy_from_slice(&self.boot_gen.to_be_bytes());
+        b[4..8].copy_from_slice(&self.boot_gen.load(Ordering::Relaxed).to_be_bytes());
         b[8..12].copy_from_slice(&seq.to_be_bytes());
         StateId { seqid: 0, other: b }
     }
@@ -291,12 +816,18 @@ impl StateManager {
             .filter(|(_, c)| c.lease_expiry < now)
             .map(|(id, _)| *id)
             .collect();
-        for id in expired {
-            if let Some(c) = b.clients.remove(&id) {
+        for id in &expired {
+            if let Some(c) = b.clients.remove(id) {
                 names.remove(&c.name);
             }
-            b.opens.retain(|(cid, _), _| *cid != id);
-            b.locks.retain(|(cid, _), _| *cid != id);
+            b.opens.retain(|(cid, _), _| cid != id);
+            b.locks.retain(|(cid, _), _| cid != id);
+        }
+        // Log expiries after releasing bucket/names locks.
+        drop(b);
+        drop(names);
+        for id in expired {
+            self.log_append(StateLogRecord::ClientExpired { clientid: id });
         }
     }
 
@@ -381,15 +912,25 @@ impl StateManager {
 
     /// SETCLIENTID_CONFIRM: confirm a client. Returns true if confirmed.
     pub fn confirm(&self, clientid: u64, verifier: [u8; 8]) -> bool {
-        let mut b = self.buckets[Self::bucket_idx(clientid)].lock().unwrap();
-        match b.clients.get_mut(&clientid) {
-            Some(c) if c.verifier == verifier => {
-                c.confirmed = true;
-                c.lease_expiry = Instant::now() + self.lease_duration;
-                true
+        let (ok, name) = {
+            let mut b = self.buckets[Self::bucket_idx(clientid)].lock().unwrap();
+            match b.clients.get_mut(&clientid) {
+                Some(c) if c.verifier == verifier => {
+                    c.confirmed = true;
+                    c.lease_expiry = Instant::now() + self.lease_duration;
+                    (true, c.name.clone())
+                }
+                _ => (false, Vec::new()),
             }
-            _ => false,
+        };
+        if ok {
+            self.log_append(StateLogRecord::ClientConfirmed {
+                clientid,
+                verifier,
+                name,
+            });
         }
+        ok
     }
 
     /// RENEW: renew the lease. Returns true if client exists.
@@ -429,51 +970,55 @@ impl StateManager {
         reclaim: bool,
     ) -> Result<OpenRecord, NfsError> {
         self.check_client(clientid)?;
-        if reclaim {
+        let rec = if reclaim {
             if !self.in_grace() {
                 return Err(NfsError::Status(NFS4ERR_NO_GRACE));
             }
-            return Ok(self.insert_open(
+            self.insert_open(seqid, clientid, owner, file_ino, share_access, share_deny)
+        } else {
+            if self.in_grace() {
+                return Err(NfsError::Status(NFS4ERR_GRACE));
+            }
+            // Serialize conflict-check+insert vs other open()/lock() calls.
+            // Lock ordering: conflict -> bucket.
+            let _conflict = self.conflict.lock().unwrap();
+            // Check share conflicts with existing opens on the same file
+            // (excluding our own opens from the same client).
+            for bucket in &self.buckets {
+                let b = bucket.lock().unwrap();
+                for o in b.opens.values() {
+                    if o.file_ino != file_ino || o.clientid == clientid {
+                        continue;
+                    }
+                    // If existing denies what we want, or we deny what existing has.
+                    let deny_conflict = (o.share_deny & share_access) != 0;
+                    let access_conflict = (share_deny & o.share_access) != 0;
+                    if deny_conflict || access_conflict {
+                        return Err(NfsError::Status(NFS4ERR_DENIED));
+                    }
+                }
+            }
+            let mut b = self.buckets[Self::bucket_idx(clientid)].lock().unwrap();
+            self.insert_open_in(
+                &mut b,
                 seqid,
                 clientid,
                 owner,
                 file_ino,
                 share_access,
                 share_deny,
-            ));
-        }
-        if self.in_grace() {
-            return Err(NfsError::Status(NFS4ERR_GRACE));
-        }
-        // Serialize conflict-check+insert vs other open()/lock() calls.
-        // Lock ordering: conflict -> bucket.
-        let _conflict = self.conflict.lock().unwrap();
-        // Check share conflicts with existing opens on the same file
-        // (excluding our own opens from the same client).
-        for bucket in &self.buckets {
-            let b = bucket.lock().unwrap();
-            for o in b.opens.values() {
-                if o.file_ino != file_ino || o.clientid == clientid {
-                    continue;
-                }
-                // If existing denies what we want, or we deny what existing has.
-                let deny_conflict = (o.share_deny & share_access) != 0;
-                let access_conflict = (share_deny & o.share_access) != 0;
-                if deny_conflict || access_conflict {
-                    return Err(NfsError::Status(NFS4ERR_DENIED));
-                }
-            }
-        }
-        let mut b = self.buckets[Self::bucket_idx(clientid)].lock().unwrap();
-        Ok(self.insert_open_in(
-            &mut b,
-            seqid,
-            clientid,
-            owner,
-            file_ino,
-            share_access,
-            share_deny,
-        ))
+            )
+        };
+        self.log_append(StateLogRecord::Open {
+            clientid: rec.clientid,
+            owner: rec.owner.clone(),
+            file_ino: rec.file_ino,
+            share_access: rec.share_access,
+            share_deny: rec.share_deny,
+            stateid: rec.stateid.clone(),
+            seqid: rec.seqid,
+        });
+        Ok(rec)
     }
 
     /// Merge-or-insert an open record into an already-locked bucket.
@@ -562,26 +1107,34 @@ impl StateManager {
         let found = self.find_open_key(stateid);
         match found {
             Some((idx, k)) => {
-                let mut b = self.buckets[idx].lock().unwrap();
-                // Re-validate under the bucket lock: may have been closed
-                // concurrently between the scan and now.
-                let o = match b.opens.get(&k) {
-                    Some(o) if &o.stateid == stateid => o,
-                    _ => return Err(NfsError::Status(NFS4ERR_EXPIRED)),
-                };
-                if seqid != o.seqid + 1 {
-                    // Replay or bad seqid.
-                    if seqid == o.seqid {
-                        return Ok(()); // Replay: already closed, return success.
+                let removed = {
+                    let mut b = self.buckets[idx].lock().unwrap();
+                    // Re-validate under the bucket lock: may have been closed
+                    // concurrently between the scan and now.
+                    let o = match b.opens.get(&k) {
+                        Some(o) if &o.stateid == stateid => o,
+                        _ => return Err(NfsError::Status(NFS4ERR_EXPIRED)),
+                    };
+                    if seqid != o.seqid + 1 {
+                        // Replay or bad seqid.
+                        if seqid == o.seqid {
+                            return Ok(()); // Replay: already closed, return success.
+                        }
+                        return Err(NfsError::Status(NFS4ERR_BAD_SEQID));
                     }
-                    return Err(NfsError::Status(NFS4ERR_BAD_SEQID));
+                    let clientid = o.clientid;
+                    b.opens.remove(&k);
+                    // Also remove locks held by this open's owner? No, locks are
+                    // separate. But if no opens remain for the file, keep locks
+                    // (they're independent in NFSv4).
+                    self.renew_lease_in(&mut b, clientid);
+                    true
+                };
+                if removed {
+                    self.log_append(StateLogRecord::Close {
+                        stateid: stateid.clone(),
+                    });
                 }
-                let clientid = o.clientid;
-                b.opens.remove(&k);
-                // Also remove locks held by this open's owner? No, locks are
-                // separate. But if no opens remain for the file, keep locks
-                // (they're independent in NFSv4).
-                self.renew_lease_in(&mut b, clientid);
                 Ok(())
             }
             None => Err(NfsError::Status(NFS4ERR_EXPIRED)),
@@ -611,29 +1164,40 @@ impl StateManager {
         let found = self.find_open_key(stateid);
         match found {
             Some((idx, k)) => {
-                let mut b = self.buckets[idx].lock().unwrap();
-                let o = match b.opens.get_mut(&k) {
-                    Some(o) if &o.stateid == stateid => o,
-                    _ => return Err(NfsError::Status(NFS4ERR_EXPIRED)),
-                };
-                if seqid != o.seqid + 1 {
-                    if seqid == o.seqid {
-                        return Ok(o.stateid.clone()); // Replay.
+                let (sid, downgraded) = {
+                    let mut b = self.buckets[idx].lock().unwrap();
+                    let o = match b.opens.get_mut(&k) {
+                        Some(o) if &o.stateid == stateid => o,
+                        _ => return Err(NfsError::Status(NFS4ERR_EXPIRED)),
+                    };
+                    if seqid != o.seqid + 1 {
+                        if seqid == o.seqid {
+                            return Ok(o.stateid.clone()); // Replay.
+                        }
+                        return Err(NfsError::Status(NFS4ERR_BAD_SEQID));
                     }
-                    return Err(NfsError::Status(NFS4ERR_BAD_SEQID));
+                    // Downgrade must be a subset of current modes.
+                    if (share_access & !o.share_access) != 0 || (share_deny & !o.share_deny) != 0 {
+                        return Err(NfsError::Status(NFS4ERR_INVAL));
+                    }
+                    o.share_access = share_access;
+                    o.share_deny = share_deny;
+                    o.seqid = seqid;
+                    // Bump stateid seqid.
+                    o.stateid.seqid += 1;
+                    let sid = o.stateid.clone();
+                    let clientid = o.clientid;
+                    self.renew_lease_in(&mut b, clientid);
+                    (sid, true)
+                };
+                if downgraded {
+                    self.log_append(StateLogRecord::OpenDowngrade {
+                        stateid: stateid.clone(),
+                        share_access,
+                        share_deny,
+                        seqid,
+                    });
                 }
-                // Downgrade must be a subset of current modes.
-                if (share_access & !o.share_access) != 0 || (share_deny & !o.share_deny) != 0 {
-                    return Err(NfsError::Status(NFS4ERR_INVAL));
-                }
-                o.share_access = share_access;
-                o.share_deny = share_deny;
-                o.seqid = seqid;
-                // Bump stateid seqid.
-                o.stateid.seqid += 1;
-                let sid = o.stateid.clone();
-                let clientid = o.clientid;
-                self.renew_lease_in(&mut b, clientid);
                 Ok(sid)
             }
             None => Err(NfsError::Status(NFS4ERR_EXPIRED)),
@@ -661,7 +1225,7 @@ impl StateManager {
         reclaim: bool,
     ) -> Result<LockRecord, NfsError> {
         self.check_client(clientid)?;
-        if reclaim {
+        let rec = if reclaim {
             if !self.in_grace() {
                 return Err(NfsError::Status(NFS4ERR_NO_GRACE));
             }
@@ -679,55 +1243,67 @@ impl StateManager {
             };
             b.locks.insert((clientid, lock_owner), rec.clone());
             self.renew_lease_in(&mut b, clientid);
-            return Ok(rec);
-        }
-        if self.in_grace() {
-            return Err(NfsError::Status(NFS4ERR_GRACE));
-        }
-        // Validate open_stateid if provided (new lock owner).
-        if let Some(ost) = open_stateid {
-            if self.find_open(ost).is_none() {
-                return Err(NfsError::Status(NFS4ERR_EXPIRED));
+            rec
+        } else {
+            if self.in_grace() {
+                return Err(NfsError::Status(NFS4ERR_GRACE));
             }
-        }
-        let _conflict = self.conflict.lock().unwrap();
-        // Check for conflicts with existing locks on the same file.
-        for bucket in &self.buckets {
-            let b = bucket.lock().unwrap();
-            for l in b.locks.values() {
-                if l.file_ino != file_ino {
-                    continue;
+            // Validate open_stateid if provided (new lock owner).
+            if let Some(ost) = open_stateid {
+                if self.find_open(ost).is_none() {
+                    return Err(NfsError::Status(NFS4ERR_EXPIRED));
                 }
-                // Same owner: allow (it's an upgrade/downgrade or overlapping).
-                if l.clientid == clientid && l.owner == lock_owner {
-                    continue;
-                }
-                if ranges_overlap(l.offset, l.length, offset, length) {
-                    // WRITE lock conflicts with any; READ conflicts with WRITE.
-                    let conflict = match (l.locktype, locktype) {
-                        (2, _) | (_, 2) => true, // WRITE_LT conflicts
-                        _ => false,
-                    };
-                    if conflict {
-                        return Err(NfsError::Status(NFS4ERR_LOCKED));
+            }
+            let _conflict = self.conflict.lock().unwrap();
+            // Check for conflicts with existing locks on the same file.
+            for bucket in &self.buckets {
+                let b = bucket.lock().unwrap();
+                for l in b.locks.values() {
+                    if l.file_ino != file_ino {
+                        continue;
+                    }
+                    // Same owner: allow (it's an upgrade/downgrade or overlapping).
+                    if l.clientid == clientid && l.owner == lock_owner {
+                        continue;
+                    }
+                    if ranges_overlap(l.offset, l.length, offset, length) {
+                        // WRITE lock conflicts with any; READ conflicts with WRITE.
+                        let conflict = match (l.locktype, locktype) {
+                            (2, _) | (_, 2) => true, // WRITE_LT conflicts
+                            _ => false,
+                        };
+                        if conflict {
+                            return Err(NfsError::Status(NFS4ERR_LOCKED));
+                        }
                     }
                 }
             }
-        }
-        let mut b = self.buckets[Self::bucket_idx(clientid)].lock().unwrap();
-        let stateid = self.new_stateid();
-        let rec = LockRecord {
-            clientid,
-            owner: lock_owner.clone(),
-            file_ino,
-            stateid: stateid.clone(),
-            offset,
-            length,
-            locktype,
-            seqid: 0,
+            let mut b = self.buckets[Self::bucket_idx(clientid)].lock().unwrap();
+            let stateid = self.new_stateid();
+            let rec = LockRecord {
+                clientid,
+                owner: lock_owner.clone(),
+                file_ino,
+                stateid,
+                offset,
+                length,
+                locktype,
+                seqid: 0,
+            };
+            b.locks.insert((clientid, lock_owner), rec.clone());
+            self.renew_lease_in(&mut b, clientid);
+            rec
         };
-        b.locks.insert((clientid, lock_owner), rec.clone());
-        self.renew_lease_in(&mut b, clientid);
+        self.log_append(StateLogRecord::Lock {
+            clientid: rec.clientid,
+            owner: rec.owner.clone(),
+            file_ino: rec.file_ino,
+            offset: rec.offset,
+            length: rec.length,
+            locktype: rec.locktype,
+            stateid: rec.stateid.clone(),
+            seqid: rec.seqid,
+        });
         Ok(rec)
     }
 
@@ -753,25 +1329,36 @@ impl StateManager {
         let found = self.find_lock_key(stateid);
         match found {
             Some((idx, k)) => {
-                let mut b = self.buckets[idx].lock().unwrap();
-                let l = match b.locks.get(&k) {
-                    Some(l) if &l.stateid == stateid => l,
-                    _ => return Err(NfsError::Status(NFS4ERR_EXPIRED)),
-                };
-                if seqid != l.seqid + 1 {
-                    if seqid == l.seqid {
-                        return Ok(l.stateid.clone()); // Replay.
+                let (sid, unlocked) = {
+                    let mut b = self.buckets[idx].lock().unwrap();
+                    let l = match b.locks.get(&k) {
+                        Some(l) if &l.stateid == stateid => l,
+                        _ => return Err(NfsError::Status(NFS4ERR_EXPIRED)),
+                    };
+                    if seqid != l.seqid + 1 {
+                        if seqid == l.seqid {
+                            return Ok(l.stateid.clone()); // Replay.
+                        }
+                        return Err(NfsError::Status(NFS4ERR_BAD_SEQID));
                     }
-                    return Err(NfsError::Status(NFS4ERR_BAD_SEQID));
+                    // For simplicity, remove the whole lock (not partial).
+                    // P6: full unlock only; partial unlock is an edge case.
+                    let _ = (offset, length);
+                    let mut sid = l.stateid.clone();
+                    sid.seqid += 1;
+                    let clientid = l.clientid;
+                    b.locks.remove(&k);
+                    self.renew_lease_in(&mut b, clientid);
+                    (sid, true)
+                };
+                if unlocked {
+                    self.log_append(StateLogRecord::Unlock {
+                        stateid: stateid.clone(),
+                        offset,
+                        length,
+                        seqid,
+                    });
                 }
-                // For simplicity, remove the whole lock (not partial).
-                // P6: full unlock only; partial unlock is an edge case.
-                let _ = (offset, length);
-                let mut sid = l.stateid.clone();
-                sid.seqid += 1;
-                let clientid = l.clientid;
-                b.locks.remove(&k);
-                self.renew_lease_in(&mut b, clientid);
                 Ok(sid)
             }
             None => Err(NfsError::Status(NFS4ERR_EXPIRED)),

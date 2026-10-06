@@ -1922,6 +1922,20 @@ impl Fs {
         Ok(())
     }
 
+    /// Promote a read-only Fs to writable (standby failover, §4.3 step 4).
+    /// Acquires the exclusive open lock (fails if the primary still holds
+    /// it) and clears the read-only flag. The caller must ensure the
+    /// underlying image is up to date (via cownfs-replicate).
+    pub fn promote(&mut self) -> Result<(), FsError> {
+        if !self.read_only {
+            return Ok(());
+        }
+        let lock_file = Self::acquire_open_lock(&self.image_path, false)?;
+        self._lock_file = lock_file;
+        self.read_only = false;
+        Ok(())
+    }
+
     /// Stage the current changes into the open transaction group without
     /// making them durable. Returns the txg id containing these changes.
     ///

@@ -7,7 +7,7 @@ use cownfs_nfs::server;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: cownfs-server [--read-only] [--ds-addr <addr>] [--referrals <file>] [--node-id <id>] [--server-id <u32>] [--lease-ttl <secs>] [--snapshot-policy <spec>] [--txg-interval-ms <ms>] [--grace-period-secs <s>] [--quota <uid>:<blocks>]... <image> [addr]");
+        eprintln!("usage: cownfs-server [--read-only] [--ds-addr <addr>] [--referrals <file>] [--node-id <id>] [--server-id <u32>] [--lease-ttl <secs>] [--snapshot-policy <spec>] [--txg-interval-ms <ms>] [--grace-period-secs <s>] [--state-log-addr <addr>] [--tail-state <addr>] [--promote-on-primary-loss] [--quota <uid>:<blocks>]... <image> [addr]");
         std::process::exit(1);
     }
     let read_only = args.iter().any(|a| a == "--read-only");
@@ -97,6 +97,22 @@ fn main() {
         .position(|a| a == "--grace-period-secs")
         .and_then(|i| args.get(i + 1))
         .cloned();
+    // --state-log-addr <addr>: serve the state mutation log for standby
+    // tailing (§4.3 step 4). Primary side.
+    let state_log_addr = args
+        .iter()
+        .position(|a| a == "--state-log-addr")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    // --tail-state <addr>: tail the primary's state log (standby side).
+    let tail_state = args
+        .iter()
+        .position(|a| a == "--tail-state")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    // --promote-on-primary-loss: standby auto-promotes when the primary
+    // is lost (tail connection breaks repeatedly).
+    let promote_on_loss = args.iter().any(|a| a == "--promote-on-primary-loss");
     // --quota uid:blocks (repeatable).
     let quota_args: Vec<String> = args
         .iter()
@@ -124,6 +140,9 @@ fn main() {
                 && *a != "--snapshot-policy"
                 && *a != "--txg-interval-ms"
                 && *a != "--grace-period-secs"
+                && *a != "--state-log-addr"
+                && *a != "--tail-state"
+                && *a != "--promote-on-primary-loss"
                 && *a != "--quota"
         })
         .collect();
@@ -143,7 +162,8 @@ fn main() {
                 && Some(*a) != txg_interval_arg.as_ref()
                 && Some(*a) != server_id_arg.as_ref()
                 && Some(*a) != grace_period_arg.as_ref()
-                && Some(*a) != grace_period_arg.as_ref()
+                && Some(*a) != state_log_addr.as_ref()
+                && Some(*a) != tail_state.as_ref()
                 && !quota_args.iter().any(|q| *a == q)
         })
         .collect();
@@ -256,6 +276,38 @@ fn main() {
     std::thread::spawn(move || {
         let _ = server::serve_metrics(&metrics_addr, &metrics_shared);
     });
+
+    // State mutation log tail server (primary side, §4.3 step 4).
+    if let Some(log_addr) = state_log_addr {
+        let log_state = shared.state.clone();
+        eprintln!("state log tail server on {log_addr}");
+        std::thread::spawn(move || {
+            if let Err(e) = cownfs_nfs::state_log::serve_tail(&log_addr, log_state) {
+                eprintln!("state log server error: {e}");
+            }
+        });
+    }
+
+    // State log tail client (standby side, §4.3 step 4).
+    if let Some(primary) = tail_state {
+        let tail_state = shared.state.clone();
+        let promote_shared = shared.clone();
+        eprintln!("tailing state log from {primary}");
+        std::thread::spawn(move || {
+            cownfs_nfs::state_log::tail_forever(&primary, tail_state, 1, move || {
+                if promote_on_loss {
+                    eprintln!("promoting to primary!");
+                    if let Err(e) = promote_shared.promote() {
+                        eprintln!("promotion failed: {e}");
+                    } else {
+                        eprintln!("promoted: now serving as primary");
+                    }
+                } else {
+                    eprintln!("primary lost; not promoting (--promote-on-primary-loss not set)");
+                }
+            });
+        });
+    }
 
     // Transaction group sync interval. Shared::new already started the
     // background sync thread; just tune its interval.

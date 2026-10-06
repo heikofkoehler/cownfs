@@ -14,5 +14,6 @@ pub mod server;
 pub mod sessions;
 pub mod snapshot_sched;
 pub mod state;
+pub mod state_log;
 pub mod throttle;
 pub mod xdr;

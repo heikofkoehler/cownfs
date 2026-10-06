@@ -144,7 +144,8 @@ pub struct Shared {
     /// None disables pNFS layouts (LAYOUTGET returns NOTSUPP).
     pub ds_addr: Option<String>,
     /// When true, mutating ops return NFS4ERR_ROFS. Used for read replicas.
-    pub read_only: bool,
+    /// Flipped to false on standby promotion (§4.3 step 4).
+    pub read_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// P0: image path for read-only reload. If set, a read-only server
     /// periodically checks for a newer on-disk generation and re-opens.
     pub image_path: Option<std::path::PathBuf>,
@@ -275,7 +276,7 @@ impl Shared {
             sessions: Arc::new(Mutex::new(crate::sessions::SessionTable::new())),
             layouts: Arc::new(Mutex::new(crate::layouts::LayoutTable::new())),
             ds_addr: None,
-            read_only: false,
+            read_only: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_path: None,
             last_reload_check: std::sync::Arc::new(Mutex::new(std::time::Instant::now())),
             referrals: Arc::new(crate::referrals::ReferralTable::new()),
@@ -305,6 +306,11 @@ impl Shared {
     /// Enter a grace period of custom length (tests).
     pub fn enter_grace_period_for(&self, d: std::time::Duration) {
         self.state.enter_grace_period_for(d);
+    }
+
+    /// Enter the default (lease-length) grace period.
+    pub fn enter_grace_period(&self) {
+        self.state.enter_grace_period();
     }
 
     /// Set the txg sync interval (milliseconds). The background thread
@@ -337,7 +343,7 @@ impl Shared {
             sessions: Arc::new(Mutex::new(crate::sessions::SessionTable::new())),
             layouts: Arc::new(Mutex::new(crate::layouts::LayoutTable::new())),
             ds_addr: None,
-            read_only: true,
+            read_only: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             image_path,
             last_reload_check: std::sync::Arc::new(Mutex::new(std::time::Instant::now())),
             referrals: Arc::new(crate::referrals::ReferralTable::new()),
@@ -370,11 +376,33 @@ impl Shared {
         self
     }
 
+    /// Promote a read-only standby to read-write (§4.3 step 4).
+    /// Acquires the exclusive image lock (fails if the primary still holds
+    /// it — split-brain protection), flips to writable, and enters a grace
+    /// period so clients with unreplicated state can reclaim the tail.
+    pub fn promote(&self) -> Result<(), String> {
+        {
+            let mut fs = self.fs.write().unwrap();
+            fs.promote()
+                .map_err(|e| format!("promote: image lock failed: {e:?}"))?;
+        }
+        self.read_only
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // The unreplicated tail (if any) is reclaimed by clients.
+        self.enter_grace_period();
+        Ok(())
+    }
+
+    /// True if this server is read-only (standby / replica).
+    pub fn is_read_only(&self) -> bool {
+        self.read_only.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// P0: for read-only servers, check if the on-disk generation is newer
     /// than the in-memory one, and if so, re-open the image. Throttled to
     /// max once per 5 seconds. Called before handling requests.
     pub fn maybe_reload(&self) {
-        if !self.read_only {
+        if !self.read_only.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
         let path = match &self.image_path {
@@ -760,7 +788,12 @@ impl Session {
                 filename,
             } => {
                 // OPEN with CREATE mutates the namespace.
-                if self.shared.read_only && *opentype == OPEN4_CREATE {
+                if self
+                    .shared
+                    .read_only
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    && *opentype == OPEN4_CREATE
+                {
                     return OpResult::err(OP_OPEN, NFS4ERR_ROFS);
                 }
                 self.op_open(
@@ -782,7 +815,11 @@ impl Session {
                 name,
                 attrs,
             } => {
-                if self.shared.read_only {
+                if self
+                    .shared
+                    .read_only
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
                     return OpResult::err(OP_CREATE, NFS4ERR_ROFS);
                 }
                 let res = self.op_create(*ftype, linkdata, name, attrs);
@@ -797,7 +834,11 @@ impl Session {
                 res
             }
             Op::Remove(name) => {
-                if self.shared.read_only {
+                if self
+                    .shared
+                    .read_only
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
                     return OpResult::err(OP_REMOVE, NFS4ERR_ROFS);
                 }
                 let res = self.op_remove(name);
@@ -814,13 +855,21 @@ impl Session {
             Op::Secinfo(name) => self.op_secinfo(name),
             Op::Illegal => OpResult::err(OP_ILLEGAL, NFS4ERR_OP_ILLEGAL),
             Op::Rename { old, new } => {
-                if self.shared.read_only {
+                if self
+                    .shared
+                    .read_only
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
                     return OpResult::err(OP_RENAME, NFS4ERR_ROFS);
                 }
                 self.op_rename(old, new)
             }
             Op::Link(name) => {
-                if self.shared.read_only {
+                if self
+                    .shared
+                    .read_only
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
                     return OpResult::err(OP_LINK, NFS4ERR_ROFS);
                 }
                 self.op_link(name)
@@ -837,7 +886,11 @@ impl Session {
                 None => OpResult::err(OP_RESTOREFH, NFS4ERR_INVAL),
             },
             Op::SetAttr { attrs } => {
-                if self.shared.read_only {
+                if self
+                    .shared
+                    .read_only
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
                     return OpResult::err(OP_SETATTR, NFS4ERR_ROFS);
                 }
                 self.op_setattr(attrs)
@@ -847,7 +900,11 @@ impl Session {
                 stable,
                 data,
             } => {
-                if self.shared.read_only {
+                if self
+                    .shared
+                    .read_only
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
                     return OpResult::err(OP_WRITE, NFS4ERR_ROFS);
                 }
                 // Per-file throttling: limit bytes/sec and concurrent writers.
@@ -1075,7 +1132,11 @@ impl Session {
             Ok(i) => i,
             Err(r) => return r,
         };
-        if self.shared.read_only {
+        if self
+            .shared
+            .read_only
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return OpResult::err(OP_LAYOUTGET, NFS4ERR_ROFS);
         }
         // Cap the layout length at 1 MiB per LAYOUTGET in v1.
@@ -1139,7 +1200,11 @@ impl Session {
             Ok(i) => i,
             Err(r) => return r,
         };
-        if self.shared.read_only {
+        if self
+            .shared
+            .read_only
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return OpResult::err(OP_LAYOUTCOMMIT, NFS4ERR_ROFS);
         }
         // The commit must fall inside an outstanding, non-recalled layout.
