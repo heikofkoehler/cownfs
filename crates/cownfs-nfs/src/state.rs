@@ -452,6 +452,10 @@ pub struct StateManager {
     /// State mutation log (§4.3 step 4). Appended on every mutation;
     /// tailed by the standby. Locked alone, never nested.
     log: Mutex<StateLog>,
+    /// Admission control (§4.1 step 5): max registered clients. 0 = unlimited.
+    /// At the cap, new SETCLIENTID gets NFS4ERR_DELAY; re-establishment of
+    /// known clients is always allowed.
+    max_clients: std::sync::atomic::AtomicUsize,
 }
 
 /// Generate a random boot generation from OS entropy, falling back to a
@@ -502,6 +506,7 @@ impl StateManager {
             next_stateid_seq: AtomicU32::new(1),
             lease_duration,
             log: Mutex::new(StateLog::new()),
+            max_clients: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -858,7 +863,13 @@ impl StateManager {
     }
 
     /// SETCLIENTID: register or update a client. Returns (clientid, confirmed).
-    pub fn setclientid(&self, verifier: [u8; 8], name: Vec<u8>) -> (u64, bool) {
+    /// At the admission-control cap, a NEW name gets `Err(NFS4ERR_DELAY)`;
+    /// re-establishment of a known client is always allowed.
+    pub fn setclientid(
+        &self,
+        verifier: [u8; 8],
+        name: Vec<u8>,
+    ) -> Result<(u64, bool), u32> {
         self.reap_all();
         // Lock ordering: names -> bucket.
         let mut names = self.names.lock().unwrap();
@@ -875,7 +886,7 @@ impl StateManager {
                 let c = b.clients.get_mut(&id).unwrap();
                 c.confirmed = false;
                 c.lease_expiry = Instant::now() + self.lease_duration;
-                (id, false)
+                Ok((id, false))
             } else {
                 // Different verifier: new incarnation, drop old state.
                 b.opens.retain(|(cid, _), _| *cid != id);
@@ -887,9 +898,24 @@ impl StateManager {
                 c.verifier = verifier;
                 c.confirmed = false;
                 c.lease_expiry = Instant::now() + self.lease_duration;
-                (id, false)
+                Ok((id, false))
             }
         } else {
+            // Admission control (§4.1): at the cap, refuse NEW clients with
+            // DELAY so the client retries (or the LB sends it elsewhere).
+            let max = self
+                .max_clients
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if max > 0 {
+                let count: usize = self
+                    .buckets
+                    .iter()
+                    .map(|bucket| bucket.lock().unwrap().clients.len())
+                    .sum();
+                if count >= max {
+                    return Err(crate::nfs4::NFS4ERR_DELAY);
+                }
+            }
             // Server-qualified clientid: high 32 bits = server id, low
             // 32 bits = local sequence. Two servers never issue the
             // same clientid; low bits never 0 (0 = invalid clientid).
@@ -906,7 +932,7 @@ impl StateManager {
                 },
             );
             names.insert(name, id);
-            (id, false)
+            Ok((id, false))
         }
     }
 
@@ -1379,6 +1405,23 @@ impl StateManager {
             .map(|bucket| bucket.lock().unwrap().clients.len())
             .sum()
     }
+
+    /// Set the admission-control cap (§4.1 step 5). 0 = unlimited.
+    pub fn set_max_clients(&self, max: usize) {
+        self.max_clients
+            .store(max, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The admission-control cap (0 = unlimited).
+    pub fn max_clients(&self) -> usize {
+        self.max_clients.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// True if the server is at its client cap (admission control).
+    pub fn at_client_cap(&self) -> bool {
+        let max = self.max_clients();
+        max > 0 && self.client_count() >= max
+    }
 }
 
 fn ranges_overlap(off1: u64, len1: u64, off2: u64, len2: u64) -> bool {
@@ -1403,7 +1446,7 @@ mod tests {
     #[test]
     fn lease_expiry_reaps_state() {
         let sm = StateManager::with_lease(Duration::from_millis(100));
-        let (cid, _) = sm.setclientid([1u8; 8], b"test".to_vec());
+        let (cid, _) = sm.setclientid([1u8; 8], b"test".to_vec()).unwrap();
         assert!(sm.confirm(cid, [1u8; 8]));
         // Create an open.
         sm.open(1, cid, b"owner".to_vec(), 1, 3, 0, false).unwrap();
@@ -1420,8 +1463,8 @@ mod tests {
     #[test]
     fn share_deny_conflict() {
         let sm = StateManager::new();
-        let (cid1, _) = sm.setclientid([1u8; 8], b"c1".to_vec());
-        let (cid2, _) = sm.setclientid([2u8; 8], b"c2".to_vec());
+        let (cid1, _) = sm.setclientid([1u8; 8], b"c1".to_vec()).unwrap();
+        let (cid2, _) = sm.setclientid([2u8; 8], b"c2".to_vec()).unwrap();
         sm.confirm(cid1, [1u8; 8]);
         sm.confirm(cid2, [2u8; 8]);
         // c1 opens with DENY_WRITE.
@@ -1434,8 +1477,8 @@ mod tests {
     #[test]
     fn lock_conflict() {
         let sm = StateManager::new();
-        let (cid1, _) = sm.setclientid([1u8; 8], b"c1".to_vec());
-        let (cid2, _) = sm.setclientid([2u8; 8], b"c2".to_vec());
+        let (cid1, _) = sm.setclientid([1u8; 8], b"c1".to_vec()).unwrap();
+        let (cid2, _) = sm.setclientid([2u8; 8], b"c2".to_vec()).unwrap();
         sm.confirm(cid1, [1u8; 8]);
         sm.confirm(cid2, [2u8; 8]);
         let o1 = sm.open(1, cid1, b"o1".to_vec(), 1, 3, 0, false).unwrap();
@@ -1483,8 +1526,8 @@ mod tests {
     #[test]
     fn server_id_qualifies_clientids() {
         let sm = StateManager::with_server_id(0x1234_5678);
-        let (cid1, _) = sm.setclientid([1u8; 8], b"c1".to_vec());
-        let (cid2, _) = sm.setclientid([2u8; 8], b"c2".to_vec());
+        let (cid1, _) = sm.setclientid([1u8; 8], b"c1".to_vec()).unwrap();
+        let (cid2, _) = sm.setclientid([2u8; 8], b"c2".to_vec()).unwrap();
         // High 32 bits carry the server id; low 32 bits are the sequence.
         assert_eq!(StateManager::clientid_server_id(cid1), 0x1234_5678);
         assert_eq!(StateManager::clientid_server_id(cid2), 0x1234_5678);
@@ -1497,8 +1540,8 @@ mod tests {
     fn default_server_id_preserves_legacy_layout() {
         // Server id 0 keeps the old wire shape: clientids are 1, 2, 3...
         let sm = StateManager::new();
-        let (cid1, _) = sm.setclientid([1u8; 8], b"c1".to_vec());
-        let (cid2, _) = sm.setclientid([2u8; 8], b"c2".to_vec());
+        let (cid1, _) = sm.setclientid([1u8; 8], b"c1".to_vec()).unwrap();
+        let (cid2, _) = sm.setclientid([2u8; 8], b"c2".to_vec()).unwrap();
         assert_eq!(cid1, 1);
         assert_eq!(cid2, 2);
     }
@@ -1511,8 +1554,8 @@ mod tests {
         let standby = StateManager::with_server_id(8);
         let mut seen = std::collections::HashSet::new();
         for i in 0..100 {
-            let (c1, _) = primary.setclientid([1u8; 8], format!("p{i}").into_bytes());
-            let (c2, _) = standby.setclientid([1u8; 8], format!("s{i}").into_bytes());
+            let (c1, _) = primary.setclientid([1u8; 8], format!("p{i}").into_bytes()).unwrap();
+            let (c2, _) = standby.setclientid([1u8; 8], format!("s{i}").into_bytes()).unwrap();
             assert!(seen.insert(c1), "primary reissued clientid {c1:#x}");
             assert!(
                 seen.insert(c2),
@@ -1524,7 +1567,7 @@ mod tests {
     #[test]
     fn stateid_carries_server_id_and_boot_gen() {
         let sm = StateManager::with_server_id(42);
-        let (cid, _) = sm.setclientid([1u8; 8], b"c1".to_vec());
+        let (cid, _) = sm.setclientid([1u8; 8], b"c1".to_vec()).unwrap();
         sm.confirm(cid, [1u8; 8]);
         let o = sm.open(1, cid, b"o1".to_vec(), 1, 3, 0, false).unwrap();
         assert_eq!(StateManager::stateid_server_id(&o.stateid), 42);
@@ -1541,8 +1584,8 @@ mod tests {
         // (With overwhelming probability; /dev/urandom-backed.)
         let boot1 = StateManager::with_server_id(9);
         let boot2 = StateManager::with_server_id(9);
-        let (cid1, _) = boot1.setclientid([1u8; 8], b"c".to_vec());
-        let (cid2, _) = boot2.setclientid([1u8; 8], b"c".to_vec());
+        let (cid1, _) = boot1.setclientid([1u8; 8], b"c".to_vec()).unwrap();
+        let (cid2, _) = boot2.setclientid([1u8; 8], b"c".to_vec()).unwrap();
         boot1.confirm(cid1, [1u8; 8]);
         boot2.confirm(cid2, [1u8; 8]);
         let o1 = boot1.open(1, cid1, b"o".to_vec(), 1, 3, 0, false).unwrap();
@@ -1563,7 +1606,7 @@ mod tests {
         let sm = StateManager::new();
         sm.set_server_id(5);
         assert_eq!(sm.server_id(), 5);
-        let (cid, _) = sm.setclientid([1u8; 8], b"c".to_vec());
+        let (cid, _) = sm.setclientid([1u8; 8], b"c".to_vec()).unwrap();
         assert_eq!(StateManager::clientid_server_id(cid), 5);
         // Changing the id after ids were issued would break the
         // no-aliasing invariant: must panic.
@@ -1588,7 +1631,7 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 barrier.wait();
                 let v = [i as u8; 8];
-                let (cid, _) = sm.setclientid(v, format!("client-{i}").into_bytes());
+                let (cid, _) = sm.setclientid(v, format!("client-{i}").into_bytes()).unwrap();
                 assert!(sm.confirm(cid, v));
                 // Each client opens/closes its own files: no conflicts expected.
                 for j in 0..20u64 {
@@ -1621,8 +1664,8 @@ mod tests {
         // exactly one wins and the other gets DENIED.
         use std::sync::{Arc, Barrier};
         let sm = Arc::new(StateManager::new());
-        let (cid1, _) = sm.setclientid([1u8; 8], b"c1".to_vec());
-        let (cid2, _) = sm.setclientid([2u8; 8], b"c2".to_vec());
+        let (cid1, _) = sm.setclientid([1u8; 8], b"c1".to_vec()).unwrap();
+        let (cid2, _) = sm.setclientid([2u8; 8], b"c2".to_vec()).unwrap();
         sm.confirm(cid1, [1u8; 8]);
         sm.confirm(cid2, [2u8; 8]);
         // Sanity: the two clients land in different buckets.
@@ -1651,11 +1694,11 @@ mod tests {
         // Same name, new verifier: new incarnation keeps the id but drops
         // old opens/locks, and the name index stays consistent.
         let sm = StateManager::with_lease(Duration::from_secs(3600));
-        let (cid1, _) = sm.setclientid([1u8; 8], b"cli".to_vec());
+        let (cid1, _) = sm.setclientid([1u8; 8], b"cli".to_vec()).unwrap();
         sm.confirm(cid1, [1u8; 8]);
         let rec = sm.open(1, cid1, b"o".to_vec(), 5, 3, 0, false).unwrap();
         assert!(sm.client_has_state(cid1));
-        let (cid2, _) = sm.setclientid([2u8; 8], b"cli".to_vec());
+        let (cid2, _) = sm.setclientid([2u8; 8], b"cli".to_vec()).unwrap();
         assert_eq!(cid1, cid2);
         assert!(!sm.client_has_state(cid2));
         assert!(sm.find_open(&rec.stateid).is_none());
@@ -1665,7 +1708,7 @@ mod tests {
     // --- Grace period / reclaim (RFC 7530 §8.4) ---
 
     fn confirmed_client(sm: &StateManager, name: &[u8]) -> u64 {
-        let (cid, _) = sm.setclientid([9u8; 8], name.to_vec());
+        let (cid, _) = sm.setclientid([9u8; 8], name.to_vec()).unwrap();
         assert!(sm.confirm(cid, [9u8; 8]));
         cid
     }
@@ -1746,5 +1789,41 @@ mod tests {
             .lock(cid, b"l3".to_vec(), 7, 2, 300, 100, None, true)
             .unwrap_err();
         assert_eq!(err, NfsError::Status(NFS4ERR_NO_GRACE));
+    }
+
+    #[test]
+    fn admission_control_caps_new_clients() {
+        use crate::nfs4::NFS4ERR_DELAY;
+        use std::time::Duration;
+        let sm = StateManager::with_lease(Duration::from_millis(50));
+        sm.set_max_clients(2);
+        assert!(!sm.at_client_cap());
+        // Two fresh registrations succeed.
+        let (cid1, _) = sm.setclientid([1u8; 8], b"c1".to_vec()).unwrap();
+        let (_cid2, _) = sm.setclientid([2u8; 8], b"c2".to_vec()).unwrap();
+        assert!(sm.at_client_cap());
+        assert_eq!(sm.client_count(), 2);
+        // Third fresh client gets DELAY.
+        let err = sm.setclientid([3u8; 8], b"c3".to_vec()).unwrap_err();
+        assert_eq!(err, NFS4ERR_DELAY);
+        // Re-establishment of a known client is still allowed at the cap.
+        let (cid1b, _) = sm.setclientid([9u8; 8], b"c1".to_vec()).unwrap();
+        assert_eq!(cid1b, cid1);
+        // After leases expire, a new client fits again.
+        std::thread::sleep(Duration::from_millis(100));
+        let (cid3, _) = sm.setclientid([3u8; 8], b"c3".to_vec()).unwrap();
+        assert_ne!(cid3, cid1);
+    }
+
+    #[test]
+    fn admission_control_unlimited_by_default() {
+        let sm = StateManager::new();
+        assert_eq!(sm.max_clients(), 0);
+        assert!(!sm.at_client_cap());
+        for i in 0..100 {
+            sm.setclientid([i as u8; 8], format!("c{i}").into_bytes())
+                .unwrap();
+        }
+        assert_eq!(sm.client_count(), 100);
     }
 }

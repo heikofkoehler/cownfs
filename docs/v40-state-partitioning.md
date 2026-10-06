@@ -206,7 +206,11 @@ point where dead-client state lingers too long.
 4. **State change log + standby tailing** (§4.3). Failover without
    reclaim storms. Depends on 1–3.
 5. **Admission control + client migration** (§4.1). Caps per-server
-   state; the 100M-client story only closes here.
+   state; the 100M-client story only closes here. DONE (2026-10-06):
+   `--max-clients` (0=unlimited); new SETCLIENTID at cap → NFS4ERR_DELAY;
+   known-client re-establishment always allowed; `--overflow-addr` redirects
+   fresh mounts (LOOKUP on root → NFS4ERR_MOVED, fs_locations advertises
+   the overflow target). Tests: p64_admission + 2 unit tests.
 6. **Optional: persistent state WAL** (§4.4). Fast restart without a
    standby.
 

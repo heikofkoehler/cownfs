@@ -7,7 +7,7 @@ use cownfs_nfs::server;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: cownfs-server [--read-only] [--ds-addr <addr>] [--referrals <file>] [--node-id <id>] [--server-id <u32>] [--lease-ttl <secs>] [--snapshot-policy <spec>] [--txg-interval-ms <ms>] [--grace-period-secs <s>] [--state-log-addr <addr>] [--tail-state <addr>] [--promote-on-primary-loss] [--quota <uid>:<blocks>]... <image> [addr]");
+        eprintln!("usage: cownfs-server [--read-only] [--ds-addr <addr>] [--referrals <file>] [--node-id <id>] [--server-id <u32>] [--lease-ttl <secs>] [--snapshot-policy <spec>] [--txg-interval-ms <ms>] [--grace-period-secs <s>] [--state-log-addr <addr>] [--tail-state <addr>] [--promote-on-primary-loss] [--max-clients <n>] [--overflow-addr <addr>] [--quota <uid>:<blocks>]... <image> [addr]");
         std::process::exit(1);
     }
     let read_only = args.iter().any(|a| a == "--read-only");
@@ -113,6 +113,24 @@ fn main() {
     // --promote-on-primary-loss: standby auto-promotes when the primary
     // is lost (tail connection breaks repeatedly).
     let promote_on_loss = args.iter().any(|a| a == "--promote-on-primary-loss");
+    // --max-clients <n>: admission control (§4.1 step 5). At the cap, new
+    // SETCLIENTID gets NFS4ERR_DELAY. 0 (default) = unlimited.
+    let max_clients_arg: Option<String> = args
+        .iter()
+        .position(|a| a == "--max-clients")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let max_clients: usize = max_clients_arg
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    // --overflow-addr <addr>: when at the client cap, redirect fresh mounts
+    // (LOOKUP on root) to this server via NFS4ERR_MOVED.
+    let overflow_addr: Option<String> = args
+        .iter()
+        .position(|a| a == "--overflow-addr")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
     // --quota uid:blocks (repeatable).
     let quota_args: Vec<String> = args
         .iter()
@@ -143,6 +161,8 @@ fn main() {
                 && *a != "--state-log-addr"
                 && *a != "--tail-state"
                 && *a != "--promote-on-primary-loss"
+                && *a != "--max-clients"
+                && *a != "--overflow-addr"
                 && *a != "--quota"
         })
         .collect();
@@ -164,6 +184,8 @@ fn main() {
                 && Some(*a) != grace_period_arg.as_ref()
                 && Some(*a) != state_log_addr.as_ref()
                 && Some(*a) != tail_state.as_ref()
+                && Some(*a) != max_clients_arg.as_ref()
+                && Some(*a) != overflow_addr.as_ref()
                 && !quota_args.iter().any(|q| *a == q)
         })
         .collect();
@@ -243,6 +265,15 @@ fn main() {
     };
     shared.set_server_id(server_id);
     eprintln!("server-id {server_id} (qualifies clientids/stateids)");
+    if max_clients > 0 {
+        shared.state.set_max_clients(max_clients);
+        eprintln!("admission control: max {max_clients} clients");
+    }
+    let mut shared = shared;
+    if let Some(addr) = overflow_addr {
+        shared.set_overflow_addr(addr.clone());
+        eprintln!("admission control overflow -> {addr}");
+    }
     // RFC 7530 §8.4: every (re)start enters the grace period so clients can
     // reclaim pre-restart state. 0 disables it (tests/development).
     if grace_period_secs == 0 {

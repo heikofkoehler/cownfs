@@ -154,6 +154,10 @@ pub struct Shared {
     /// NFSv4.0 referral table: directory inode -> list of targets.
     /// Empty disables referrals.
     pub referrals: Arc<crate::referrals::ReferralTable>,
+    /// Admission-control overflow (§4.1 step 5): when at the client cap,
+    /// LOOKUP on the root returns NFS4ERR_MOVED with this target, directing
+    /// fresh mounts to a less-loaded server. None disables.
+    pub overflow_addr: Option<String>,
     /// Metrics registry.
     pub metrics: Arc<crate::metrics::Metrics>,
     /// Throttling (per-client and per-file rate limits).
@@ -280,6 +284,7 @@ impl Shared {
             image_path: None,
             last_reload_check: std::sync::Arc::new(Mutex::new(std::time::Instant::now())),
             referrals: Arc::new(crate::referrals::ReferralTable::new()),
+            overflow_addr: None,
             metrics: crate::metrics::Metrics::new(),
             throttle: Arc::new(crate::throttle::Throttle::new(
                 crate::throttle::ThrottleConfig::default(),
@@ -347,6 +352,7 @@ impl Shared {
             image_path,
             last_reload_check: std::sync::Arc::new(Mutex::new(std::time::Instant::now())),
             referrals: Arc::new(crate::referrals::ReferralTable::new()),
+            overflow_addr: None,
             metrics: crate::metrics::Metrics::new(),
             throttle: Arc::new(crate::throttle::Throttle::new(
                 crate::throttle::ThrottleConfig::default(),
@@ -374,6 +380,11 @@ impl Shared {
     pub fn with_referrals(mut self, table: crate::referrals::ReferralTable) -> Self {
         self.referrals = Arc::new(table);
         self
+    }
+
+    /// Set the admission-control overflow target (§4.1 step 5).
+    pub fn set_overflow_addr(&mut self, addr: String) {
+        self.overflow_addr = Some(addr);
     }
 
     /// Promote a read-only standby to read-write (§4.3 step 4).
@@ -1305,6 +1316,19 @@ impl Session {
             Some(fh) => fh,
             None => return OpResult::err(opnum, NFS4ERR_NOFILEHANDLE),
         };
+        // Admission-control overflow (§4.1 step 5): at the client cap, a
+        // LOOKUP issued against the filesystem root is a fresh mount
+        // attempt — redirect it to the overflow server via NFS4ERR_MOVED.
+        // Existing clients hold filehandles and rarely re-lookup root.
+        if let Fh::Live(ino) = cfh {
+            if ino == ROOT_INO
+                && self.shared.overflow_addr.is_some()
+                && self.shared.state.at_client_cap()
+            {
+                self.cfh = Some(Fh::Live(ROOT_INO));
+                return OpResult::err(opnum, NFS4ERR_MOVED);
+            }
+        }
         // Hide the xattr backing file from NFS clients.
         if let Fh::Live(ino) = cfh {
             if ino == ROOT_INO && name == cownfs_core::engine::XATTR_FILE {
@@ -1527,19 +1551,36 @@ impl Session {
             // Rough inode estimates: 1 inode per 16 KiB (4 blocks) used.
             files_total: total_blocks / 4,
             files_free: free_blocks / 4,
-            fs_locations: self.shared.referrals.lookup(ino).map(|targets| {
-                targets
-                    .iter()
-                    .map(|t| {
-                        let server = if t.port == 2049 {
-                            t.server.clone()
-                        } else {
-                            format!("{}:{}", t.server, t.port)
-                        };
-                        (server, t.path.clone())
-                    })
-                    .collect()
-            }),
+            fs_locations: self
+                .shared
+                .referrals
+                .lookup(ino)
+                .map(|targets| {
+                    targets
+                        .iter()
+                        .map(|t| {
+                            let server = if t.port == 2049 {
+                                t.server.clone()
+                            } else {
+                                format!("{}:{}", t.server, t.port)
+                            };
+                            (server, t.path.clone())
+                        })
+                        .collect()
+                })
+                .or_else(|| {
+                    // Admission-control overflow (§4.1 step 5): at the cap,
+                    // advertise the overflow server so a redirected client
+                    // knows where to go.
+                    if ino == ROOT_INO && self.shared.state.at_client_cap() {
+                        self.shared
+                            .overflow_addr
+                            .as_ref()
+                            .map(|addr| vec![(addr.clone(), "/".to_string())])
+                    } else {
+                        None
+                    }
+                }),
         }
     }
 
@@ -2397,7 +2438,10 @@ impl Session {
     }
 
     fn op_setclientid(&mut self, verifier: [u8; 8], name: &[u8]) -> OpResult {
-        let (clientid, _) = self.shared.state.setclientid(verifier, name.to_vec());
+        let (clientid, _) = match self.shared.state.setclientid(verifier, name.to_vec()) {
+            Ok(v) => v,
+            Err(code) => return OpResult::err(OP_SETCLIENTID, code),
+        };
         let mut w = Writer::new();
         w.u64(clientid);
         w.opaque_fixed(&verifier);
