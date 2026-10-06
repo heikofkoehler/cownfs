@@ -352,3 +352,41 @@ fn r6_epoch_unique() {
 
     let _ = std::fs::remove_file(&img);
 }
+
+/// N4: re-acquiring with the SAME node_id must fence the previous holder.
+/// Two processes sharing a node_id (e.g., old/new pod with the same
+/// StatefulSet name) cannot both pass fencing.
+#[test]
+fn r6_same_node_id_reacquire_fences() {
+    let img = tmp_path("n4");
+    let _ = std::fs::remove_file(&img);
+    let mut fs1 = Fs::format(&img, 2048).expect("format");
+
+    // First holder acquires.
+    assert!(fs1.lease_acquire("server", 60).expect("acquire1"));
+    let e1 = fs1.lease_epoch_for_test().expect("epoch1");
+
+    // Second holder with SAME node_id acquires (simulates new pod).
+    let mut fs2 = Fs::open(&img).expect("open2");
+    assert!(fs2.lease_acquire("server", 60).expect("acquire2"));
+    let e2 = fs2.lease_epoch_for_test().expect("epoch2");
+
+    // Epochs must differ (N4: always bump on acquire).
+    assert_ne!(e1, e2, "N4: re-acquire must generate a new epoch");
+
+    // First holder's commit must now be rejected (fenced).
+    let ino = fs1.create(ROOT_INO, b"f", 0o644, 0, 0).expect("create");
+    fs1.write(ino, 0, b"x").expect("write");
+    match fs1.commit() {
+        Err(FsError::Fenced) => {} // expected
+        Ok(()) => panic!("N4: first holder's commit should be fenced after re-acquire"),
+        Err(e) => panic!("N4: unexpected error {e:?}"),
+    }
+
+    // Second holder can still commit.
+    let ino2 = fs2.create(ROOT_INO, b"g", 0o644, 0, 0).expect("create2");
+    fs2.write(ino2, 0, b"y").expect("write2");
+    fs2.commit().expect("second holder commits");
+
+    let _ = std::fs::remove_file(&img);
+}

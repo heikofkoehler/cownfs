@@ -3496,16 +3496,15 @@ impl Fs {
                 return Ok(false);
             }
 
-            let holder_changed = st.holder_name() != node_id;
             st.holder = crate::lease::node_id_bytes(node_id);
             st.expiry = now + ttl_secs;
-            if holder_changed {
-                // New holder (or first acquire): generate a unique fencing
-                // epoch so any previous holder's in-flight commits are
-                // rejected, and so two cross-host racers cannot write the
-                // same epoch value.
-                st.epoch = Self::unique_epoch();
-            }
+            // N4: ALWAYS generate a new unique fencing epoch on acquire,
+            // even if the holder name is unchanged. Two processes with the
+            // same node_id (e.g., old and new pod sharing a StatefulSet
+            // name) must not both pass fencing. The last acquirer wins;
+            // the previous holder's epoch no longer matches and its
+            // commits are rejected.
+            st.epoch = Self::unique_epoch();
             let my_epoch = st.epoch;
             crate::lease::write_lease(&self.image_path, blk, &st)
                 .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;

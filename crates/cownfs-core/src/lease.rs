@@ -93,40 +93,58 @@ impl LeaseState {
 /// I/O where `O_DIRECT` is unsupported (e.g. tmpfs).
 fn open_lease_fd(path: &Path) -> io::Result<std::fs::File> {
     use std::fs::OpenOptions;
-    const O_DIRECT: i32 = 0o40000; // linux; best-effort
+    // Use libc::O_DIRECT for the correct value on each platform
+    // (0o40000 on x86_64 Linux is O_DIRECTORY on aarch64).
     let direct = OpenOptions::new()
         .read(true)
         .write(true)
-        .custom_flags(O_DIRECT)
+        .custom_flags(libc::O_DIRECT)
         .open(path);
     match direct {
         Ok(f) => Ok(f),
-        Err(e) if e.raw_os_error() == Some(libc_einval()) => {
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
             OpenOptions::new().read(true).write(true).open(path)
         }
         Err(e) => Err(e),
     }
 }
 
-#[cfg(target_os = "linux")]
-fn libc_einval() -> i32 {
-    22 // EINVAL
-}
-
-#[cfg(not(target_os = "linux"))]
-fn libc_einval() -> i32 {
-    -1 // never matches; O_DIRECT path either works or errors differently
-}
-
 /// 4 KiB-aligned buffer for `O_DIRECT`.
-fn aligned_buf() -> Vec<u8> {
-    // Over-allocate and align manually; O_DIRECT needs aligned address,
-    // length, and offset (all 4 KiB here).
-    let mut v = vec![0u8; BLOCK_SIZE * 2];
-    let off = v.as_ptr().align_offset(BLOCK_SIZE);
-    v.drain(..off);
-    v.truncate(BLOCK_SIZE);
-    v
+/// Uses `std::alloc` with 4K alignment; the Vec-based approach with
+/// `drain()` does not actually align (drain shifts within the same
+/// allocation, leaving the base pointer unchanged).
+fn aligned_buf() -> AlignedBuf {
+    AlignedBuf::new()
+}
+
+/// A 4 KiB-aligned 4 KiB buffer for O_DIRECT I/O.
+struct AlignedBuf {
+    ptr: *mut u8,
+    layout: std::alloc::Layout,
+}
+
+impl AlignedBuf {
+    fn new() -> Self {
+        let layout = std::alloc::Layout::from_size_align(BLOCK_SIZE, BLOCK_SIZE)
+            .expect("4K layout");
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!ptr.is_null(), "alloc_zeroed failed");
+        Self { ptr, layout }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, BLOCK_SIZE) }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, BLOCK_SIZE) }
+    }
+}
+
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        unsafe { std::alloc::dealloc(self.ptr, self.layout) };
+    }
 }
 
 /// Read the lease state from `block` (usually [`LEASE_BLOCK`]).
@@ -135,7 +153,7 @@ pub fn read_lease(path: &Path, block: u64) -> io::Result<Option<LeaseState>> {
     use std::os::unix::fs::FileExt;
     let f = open_lease_fd(path)?;
     let mut buf = aligned_buf();
-    f.read_exact_at(&mut buf, block * BLOCK_SIZE as u64)?;
+    f.read_exact_at(buf.as_mut_slice(), block * BLOCK_SIZE as u64)?;
     let arr: &[u8; BLOCK_SIZE] = buf
         .as_slice()
         .try_into()
@@ -155,8 +173,8 @@ pub fn write_lease(path: &Path, block: u64, state: &LeaseState) -> io::Result<()
     let f = open_lease_fd(path)?;
     let blk = state.encode();
     let mut buf = aligned_buf();
-    buf.copy_from_slice(&blk);
-    f.write_all_at(&buf, block * BLOCK_SIZE as u64)?;
+    buf.as_mut_slice().copy_from_slice(&blk);
+    f.write_all_at(buf.as_slice(), block * BLOCK_SIZE as u64)?;
     f.sync_all()
 }
 
