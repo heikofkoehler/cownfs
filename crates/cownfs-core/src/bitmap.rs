@@ -290,11 +290,33 @@ impl PagedBitmap {
         if self.area_start != area_start {
             self.area_start = area_start;
             // Dirty pages were just written to the new area by write_full_to.
-            // Clear the cache to avoid stale reads/writes.
-            self.cache.clear();
-            self.lru.clear();
-            self.dirty_pages.clear();
-            self.dirty_words.clear();
+            // Do NOT clear the cache: the cached pages contain the just-written
+            // data. Clearing forces a reload from disk which can race and
+            // return stale bits (double-alloc). The cached data is authoritative.
+            //
+            // Recompute free_counts from the cached words (do not leave as
+            // MAX, which would never decrement and break the free invariant).
+            for (page_idx, words) in self.cache.iter() {
+                let mut free = 0u32;
+                let bits_in_page = BITS_PER_PAGE
+                    .min(self.nbits.saturating_sub(page_idx * BITS_PER_PAGE));
+                for (wi, w) in words.iter().enumerate() {
+                    let word_bits =
+                        64u64.min(bits_in_page.saturating_sub(wi as u64 * 64));
+                    if word_bits == 64 {
+                        free += w.count_zeros();
+                    } else if word_bits > 0 {
+                        let mask = (1u64 << word_bits) - 1;
+                        free += (!w & mask).count_ones();
+                    }
+                }
+                if let Some(fc) = self.free_counts.get_mut(*page_idx as usize) {
+                    *fc = free;
+                }
+            }
+            // Note: dirty_pages/lru are intentionally preserved. Dirty pages
+            // stay pinned (never evicted to the live area, satisfying N5).
+            // mark_all_clean() after this will allow future eviction.
         }
     }
 
