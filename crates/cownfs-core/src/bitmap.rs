@@ -411,13 +411,6 @@ impl PagedBitmap {
     }
 
     /// Evict the LRU page. Returns (page_idx, words, was_dirty).
-    pub fn evict_lru(&mut self) -> Option<(u64, [u64; WORDS_PER_PAGE], bool)> {
-        let page_idx = self.lru.pop_front()?;
-        let words = self.cache.remove(&page_idx)?;
-        let was_dirty = self.dirty_pages.remove(&page_idx);
-        Some((page_idx, words, was_dirty))
-    }
-
     /// Find a page with free space, starting from cursor (wraps).
     /// Returns None if all pages are full.
     pub fn find_free_page(&mut self) -> Option<u64> {
@@ -555,7 +548,9 @@ impl PagedBitmap {
     // ---- S4: transparent paging (device-backed) ----
 
     /// Ensure `page_idx` is cached, loading from disk if necessary.
-    /// Evicts the LRU page (writing back if dirty) when at capacity.
+    /// Evicts the LRU *clean* page when at capacity. Dirty pages are pinned
+    /// in memory until commit (N5: writing a dirty page to `area_start`
+    /// would corrupt the live bitmap area, violating R1).
     fn ensure_cached(&mut self, page_idx: u64) -> io::Result<()> {
         if self.cache.contains_key(&page_idx) {
             return Ok(());
@@ -569,17 +564,41 @@ impl PagedBitmap {
                 ))
             }
         };
-        // Evict if at capacity.
+        // Evict clean pages if at capacity. Dirty pages stay pinned;
+        // they are written to the new area during commit, never to the
+        // live area (N5).
         while self.cache.len() >= MAX_CACHED_PAGES {
-            let (evict_idx, words, was_dirty) = self.evict_lru().expect("nonempty cache");
-            if was_dirty {
-                Self::write_page(&dev, area_start, evict_idx, &words)?;
+            if let Some((evict_idx, words)) = self.evict_lru_clean() {
+                // Clean page: just drop it (no writeback needed).
+                let _ = (evict_idx, words);
+            } else {
+                // All cached pages are dirty; allow the cache to grow.
+                // They will be written to the new area at commit time.
+                break;
             }
         }
         // Load the page.
         let words = Self::read_page(&dev, area_start, page_idx)?;
         self.insert_page(page_idx, words);
         Ok(())
+    }
+
+    /// Evict the LRU clean (non-dirty) page. Returns None if all cached
+    /// pages are dirty.
+    fn evict_lru_clean(&mut self) -> Option<(u64, [u64; WORDS_PER_PAGE])> {
+        // Find the LRU clean page by scanning from the front.
+        let mut clean_idx = None;
+        for &page_idx in &self.lru {
+            if !self.dirty_pages.contains(&page_idx) {
+                clean_idx = Some(page_idx);
+                break;
+            }
+        }
+        let page_idx = clean_idx?;
+        // Remove from LRU list.
+        self.lru.retain(|&x| x != page_idx);
+        let words = self.cache.remove(&page_idx)?;
+        Some((page_idx, words))
     }
 
     fn read_page(

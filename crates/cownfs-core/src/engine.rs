@@ -1908,6 +1908,10 @@ impl Fs {
 
     pub fn commit_async(&self) -> Result<u64, FsError> {
         self.check_writable()?;
+        // N3: fencing — the server's txg thread commits via commit_async,
+        // not commit(). Check here so a fenced node stops immediately
+        // instead of waiting for the renewal thread (up to ttl/3 s).
+        self.check_fenced()?;
         // T9: new commit attempt; clear stale txg errors (see mark_txg_dirty).
         self.txg.clear_error();
         let flushed = self.flush_all()?;
@@ -1942,6 +1946,9 @@ impl Fs {
     /// Returns None if nothing to sync. Does NOT do I/O.
     pub fn prepare_sync(&mut self) -> Result<Option<PreparedCommit>, FsError> {
         self.txg.clear_error();
+        // N3: fencing — check here too, in case commit_async was bypassed
+        // or the lease was lost between commit_async and prepare_sync.
+        self.check_fenced()?;
         if !self.txg.state.lock().unwrap().dirty {
             let mut t = self.txg.state.lock().unwrap();
             t.synced = t.current;
