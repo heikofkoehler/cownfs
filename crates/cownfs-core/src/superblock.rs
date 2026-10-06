@@ -493,3 +493,18 @@ pub fn read_quota_table(
     }
     Some(Ok(map))
 }
+
+/// T3: fuzz helpers.
+pub mod fuzz {
+    use super::*;
+
+    /// Fuzz superblock header decode. Must not panic.
+    pub fn decode_header(buf: &[u8]) {
+        if buf.len() != HDR_LEN {
+            return;
+        }
+        let mut hdr = [0u8; HDR_LEN];
+        hdr.copy_from_slice(buf);
+        let _ = Superblock::decode(&hdr);
+    }
+}

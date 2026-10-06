@@ -944,3 +944,20 @@ mod tests {
         }
     }
 }
+
+/// T3: fuzz helpers (public for cargo-fuzz).
+pub mod fuzz {
+    use super::*;
+    use crate::BLOCK_SIZE;
+
+    /// Fuzz `decode_node` with arbitrary bytes. Must not panic.
+    pub fn decode_node_bytes(buf: &[u8]) {
+        if buf.len() != BLOCK_SIZE {
+            return;
+        }
+        let mut arr = [0u8; BLOCK_SIZE];
+        arr.copy_from_slice(buf);
+        // Use u64/u64 as representative K/V.
+        let _ = decode_node::<u64, u64>(0, &arr);
+    }
+}

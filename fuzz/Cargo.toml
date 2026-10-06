@@ -1,0 +1,43 @@
+[package]
+name = "cownfs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.cownfs-core]
+path = "../crates/cownfs-core"
+
+[dependencies.cownfs-nfs]
+path = "../crates/cownfs-nfs"
+
+[[bin]]
+name = "fuzz_rpc_frame"
+path = "fuzz_targets/fuzz_rpc_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_xdr_compound"
+path = "fuzz_targets/fuzz_xdr_compound.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_decode_node"
+path = "fuzz_targets/fuzz_decode_node.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_superblock"
+path = "fuzz_targets/fuzz_superblock.rs"
+test = false
+doc = false
+
+[workspace]
