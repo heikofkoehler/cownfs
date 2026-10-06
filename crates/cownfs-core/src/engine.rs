@@ -607,7 +607,9 @@ pub struct Fs {
     /// frees them; they return to `pending_free` once no snapshot (and
     /// not the live tree) references them. Rebuilt from the snapshot
     /// records on open; purely in-memory.
-    snapshot_pinned: Option<std::collections::HashSet<u64>>,
+    /// P2: compact sorted Vec (8 bytes/entry) instead of HashSet (~24 bytes).
+    /// Lookups via binary_search.
+    snapshot_pinned: Option<Vec<u64>>,
     /// Transaction group coordination. Shared via Arc so the background
     /// sync thread and waiters can coordinate without the Fs lock.
     txg: Arc<TxgCoord>,
@@ -1230,16 +1232,19 @@ impl Fs {
 
     /// Rebuild the snapshot-pinned data-block set from the snapshot
     /// records (used on open; the set is purely in-memory).
+    /// P2: compact sorted Vec instead of HashSet.
     fn rebuild_pinned(&mut self) -> Result<(), FsError> {
-        let mut pinned = std::collections::HashSet::new();
+        let mut pinned = Vec::new();
         for (snap_id, _) in self.snapshot_list()? {
             let (_, _, extents) = self.snap_trees(snap_id)?;
             for (_, ext) in extents.to_sorted_vec()? {
                 for b in ext.blk..ext.blk + ext.len as u64 {
-                    pinned.insert(b);
+                    pinned.push(b);
                 }
             }
         }
+        pinned.sort_unstable();
+        pinned.dedup();
         self.snapshot_pinned = Some(pinned);
         Ok(())
     }
@@ -3108,7 +3113,7 @@ impl Fs {
             match old {
                 Some(ext)
                     if self.txg_allocated.lock().unwrap().contains(&ext.blk)
-                        && !pinned.contains(&ext.blk) =>
+                        && pinned.binary_search(&ext.blk).is_err() =>
                 {
                     // In-place: reuse the block.
                     let blk = ext.blk;
@@ -3294,7 +3299,11 @@ impl Fs {
         let pinned = self.snapshot_pinned.as_mut().unwrap();
         for (_, ext) in self.extents.to_sorted_vec()? {
             for b in ext.blk..ext.blk + ext.len as u64 {
-                pinned.insert(b);
+                // P2: Vec is sorted; insert maintaining order.
+                match pinned.binary_search(&b) {
+                    Ok(_) => {} // already present
+                    Err(pos) => pinned.insert(pos, b),
+                }
             }
         }
         Ok(id)
@@ -3354,7 +3363,7 @@ impl Fs {
             }
         }
         for blk in deleted_blocks {
-            if !pinned.contains(&blk) && !live.contains(&blk) {
+            if pinned.binary_search(&blk).is_err() && !live.contains(&blk) {
                 self.shared.lock().unwrap().pending_free[0].push(blk);
             }
         }
