@@ -42,6 +42,8 @@ fn start_server(img: &std::path::Path, port: u16) -> Child {
     Command::new(server_bin())
         .arg(img)
         .arg(format!("127.0.0.1:{port}"))
+        .arg("--grace-period-secs")
+        .arg("0") // tests control grace explicitly; not under test here
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

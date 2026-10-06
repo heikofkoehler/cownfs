@@ -46,6 +46,8 @@ fn spawn_server_proc(img: &Path, port: u16) -> Child {
     let child = Command::new(bin)
         .arg(img)
         .arg(&addr)
+        .arg("--grace-period-secs")
+        .arg("0") // tests control grace explicitly; not under test here
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

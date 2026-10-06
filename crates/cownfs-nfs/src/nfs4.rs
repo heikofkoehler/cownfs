@@ -36,6 +36,8 @@ pub const NFS4ERR_BAD_SEQID: u32 = 10026;
 pub const NFS4ERR_STALE: u32 = 70;
 pub const NFS4ERR_MOVED: u32 = 87;
 pub const NFS4ERR_STALE_CLIENTID: u32 = 10022;
+pub const NFS4ERR_GRACE: u32 = 10032;
+pub const NFS4ERR_NO_GRACE: u32 = 10033;
 pub const NFS4ERR_OP_ILLEGAL: u32 = 10044;
 // NFSv4.1 session errors (RFC 5661 §18).
 pub const NFS4ERR_BADSESSION: u32 = 10064;
@@ -425,7 +427,10 @@ pub enum Op {
         open_stateid: StateId,
         lock_seqid: u32,
         lock_stateid: StateId,
-        lock_owner: Vec<u8>,
+        /// (clientid, owner) for a new lock owner; the clientid is needed to
+        /// attribute reclaim locks (their open_stateid is pre-restart and
+        /// unresolvable after a server restart).
+        lock_owner: (u64, Vec<u8>),
     },
     LockU {
         locktype: u32,
@@ -700,9 +705,16 @@ impl Op {
                     (0, Vec::new())
                 };
                 let claim_type = r.u32()?;
-                let filename = match claim_type {
-                    0 => r.string()?.to_vec(), // CLAIM_NULL
-                    1 => Vec::new(),           // CLAIM_PREVIOUS
+                // RFC 7530 §16.16 open_claim4 union:
+                //   CLAIM_NULL(0): utf8str_cs file;
+                //   CLAIM_PREVIOUS(1): open_delegation_type4 delegate_type;
+                //   CLAIM_DELEGATE_CUR(2): open_delegate_owner4 ...
+                let (claim_type, filename) = match claim_type {
+                    0 => (0, r.string()?.to_vec()), // CLAIM_NULL
+                    1 => {
+                        let _delegate_type = r.u32()?;
+                        (1, Vec::new())
+                    } // CLAIM_PREVIOUS: no filename; the current FH is the file.
                     _ => return Err(NfsError::Xdr(XdrError::Invalid("claim_type"))),
                 };
                 Op::Open {
@@ -825,7 +837,7 @@ impl Op {
                         let os = r.u32()?;
                         let ost = StateId::decode(r)?;
                         let ls = r.u32()?;
-                        let _lock_clientid = r.u64()?;
+                        let lock_clientid = r.u64()?;
                         let owner = r.opaque()?.to_vec();
                         (
                             os,
@@ -835,7 +847,7 @@ impl Op {
                                 seqid: 0,
                                 other: [0u8; 12],
                             },
-                            owner,
+                            (lock_clientid, owner),
                         )
                     } else {
                         let ls = r.u32()?;
@@ -848,7 +860,7 @@ impl Op {
                             },
                             ls,
                             lst,
-                            Vec::new(),
+                            (0, Vec::new()),
                         )
                     };
                 Op::Lock {

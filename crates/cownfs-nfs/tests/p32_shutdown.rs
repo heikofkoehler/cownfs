@@ -56,6 +56,8 @@ impl TestServer {
         let child = Command::new(server_bin())
             .arg(img.to_str().unwrap())
             .arg(&addr)
+            .arg("--grace-period-secs")
+            .arg("0") // tests control grace explicitly; not under test here
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

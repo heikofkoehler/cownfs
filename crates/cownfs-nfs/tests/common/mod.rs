@@ -523,6 +523,8 @@ impl Ops {
         self.w.u32(claim);
         if claim == 0 {
             self.w.string(filename); // CLAIM_NULL
+        } else if claim == 1 {
+            self.w.u32(0); // CLAIM_PREVIOUS: open_delegation_type4 = OPEN_DELEGATE_NONE
         }
         self.op();
     }
@@ -552,6 +554,21 @@ impl Ops {
             &[],
             0,
             name,
+        );
+    }
+
+    /// OPEN with CLAIM_PREVIOUS (RFC 7530 §8.4 reclaim). The current FH must
+    /// already be the file; no filename is sent.
+    pub fn open_reclaim(&mut self, clientid: u64, owner: &[u8], flags: u32) {
+        self.open(
+            clientid,
+            owner,
+            flags,
+            nfs4::OPEN4_NOCREATE,
+            0,
+            &[],
+            1, // CLAIM_PREVIOUS
+            b"",
         );
     }
 
@@ -841,9 +858,31 @@ impl Ops {
         open_stateid: &[u8; 16],
         owner: &[u8],
     ) {
+        self.lock_new_reclaim(
+            clientid,
+            locktype,
+            offset,
+            length,
+            open_stateid,
+            owner,
+            false,
+        );
+    }
+
+    /// New-lock-owner LOCK with an explicit reclaim flag (RFC 7530 §8.4).
+    pub fn lock_new_reclaim(
+        &mut self,
+        clientid: u64,
+        locktype: u32,
+        offset: u64,
+        length: u64,
+        open_stateid: &[u8; 16],
+        owner: &[u8],
+        reclaim: bool,
+    ) {
         self.w.u32(nfs4::OP_LOCK);
         self.w.u32(locktype);
-        self.w.bool(false); // reclaim
+        self.w.bool(reclaim);
         self.w.u64(offset);
         self.w.u64(length);
         self.w.bool(true); // new lock owner

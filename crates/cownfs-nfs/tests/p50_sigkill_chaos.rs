@@ -53,6 +53,8 @@ fn spawn(img: &std::path::Path, port: u16, log_suffix: &str) -> Child {
     Command::new(server_bin())
         .arg(img)
         .arg(format!("127.0.0.1:{port}"))
+        .arg("--grace-period-secs")
+        .arg("0") // tests control grace explicitly; not under test here
         .arg("--txg-interval-ms")
         .arg("10000") // 10s: avoid background sync racing with traffic
         .stdout(std::process::Stdio::null())

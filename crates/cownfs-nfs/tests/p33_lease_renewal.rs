@@ -43,6 +43,8 @@ fn lease_renewal_keeps_lease_alive() {
             "test-node",
             "--lease-ttl",
             "5",
+            "--grace-period-secs",
+            "0", // tests control grace explicitly; not under test here
             img.to_str().unwrap(),
             &addr,
         ])

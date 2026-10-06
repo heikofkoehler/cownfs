@@ -7,7 +7,7 @@ use cownfs_nfs::server;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: cownfs-server [--read-only] [--ds-addr <addr>] [--referrals <file>] [--node-id <id>] [--server-id <u32>] [--lease-ttl <secs>] [--snapshot-policy <spec>] [--txg-interval-ms <ms>] [--quota <uid>:<blocks>]... <image> [addr]");
+        eprintln!("usage: cownfs-server [--read-only] [--ds-addr <addr>] [--referrals <file>] [--node-id <id>] [--server-id <u32>] [--lease-ttl <secs>] [--snapshot-policy <spec>] [--txg-interval-ms <ms>] [--grace-period-secs <s>] [--quota <uid>:<blocks>]... <image> [addr]");
         std::process::exit(1);
     }
     let read_only = args.iter().any(|a| a == "--read-only");
@@ -82,6 +82,21 @@ fn main() {
         .position(|a| a == "--txg-interval-ms")
         .and_then(|i| args.get(i + 1))
         .cloned();
+    // Grace period after (re)start (RFC 7530 §8.4): reclaim accepted, new
+    // state establishment gets NFS4ERR_GRACE. Default 90s (the NFS lease
+    // duration). 0 disables it (reclaim impossible; clients re-establish
+    // fresh) — only for single-writer dev/test setups.
+    let grace_period_secs: u64 = args
+        .iter()
+        .position(|a| a == "--grace-period-secs")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(90);
+    let grace_period_arg = args
+        .iter()
+        .position(|a| a == "--grace-period-secs")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
     // --quota uid:blocks (repeatable).
     let quota_args: Vec<String> = args
         .iter()
@@ -108,6 +123,7 @@ fn main() {
                 && *a != "--log-level"
                 && *a != "--snapshot-policy"
                 && *a != "--txg-interval-ms"
+                && *a != "--grace-period-secs"
                 && *a != "--quota"
         })
         .collect();
@@ -126,6 +142,8 @@ fn main() {
                 && Some(*a) != snapshot_policy.as_ref()
                 && Some(*a) != txg_interval_arg.as_ref()
                 && Some(*a) != server_id_arg.as_ref()
+                && Some(*a) != grace_period_arg.as_ref()
+                && Some(*a) != grace_period_arg.as_ref()
                 && !quota_args.iter().any(|q| *a == q)
         })
         .collect();
@@ -205,6 +223,14 @@ fn main() {
     };
     shared.set_server_id(server_id);
     eprintln!("server-id {server_id} (qualifies clientids/stateids)");
+    // RFC 7530 §8.4: every (re)start enters the grace period so clients can
+    // reclaim pre-restart state. 0 disables it (tests/development).
+    if grace_period_secs == 0 {
+        eprintln!("grace period disabled");
+    } else {
+        shared.enter_grace_period_for(std::time::Duration::from_secs(grace_period_secs));
+        eprintln!("grace period {grace_period_secs}s");
+    }
     let shared = match ds_addr {
         Some(a) => shared.with_ds_addr(a),
         None => shared,

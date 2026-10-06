@@ -35,7 +35,7 @@ use crate::nfs4::{
     OP_SETCLIENTID, OP_SETCLIENTID_CONFIRM, OP_WRITE, UNCHECKED4,
 };
 use crate::rpc::{self, Call, RecordReader, RpcError};
-use crate::state::{StateManager, OPEN4_SHARE_ACCESS_WRITE};
+use crate::state::{OpenRecord, StateManager, OPEN4_SHARE_ACCESS_WRITE};
 use crate::xdr::{Writer, XdrError};
 use cownfs_core::engine::SetAttrs;
 
@@ -267,7 +267,7 @@ impl Shared {
                 None => break,
             }
         });
-        Shared {
+        let shared = Shared {
             fs,
             txg,
             txg_interval_ms,
@@ -291,7 +291,20 @@ impl Shared {
                     .expect("/dev/urandom readable");
                 v
             },
-        }
+        };
+        // Grace is entered explicitly by the server binary (see
+        // --grace-period-secs); in-process tests start without grace.
+        shared
+    }
+
+    /// Leave the grace period immediately (tests).
+    pub fn exit_grace_period(&self) {
+        self.state.exit_grace_period();
+    }
+
+    /// Enter a grace period of custom length (tests).
+    pub fn enter_grace_period_for(&self, d: std::time::Duration) {
+        self.state.enter_grace_period_for(d);
     }
 
     /// Set the txg sync interval (milliseconds). The background thread
@@ -316,7 +329,7 @@ impl Shared {
 
     pub fn new_read_only(fs: Fs, image_path: Option<std::path::PathBuf>) -> Self {
         let txg = fs.txg();
-        Shared {
+        let shared = Shared {
             fs: Arc::new(RwLock::new(fs)),
             txg,
             txg_interval_ms: Arc::new(std::sync::atomic::AtomicU64::new(100)),
@@ -339,7 +352,10 @@ impl Shared {
                     .expect("/dev/urandom readable");
                 v
             },
-        }
+        };
+        // Grace is entered explicitly by the server binary; in-process
+        // tests start without grace.
+        shared
     }
 
     /// Attach a data server address, enabling pNFS layouts.
@@ -1790,6 +1806,11 @@ impl Session {
     ) -> OpResult {
         // P5: support CLAIM_NULL (open by name) with optional CREATE.
         // P6 will add real share/state management.
+        // Grace/reclaim (RFC 7530 §8.4): CLAIM_PREVIOUS(1) reclaims a
+        // pre-restart open; other non-null claims are unsupported.
+        if claim_type == 1 {
+            return self.op_open_reclaim(seqid, clientid, owner, share_access, share_deny);
+        }
         if claim_type != 0 {
             return OpResult::err(OP_OPEN, NFS4ERR_NOTSUPP);
         }
@@ -1887,11 +1908,18 @@ impl Session {
             state_ino,
             share_access,
             share_deny,
+            false,
         ) {
             Ok(rec) => rec,
             Err(NfsError::Status(s)) => return OpResult::err(OP_OPEN, s),
             Err(_) => return OpResult::err(OP_OPEN, NFS4ERR_SERVERFAULT),
         };
+        Self::encode_open_response(&open_rec)
+    }
+
+    /// Encode the OPEN response for an open record (shared by the
+    /// CLAIM_NULL and CLAIM_PREVIOUS paths).
+    fn encode_open_response(open_rec: &OpenRecord) -> OpResult {
         let mut w = Writer::new();
         open_rec.stateid.encode(&mut w);
         // change_info4: atomic(bool) + before(u64) + after(u64)  [RFC 7530 §16.16]
@@ -1905,6 +1933,42 @@ impl Session {
         // delegation type: OPEN_DELEGATE_NONE = 0
         w.u32(0);
         OpResult::ok(OP_OPEN, w.into_bytes())
+    }
+
+    /// OPEN with CLAIM_PREVIOUS (RFC 7530 §8.4): reclaim an open held before
+    /// a server restart. The claim carries no filename; the current FH must
+    /// already be the file (the client did PUTFH before OPEN).
+    fn op_open_reclaim(
+        &mut self,
+        seqid: u32,
+        clientid: u64,
+        owner: &[u8],
+        share_access: u32,
+        share_deny: u32,
+    ) -> OpResult {
+        let file_ino = match self.current(OP_OPEN) {
+            Ok(Fh::Live(ino)) => ino,
+            Ok(_) => return OpResult::err(OP_OPEN, NFS4ERR_NOTSUPP),
+            Err(r) => return r,
+        };
+        // The file must still exist.
+        if let Err(e) = self.fs().getattr(file_ino) {
+            return OpResult::err(OP_OPEN, fs_to_nfs(e));
+        }
+        let open_rec = match self.shared.state.open(
+            seqid,
+            clientid,
+            owner.to_vec(),
+            file_ino,
+            share_access,
+            share_deny,
+            true,
+        ) {
+            Ok(rec) => rec,
+            Err(NfsError::Status(s)) => return OpResult::err(OP_OPEN, s),
+            Err(_) => return OpResult::err(OP_OPEN, NFS4ERR_SERVERFAULT),
+        };
+        Self::encode_open_response(&open_rec)
     }
 
     fn op_create(
@@ -2323,7 +2387,7 @@ impl Session {
     fn op_lock(
         &mut self,
         locktype: u32,
-        _reclaim: bool,
+        reclaim: bool,
         offset: u64,
         length: u64,
         new_lock_owner: bool,
@@ -2331,37 +2395,47 @@ impl Session {
         open_stateid: &StateId,
         _lock_seqid: u32,
         _lock_stateid: &StateId,
-        lock_owner: &[u8],
+        lock_owner: &(u64, Vec<u8>),
     ) -> OpResult {
         let file_ino = match self.current_live(OP_LOCK) {
             Ok(i) => i,
             Err(r) => return r,
         };
-        // For P6, we need the clientid. In a real server, the clientid comes
-        // from the RPC credentials or the open_stateid. For simplicity, we
-        // use a fixed clientid 1 (the test will use SETCLIENTID first).
-        // Actually, let's get it from the open_stateid's client.
-        let clientid = match self.shared.state.find_open(open_stateid) {
-            Some(o) => o.clientid,
-            None if !new_lock_owner => {
-                // Existing lock owner: find by lock_stateid.
-                return OpResult::err(OP_LOCK, NFS4ERR_EXPIRED);
+        // Attribute the lock to a client. For reclaim, the open_stateid is
+        // pre-restart and unresolvable, so the lock_owner's clientid (on the
+        // wire per RFC 7530) is authoritative. Otherwise resolve via the
+        // open stateid.
+        let (lock_clientid, lock_owner_bytes) = lock_owner;
+        let clientid = if reclaim {
+            if !new_lock_owner {
+                // Reclaim is only meaningful for a new lock owner.
+                return OpResult::err(OP_LOCK, NFS4ERR_INVAL);
             }
-            None => 1, // Fallback for test.
+            *lock_clientid
+        } else {
+            match self.shared.state.find_open(open_stateid) {
+                Some(o) => o.clientid,
+                None if !new_lock_owner => {
+                    // Existing lock owner: find by lock_stateid.
+                    return OpResult::err(OP_LOCK, NFS4ERR_EXPIRED);
+                }
+                None => 1, // Fallback for test.
+            }
         };
-        let open_st = if new_lock_owner {
+        let open_st = if new_lock_owner && !reclaim {
             Some(open_stateid)
         } else {
             None
         };
         match self.shared.state.lock(
             clientid,
-            lock_owner.to_vec(),
+            lock_owner_bytes.to_vec(),
             file_ino,
             locktype,
             offset,
             length,
             open_st,
+            reclaim,
         ) {
             Ok(rec) => {
                 let mut w = Writer::new();

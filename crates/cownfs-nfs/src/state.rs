@@ -7,8 +7,8 @@
 //! - Expired leases reap all client state.
 
 use crate::nfs4::{
-    NfsError, StateId, NFS4ERR_BAD_SEQID, NFS4ERR_DENIED, NFS4ERR_EXPIRED, NFS4ERR_INVAL,
-    NFS4ERR_LOCKED, NFS4ERR_STALE_CLIENTID,
+    NfsError, StateId, NFS4ERR_BAD_SEQID, NFS4ERR_DENIED, NFS4ERR_EXPIRED, NFS4ERR_GRACE,
+    NFS4ERR_INVAL, NFS4ERR_LOCKED, NFS4ERR_NO_GRACE, NFS4ERR_STALE_CLIENTID,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -95,6 +95,12 @@ pub struct StateManager {
     /// share/lock conflict detection exact. Lock ordering: conflict ->
     /// bucket. Never acquire in the reverse order.
     conflict: Mutex<()>,
+    /// Post-restart grace period (RFC 7530 §8.4). While `Some(deadline)` is
+    /// in the future, the server accepts reclaim (CLAIM_PREVIOUS / reclaim
+    /// locks) and rejects new state establishment with NFS4ERR_GRACE.
+    /// Entered at server startup; `None` once expired or never entered.
+    /// Only ever locked alone (never nested inside bucket/names locks).
+    grace_until: Mutex<Option<Instant>>,
     /// Unique per shard primary (see docs/v40-state-partitioning.md §4.2).
     /// Occupies the high 32 bits of every clientid this server issues, so
     /// two servers never issue the same clientid and a standby never
@@ -151,11 +157,37 @@ impl StateManager {
             buckets: std::array::from_fn(|_| Mutex::new(Bucket::new())),
             names: Mutex::new(HashMap::new()),
             conflict: Mutex::new(()),
+            grace_until: Mutex::new(None),
             server_id: AtomicU32::new(server_id),
             boot_gen: random_boot_gen(),
             next_client_seq: AtomicU32::new(1),
             next_stateid_seq: AtomicU32::new(1),
             lease_duration,
+        }
+    }
+
+    /// Enter the post-restart grace period (RFC 7530 §8.4): until the lease
+    /// duration elapses, reclaim is accepted and new state establishment
+    /// fails with NFS4ERR_GRACE. Called once at server startup.
+    pub fn enter_grace_period(&self) {
+        self.enter_grace_period_for(self.lease_duration);
+    }
+
+    /// Enter a grace period of custom length (for tests).
+    pub fn enter_grace_period_for(&self, d: Duration) {
+        *self.grace_until.lock().unwrap() = Some(Instant::now() + d);
+    }
+
+    /// Leave the grace period immediately (for tests).
+    pub fn exit_grace_period(&self) {
+        *self.grace_until.lock().unwrap() = None;
+    }
+
+    /// True while the server is in its post-restart grace period.
+    pub fn in_grace(&self) -> bool {
+        match *self.grace_until.lock().unwrap() {
+            Some(t) => t > Instant::now(),
+            None => false,
         }
     }
 
@@ -377,6 +409,12 @@ impl StateManager {
     /// OPEN: create open state. Checks share reservations.
     /// Returns the OpenRecord or an NFS error.
     ///
+    /// `reclaim` = CLAIM_PREVIOUS (RFC 7530 §8.4): the client re-establishes
+    /// state it held before a server restart. Reclaim is only valid during
+    /// the grace period and is granted without share-conflict checks (the
+    /// server lost all pre-restart state, so there is nothing to check
+    /// against). Non-reclaim opens during grace fail with NFS4ERR_GRACE.
+    ///
     /// The share-conflict check scans all buckets under the conflict lock,
     /// so two racing opens observe a consistent view and conflict detection
     /// stays exact (same atomicity the old global lock provided).
@@ -388,8 +426,25 @@ impl StateManager {
         file_ino: u64,
         share_access: u32,
         share_deny: u32,
+        reclaim: bool,
     ) -> Result<OpenRecord, NfsError> {
         self.check_client(clientid)?;
+        if reclaim {
+            if !self.in_grace() {
+                return Err(NfsError::Status(NFS4ERR_NO_GRACE));
+            }
+            return Ok(self.insert_open(
+                seqid,
+                clientid,
+                owner,
+                file_ino,
+                share_access,
+                share_deny,
+            ));
+        }
+        if self.in_grace() {
+            return Err(NfsError::Status(NFS4ERR_GRACE));
+        }
         // Serialize conflict-check+insert vs other open()/lock() calls.
         // Lock ordering: conflict -> bucket.
         let _conflict = self.conflict.lock().unwrap();
@@ -410,6 +465,30 @@ impl StateManager {
             }
         }
         let mut b = self.buckets[Self::bucket_idx(clientid)].lock().unwrap();
+        Ok(self.insert_open_in(
+            &mut b,
+            seqid,
+            clientid,
+            owner,
+            file_ino,
+            share_access,
+            share_deny,
+        ))
+    }
+
+    /// Merge-or-insert an open record into an already-locked bucket.
+    /// Called with the bucket lock held (and, for non-reclaim opens, the
+    /// conflict lock held).
+    fn insert_open_in(
+        &self,
+        b: &mut Bucket,
+        seqid: u32,
+        clientid: u64,
+        owner: Vec<u8>,
+        file_ino: u64,
+        share_access: u32,
+        share_deny: u32,
+    ) -> OpenRecord {
         let key = (clientid, owner.clone());
         // If the same open_owner reopens the same file, merge share modes
         // (upgrade) instead of creating a duplicate. Accept any seqid for
@@ -421,23 +500,46 @@ impl StateManager {
                 existing.seqid = seqid;
                 existing.stateid.seqid += 1;
                 let rec = existing.clone();
-                self.renew_lease_in(&mut b, clientid);
-                return Ok(rec);
+                self.renew_lease_in(b, clientid);
+                return rec;
             }
         }
         let stateid = self.new_stateid();
         let rec = OpenRecord {
             clientid,
-            owner: owner.clone(),
+            owner,
             file_ino,
-            stateid: stateid.clone(),
+            stateid,
             share_access,
             share_deny,
             seqid,
         };
         b.opens.insert(key, rec.clone());
-        self.renew_lease_in(&mut b, clientid);
-        Ok(rec)
+        self.renew_lease_in(b, clientid);
+        rec
+    }
+
+    /// Insert an open record for the reclaim path (no conflict checks; the
+    /// caller holds no locks).
+    fn insert_open(
+        &self,
+        seqid: u32,
+        clientid: u64,
+        owner: Vec<u8>,
+        file_ino: u64,
+        share_access: u32,
+        share_deny: u32,
+    ) -> OpenRecord {
+        let mut b = self.buckets[Self::bucket_idx(clientid)].lock().unwrap();
+        self.insert_open_in(
+            &mut b,
+            seqid,
+            clientid,
+            owner,
+            file_ino,
+            share_access,
+            share_deny,
+        )
     }
 
     /// Scan all buckets for the open with this exact stateid.
@@ -540,6 +642,11 @@ impl StateManager {
 
     /// LOCK: acquire a byte-range lock. Checks conflicts.
     ///
+    /// `reclaim` mirrors OPEN's CLAIM_PREVIOUS (RFC 7530 §8.4): only valid
+    /// during the grace period, granted without conflict checks and without
+    /// open_stateid validation (the server lost the pre-restart stateids).
+    /// Non-reclaim locks during grace fail with NFS4ERR_GRACE.
+    ///
     /// Like open(), the conflict check scans all buckets under the conflict
     /// lock so racing locks observe a consistent view.
     pub fn lock(
@@ -551,8 +658,32 @@ impl StateManager {
         offset: u64,
         length: u64,
         open_stateid: Option<&StateId>,
+        reclaim: bool,
     ) -> Result<LockRecord, NfsError> {
         self.check_client(clientid)?;
+        if reclaim {
+            if !self.in_grace() {
+                return Err(NfsError::Status(NFS4ERR_NO_GRACE));
+            }
+            let mut b = self.buckets[Self::bucket_idx(clientid)].lock().unwrap();
+            let stateid = self.new_stateid();
+            let rec = LockRecord {
+                clientid,
+                owner: lock_owner.clone(),
+                file_ino,
+                stateid,
+                offset,
+                length,
+                locktype,
+                seqid: 0,
+            };
+            b.locks.insert((clientid, lock_owner), rec.clone());
+            self.renew_lease_in(&mut b, clientid);
+            return Ok(rec);
+        }
+        if self.in_grace() {
+            return Err(NfsError::Status(NFS4ERR_GRACE));
+        }
         // Validate open_stateid if provided (new lock owner).
         if let Some(ost) = open_stateid {
             if self.find_open(ost).is_none() {
@@ -688,7 +819,7 @@ mod tests {
         let (cid, _) = sm.setclientid([1u8; 8], b"test".to_vec());
         assert!(sm.confirm(cid, [1u8; 8]));
         // Create an open.
-        sm.open(1, cid, b"owner".to_vec(), 1, 3, 0).unwrap();
+        sm.open(1, cid, b"owner".to_vec(), 1, 3, 0, false).unwrap();
         assert!(sm.client_has_state(cid));
         // Wait for lease to expire.
         std::thread::sleep(Duration::from_millis(150));
@@ -696,7 +827,7 @@ mod tests {
         // State should be gone.
         assert!(!sm.client_has_state(cid));
         // Open should fail with stale clientid.
-        assert!(sm.open(1, cid, b"owner2".to_vec(), 1, 3, 0).is_err());
+        assert!(sm.open(1, cid, b"owner2".to_vec(), 1, 3, 0, false).is_err());
     }
 
     #[test]
@@ -707,9 +838,9 @@ mod tests {
         sm.confirm(cid1, [1u8; 8]);
         sm.confirm(cid2, [2u8; 8]);
         // c1 opens with DENY_WRITE.
-        sm.open(1, cid1, b"o1".to_vec(), 1, 3, 2).unwrap();
+        sm.open(1, cid1, b"o1".to_vec(), 1, 3, 2, false).unwrap();
         // c2 tries to open for WRITE — should be denied.
-        let res = sm.open(1, cid2, b"o2".to_vec(), 1, 2, 0);
+        let res = sm.open(1, cid2, b"o2".to_vec(), 1, 2, 0, false);
         assert!(res.is_err());
     }
 
@@ -720,17 +851,44 @@ mod tests {
         let (cid2, _) = sm.setclientid([2u8; 8], b"c2".to_vec());
         sm.confirm(cid1, [1u8; 8]);
         sm.confirm(cid2, [2u8; 8]);
-        let o1 = sm.open(1, cid1, b"o1".to_vec(), 1, 3, 0).unwrap();
-        let o2 = sm.open(1, cid2, b"o2".to_vec(), 1, 3, 0).unwrap();
+        let o1 = sm.open(1, cid1, b"o1".to_vec(), 1, 3, 0, false).unwrap();
+        let o2 = sm.open(1, cid2, b"o2".to_vec(), 1, 3, 0, false).unwrap();
         // c1 locks [0,1000) WRITE.
-        sm.lock(cid1, b"l1".to_vec(), 1, 2, 0, 1000, Some(&o1.stateid))
-            .unwrap();
+        sm.lock(
+            cid1,
+            b"l1".to_vec(),
+            1,
+            2,
+            0,
+            1000,
+            Some(&o1.stateid),
+            false,
+        )
+        .unwrap();
         // c2 tries overlapping [500,1500) — should fail.
-        let res = sm.lock(cid2, b"l2".to_vec(), 1, 2, 500, 1000, Some(&o2.stateid));
+        let res = sm.lock(
+            cid2,
+            b"l2".to_vec(),
+            1,
+            2,
+            500,
+            1000,
+            Some(&o2.stateid),
+            false,
+        );
         assert!(res.is_err());
         // c2 locks non-overlapping [2000,3000) — should succeed.
-        sm.lock(cid2, b"l2".to_vec(), 1, 2, 2000, 1000, Some(&o2.stateid))
-            .unwrap();
+        sm.lock(
+            cid2,
+            b"l2".to_vec(),
+            1,
+            2,
+            2000,
+            1000,
+            Some(&o2.stateid),
+            false,
+        )
+        .unwrap();
     }
 
     // --- Server-qualified ids (docs/v40-state-partitioning.md §4.2) ---
@@ -781,7 +939,7 @@ mod tests {
         let sm = StateManager::with_server_id(42);
         let (cid, _) = sm.setclientid([1u8; 8], b"c1".to_vec());
         sm.confirm(cid, [1u8; 8]);
-        let o = sm.open(1, cid, b"o1".to_vec(), 1, 3, 0).unwrap();
+        let o = sm.open(1, cid, b"o1".to_vec(), 1, 3, 0, false).unwrap();
         assert_eq!(StateManager::stateid_server_id(&o.stateid), 42);
         assert!(sm.owns_stateid(&o.stateid));
         // A stateid from another server is not ours.
@@ -800,8 +958,8 @@ mod tests {
         let (cid2, _) = boot2.setclientid([1u8; 8], b"c".to_vec());
         boot1.confirm(cid1, [1u8; 8]);
         boot2.confirm(cid2, [1u8; 8]);
-        let o1 = boot1.open(1, cid1, b"o".to_vec(), 1, 3, 0).unwrap();
-        let o2 = boot2.open(1, cid2, b"o".to_vec(), 1, 3, 0).unwrap();
+        let o1 = boot1.open(1, cid1, b"o".to_vec(), 1, 3, 0, false).unwrap();
+        let o2 = boot2.open(1, cid2, b"o".to_vec(), 1, 3, 0, false).unwrap();
         assert_ne!(
             StateManager::stateid_boot_gen(&o1.stateid),
             StateManager::stateid_boot_gen(&o2.stateid),
@@ -848,7 +1006,15 @@ mod tests {
                 // Each client opens/closes its own files: no conflicts expected.
                 for j in 0..20u64 {
                     let rec = sm
-                        .open(1, cid, format!("owner-{j}").into_bytes(), 1000 + j, 3, 0)
+                        .open(
+                            1,
+                            cid,
+                            format!("owner-{j}").into_bytes(),
+                            1000 + j,
+                            3,
+                            0,
+                            false,
+                        )
                         .expect("disjoint open failed");
                     sm.close(&rec.stateid, 2).expect("close failed");
                 }
@@ -882,7 +1048,7 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 barrier.wait();
                 // OPEN for WRITE with DENY_WRITE: conflicts with any writer.
-                sm.open(1, cid, b"o".to_vec(), 777, 2, 2)
+                sm.open(1, cid, b"o".to_vec(), 777, 2, 2, false)
             }));
         }
         let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
@@ -900,12 +1066,98 @@ mod tests {
         let sm = StateManager::with_lease(Duration::from_secs(3600));
         let (cid1, _) = sm.setclientid([1u8; 8], b"cli".to_vec());
         sm.confirm(cid1, [1u8; 8]);
-        let rec = sm.open(1, cid1, b"o".to_vec(), 5, 3, 0).unwrap();
+        let rec = sm.open(1, cid1, b"o".to_vec(), 5, 3, 0, false).unwrap();
         assert!(sm.client_has_state(cid1));
         let (cid2, _) = sm.setclientid([2u8; 8], b"cli".to_vec());
         assert_eq!(cid1, cid2);
         assert!(!sm.client_has_state(cid2));
         assert!(sm.find_open(&rec.stateid).is_none());
         assert!(sm.confirm(cid2, [2u8; 8]));
+    }
+
+    // --- Grace period / reclaim (RFC 7530 §8.4) ---
+
+    fn confirmed_client(sm: &StateManager, name: &[u8]) -> u64 {
+        let (cid, _) = sm.setclientid([9u8; 8], name.to_vec());
+        assert!(sm.confirm(cid, [9u8; 8]));
+        cid
+    }
+
+    #[test]
+    fn grace_reclaim_open_accepted() {
+        let sm = StateManager::new();
+        sm.enter_grace_period();
+        assert!(sm.in_grace());
+        let cid = confirmed_client(&sm, b"c1");
+        // Reclaim during grace: granted.
+        let rec = sm.open(1, cid, b"o".to_vec(), 7, 3, 0, true).unwrap();
+        assert_eq!(rec.file_ino, 7);
+        assert!(sm.client_has_state(cid));
+    }
+
+    #[test]
+    fn grace_new_open_rejected() {
+        let sm = StateManager::new();
+        sm.enter_grace_period();
+        let cid = confirmed_client(&sm, b"c1");
+        let err = sm.open(1, cid, b"o".to_vec(), 7, 3, 0, false).unwrap_err();
+        assert_eq!(err, NfsError::Status(NFS4ERR_GRACE));
+    }
+
+    #[test]
+    fn no_grace_reclaim_open_rejected() {
+        let sm = StateManager::new();
+        assert!(!sm.in_grace());
+        let cid = confirmed_client(&sm, b"c1");
+        let err = sm.open(1, cid, b"o".to_vec(), 7, 3, 0, true).unwrap_err();
+        assert_eq!(err, NfsError::Status(NFS4ERR_NO_GRACE));
+    }
+
+    #[test]
+    fn grace_expiry_resumes_normal_opens() {
+        let sm = StateManager::new();
+        sm.enter_grace_period_for(Duration::from_millis(50));
+        let cid = confirmed_client(&sm, b"c1");
+        assert!(sm.open(1, cid, b"o".to_vec(), 7, 3, 0, false).is_err());
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(!sm.in_grace());
+        // Grace over: normal open works, reclaim is rejected.
+        sm.open(1, cid, b"o".to_vec(), 7, 3, 0, false).unwrap();
+        let err = sm.open(1, cid, b"o2".to_vec(), 8, 3, 0, true).unwrap_err();
+        assert_eq!(err, NfsError::Status(NFS4ERR_NO_GRACE));
+    }
+
+    #[test]
+    fn grace_reclaim_skips_share_conflicts() {
+        // Post-restart there is nothing to conflict with: two clients
+        // reclaiming mutually conflicting opens both succeed.
+        let sm = StateManager::new();
+        sm.enter_grace_period();
+        let cid1 = confirmed_client(&sm, b"c1");
+        let cid2 = confirmed_client(&sm, b"c2");
+        sm.open(1, cid1, b"o1".to_vec(), 7, 2, 2, true).unwrap();
+        sm.open(1, cid2, b"o2".to_vec(), 7, 2, 2, true).unwrap();
+    }
+
+    #[test]
+    fn grace_lock_reclaim_rules() {
+        let sm = StateManager::new();
+        sm.enter_grace_period();
+        let cid = confirmed_client(&sm, b"c1");
+        // Reclaim lock during grace: granted without open_stateid validation
+        // (pre-restart stateids are unresolvable).
+        sm.lock(cid, b"l".to_vec(), 7, 2, 0, 100, None, true)
+            .unwrap();
+        // New lock during grace: rejected.
+        let err = sm
+            .lock(cid, b"l2".to_vec(), 7, 2, 200, 100, None, false)
+            .unwrap_err();
+        assert_eq!(err, NfsError::Status(NFS4ERR_GRACE));
+        sm.exit_grace_period();
+        // Reclaim after grace: rejected.
+        let err = sm
+            .lock(cid, b"l3".to_vec(), 7, 2, 300, 100, None, true)
+            .unwrap_err();
+        assert_eq!(err, NfsError::Status(NFS4ERR_NO_GRACE));
     }
 }
