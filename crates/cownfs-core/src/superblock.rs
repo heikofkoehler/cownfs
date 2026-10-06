@@ -50,7 +50,15 @@ const OFF_CHECKSUM: usize = 64;
 /// - `compat`: safe to ignore unknown bits.
 /// - `ro_compat`: unknown bits → open read-only.
 /// - `incompat`: unknown bits → refuse to open.
-pub const KNOWN_COMPAT: u64 = 0;
+///
+/// N9: S3/S4 format features are backward-compatible (old code falls back
+/// to walks/recomputes), so they are COMPAT bits.
+pub const COMPAT_PERSISTED_COUNTS: u64 = 1 << 0; // S3: per-arena live counts
+pub const COMPAT_QUOTA_TABLE: u64 = 1 << 1; // S3: persisted quota usage table
+pub const COMPAT_FREE_BLOCKS: u64 = 1 << 2; // S4: persisted free_blocks counter
+pub const COMPAT_PAGED_BITMAP: u64 = 1 << 3; // S4: per-slot bitmap areas
+pub const KNOWN_COMPAT: u64 =
+    COMPAT_PERSISTED_COUNTS | COMPAT_QUOTA_TABLE | COMPAT_FREE_BLOCKS | COMPAT_PAGED_BITMAP;
 pub const KNOWN_RO_COMPAT: u64 = 0;
 pub const KNOWN_INCOMPAT: u64 = 0;
 
@@ -292,7 +300,7 @@ impl Superblock {
             bitmap_full_gen: 0,
             bitmap_delta_gen: 0,
             bitmap_base_area: 0,
-            compat: 0,
+            compat: KNOWN_COMPAT,
             ro_compat: 0,
             incompat: 0,
             live_inodes: 0,
