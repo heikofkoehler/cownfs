@@ -1199,28 +1199,18 @@ impl Fs {
         // S3: quota usage comes from the persisted table when available;
         // otherwise fall back to the O(inodes) rebuild (legacy images,
         // corrupt table, or UID overflow).
-        let quota_rebuilt = match superblock::read_quota_table(&dev, active_slot) {
+        // N6: Do NOT write the rebuilt table here. Writing to the active
+        // slot's block on open races with a live writer (the renewal
+        // thread opens every ttl/3 s). The table stays in memory and the
+        // next commit persists it via the normal superblock write path.
+        match superblock::read_quota_table(&dev, active_slot) {
             Some(Ok(map)) => {
                 fs.quota_usage = map;
-                false
             }
             _ => {
                 fs.rebuild_quota_usage()?;
-                true
             }
         };
-        if quota_rebuilt {
-            // Persist the rebuilt table so the next open is O(1). Best
-            // effort: a read-only open must not fail here... actually a
-            // read-only FS can't write; skip the write if read_only.
-            if !read_only {
-                // Write to the active slot's padding.
-                let sh = fs.shared.lock().unwrap();
-                let usage = fs.quota_usage.clone();
-                // Ignore errors: the table is a pure optimization.
-                let _ = superblock::write_quota_table(&sh.dev, active_slot, &usage);
-            }
-        }
         // S3: xattrs load lazily on first access (ensure_xattrs).
         Ok(fs)
     }
