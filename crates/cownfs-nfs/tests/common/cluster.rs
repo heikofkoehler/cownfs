@@ -54,12 +54,7 @@ pub struct ClusterNode {
 }
 
 impl ClusterNode {
-    fn spawn(
-        dir: &std::path::Path,
-        name: &str,
-        server_id: u32,
-        extra_args: &[&str],
-    ) -> Self {
+    fn spawn(dir: &std::path::Path, name: &str, server_id: u32, extra_args: &[&str]) -> Self {
         let img = dir.join(format!("{name}.img"));
         let _ = std::fs::remove_file(&img);
         let uuid = {

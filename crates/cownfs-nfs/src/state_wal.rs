@@ -89,8 +89,7 @@ impl StateWal {
     pub fn append(&mut self, seq: u64, record: &StateLogRecord) -> std::io::Result<()> {
         let encoded = record.encode();
         self.file.write_all(&seq.to_be_bytes())?;
-        self.file
-            .write_all(&(encoded.len() as u32).to_be_bytes())?;
+        self.file.write_all(&(encoded.len() as u32).to_be_bytes())?;
         self.file.write_all(&encoded)?;
         self.file.sync_all()?;
         Ok(())

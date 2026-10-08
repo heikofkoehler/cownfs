@@ -877,11 +877,7 @@ impl StateManager {
     /// SETCLIENTID: register or update a client. Returns (clientid, confirmed).
     /// At the admission-control cap, a NEW name gets `Err(NFS4ERR_DELAY)`;
     /// re-establishment of a known client is always allowed.
-    pub fn setclientid(
-        &self,
-        verifier: [u8; 8],
-        name: Vec<u8>,
-    ) -> Result<(u64, bool), u32> {
+    pub fn setclientid(&self, verifier: [u8; 8], name: Vec<u8>) -> Result<(u64, bool), u32> {
         self.reap_all();
         // Lock ordering: names -> bucket.
         let mut names = self.names.lock().unwrap();
@@ -915,9 +911,7 @@ impl StateManager {
         } else {
             // Admission control (§4.1): at the cap, refuse NEW clients with
             // DELAY so the client retries (or the LB sends it elsewhere).
-            let max = self
-                .max_clients
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let max = self.max_clients.load(std::sync::atomic::Ordering::Relaxed);
             if max > 0 {
                 let count: usize = self
                     .buckets
@@ -1572,8 +1566,12 @@ mod tests {
         let standby = StateManager::with_server_id(8);
         let mut seen = std::collections::HashSet::new();
         for i in 0..100 {
-            let (c1, _) = primary.setclientid([1u8; 8], format!("p{i}").into_bytes()).unwrap();
-            let (c2, _) = standby.setclientid([1u8; 8], format!("s{i}").into_bytes()).unwrap();
+            let (c1, _) = primary
+                .setclientid([1u8; 8], format!("p{i}").into_bytes())
+                .unwrap();
+            let (c2, _) = standby
+                .setclientid([1u8; 8], format!("s{i}").into_bytes())
+                .unwrap();
             assert!(seen.insert(c1), "primary reissued clientid {c1:#x}");
             assert!(
                 seen.insert(c2),
@@ -1649,7 +1647,9 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 barrier.wait();
                 let v = [i as u8; 8];
-                let (cid, _) = sm.setclientid(v, format!("client-{i}").into_bytes()).unwrap();
+                let (cid, _) = sm
+                    .setclientid(v, format!("client-{i}").into_bytes())
+                    .unwrap();
                 assert!(sm.confirm(cid, v));
                 // Each client opens/closes its own files: no conflicts expected.
                 for j in 0..20u64 {
