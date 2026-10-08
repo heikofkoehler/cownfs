@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/rustup@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           components: rustfmt
@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/rustup@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
       - run: cargo build --workspace --all-targets 2>&1 | tee build.log
@@ -40,7 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/rustup@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
       - run: cargo test --workspace --exclude cownfs-bench
