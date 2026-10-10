@@ -3,7 +3,8 @@
 //! Device for finding data correctness issues:
 //! - Randomized workload: creates, writes, deletes, truncates across many files
 //! - Fault injected at a RANDOM point in the commit path (AfterFlush,
-//!   AfterBitmap, AfterSync) — simulates crash at the worst moment
+//!   AfterBitmap, AfterSync, AfterSlotWrite, AfterQuotaTable,
+//!   AfterFinalSync) — simulates crash at the worst moment
 //! - After "crash", verify:
 //!   1. Fs::open succeeds (no panic, no corruption)
 //!   2. fs.check() passes (on-disk consistency)
@@ -113,10 +114,13 @@ fn fuzz_one(seed: u64) {
     }
 
     // Phase 3: inject fault at random commit point (simulated crash).
-    let fault = match rng.below(3) {
+    let fault = match rng.below(6) {
         0 => FaultPoint::AfterFlush,
         1 => FaultPoint::AfterBitmap,
-        _ => FaultPoint::AfterSync,
+        2 => FaultPoint::AfterSync,
+        3 => FaultPoint::AfterSlotWrite,
+        4 => FaultPoint::AfterQuotaTable,
+        _ => FaultPoint::AfterFinalSync,
     };
     fs.set_fault_point(fault);
     let _ = fs.commit(); // Expected to fail with InjectedFault.

@@ -2841,6 +2841,8 @@ pub fn serve_metrics(addr: &str, shared: &Shared) -> Result<(), ServerError> {
             let req = String::from_utf8_lossy(&buf);
             let (status, ctype, body) = if req.starts_with("GET /metrics") {
                 ("200 OK", "text/plain", shared.metrics.render())
+            } else if req.starts_with("GET /status") {
+                ("200 OK", "text/plain", render_status(shared))
             } else if req.starts_with("GET /healthz") {
                 ("200 OK", "text/plain", "ok\n".to_string())
             } else {
@@ -2856,6 +2858,30 @@ pub fn serve_metrics(addr: &str, shared: &Shared) -> Result<(), ServerError> {
         }
     }
     Ok(())
+}
+
+/// Render operational diagnostics (P7): filesystem generation, space,
+/// deferred-free queue depth, and commit counts. Plain `key value` text
+/// for curl/jq-friendly inspection; /metrics stays Prometheus-formatted.
+fn render_status(shared: &Shared) -> String {
+    let mut out = String::new();
+    match shared.fs.read() {
+        Ok(fs) => {
+            let (q0, q1) = fs.deferred_queue_depth();
+            out.push_str(&format!("cownfs_generation {}\n", fs.generation()));
+            out.push_str(&format!("cownfs_block_count {}\n", fs.block_count()));
+            out.push_str(&format!("cownfs_free_blocks {}\n", fs.free_block_count()));
+            out.push_str(&format!("cownfs_deferred_q0 {q0}\n"));
+            out.push_str(&format!("cownfs_deferred_q1 {q1}\n"));
+            out.push_str(&format!("cownfs_sync_count {}\n", fs.sync_count()));
+        }
+        Err(_) => out.push_str("cownfs_fs_lock_poisoned 1\n"),
+    }
+    out.push_str(&format!(
+        "cownfs_read_only {}\n",
+        shared.read_only.load(std::sync::atomic::Ordering::Relaxed) as u8
+    ));
+    out
 }
 
 /// Run the server on an already-bound `listener`, spawning one thread per

@@ -26,6 +26,9 @@ fn p7_crash_injection() {
         FaultPoint::AfterFlush,
         FaultPoint::AfterBitmap,
         FaultPoint::AfterSync,
+        FaultPoint::AfterSlotWrite,
+        FaultPoint::AfterQuotaTable,
+        FaultPoint::AfterFinalSync,
     ];
 
     for point in points {

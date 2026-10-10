@@ -102,6 +102,15 @@ fn p7_soak() {
         if i % 10 == 9 {
             fs.commit().unwrap();
         }
+        // Heartbeat for long (multi-hour) runs.
+        if i % 100_000 == 99_999 {
+            let live_snaps = fs.snapshot_list().unwrap().len();
+            eprintln!(
+                "soak progress: {}/{n} ops, {} files, {live_snaps} live snapshots",
+                i + 1,
+                files.len()
+            );
+        }
     }
     fs.commit().unwrap();
 
@@ -116,8 +125,9 @@ fn p7_soak() {
 
     // Final check must pass.
     fs.check().expect("soak left image inconsistent");
+    let live_snaps = fs.snapshot_list().unwrap().len();
     println!(
-        "Soak: {n} ops, {} files, {snap_count} snapshots, check clean",
+        "Soak: {n} ops, {} files, {snap_count} snapshots created ({live_snaps} live), check clean",
         files.len()
     );
 
