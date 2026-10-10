@@ -66,6 +66,15 @@ pub enum FaultPoint {
     AfterBitmap,
     /// After the device sync, before the superblock slot flip.
     AfterSync,
+    /// After the new superblock slot is written, before the quota table.
+    /// The new generation may be visible on reopen (slot in page cache).
+    AfterSlotWrite,
+    /// After the quota table is persisted in the slot padding, before the
+    /// final device sync.
+    AfterQuotaTable,
+    /// After the final device sync: the commit is fully durable; the
+    /// injected error tests abort-path idempotency after durability.
+    AfterFinalSync,
 }
 
 #[derive(Debug)]
@@ -639,6 +648,14 @@ pub struct Fs {
     /// Bytes written by the last persist_bitmap (for benchmarking).
     /// P1: Mutex for commit_async(&self).
     last_bitmap_write_bytes: std::sync::Mutex<u64>,
+    /// #6: stats from the latest persist_bitmap_full: (dropped queue
+    /// entries, popcount of free bits in the written area). Set on every
+    /// persist; consumed (take) by prepare_sync for sb.free_blocks.
+    /// written_free is the exact free count of the area the next slot
+    /// flip commits — unlike the in-memory counter it accounts for
+    /// deferred-free bits cleared in the written area when the queue
+    /// didn't fit, and for writes between persist and prepare.
+    persisted_area_stats: std::sync::Mutex<Option<(u64, u64)>>,
     /// P9: uncommitted dirty data bytes (backpressure). Incremented on
     /// write(), reset to 0 when sync_txg() makes a txg durable.
     dirty_bytes: std::sync::atomic::AtomicU64,
@@ -940,6 +957,7 @@ impl Fs {
             xattrs_loaded: true,
             commits_since_checkpoint: std::sync::Mutex::new(0),
             last_bitmap_write_bytes: std::sync::Mutex::new(0),
+            persisted_area_stats: std::sync::Mutex::new(None),
             dirty_bytes: std::sync::atomic::AtomicU64::new(0),
             dirty_backpressure_threshold: std::sync::atomic::AtomicU64::new(256 * 1024 * 1024),
             txg_allocated: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -1253,6 +1271,7 @@ impl Fs {
             xattrs_loaded: false,
             commits_since_checkpoint: std::sync::Mutex::new(0),
             last_bitmap_write_bytes: std::sync::Mutex::new(0),
+            persisted_area_stats: std::sync::Mutex::new(None),
             dirty_bytes: std::sync::atomic::AtomicU64::new(0),
             dirty_backpressure_threshold: std::sync::atomic::AtomicU64::new(256 * 1024 * 1024),
             txg_allocated: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -1336,6 +1355,15 @@ impl Fs {
     pub fn free_block_count(&self) -> u64 {
         // P3: O(1) via the bitmap's maintained free counter.
         self.shared.lock().unwrap().bitmap.free_count()
+    }
+
+    /// Deferred-free queue depths (q0 = freed in current generation,
+    /// q1 = freed one generation ago). Nonzero q1 after many commits is
+    /// normal; a monotonically growing total across commits indicates
+    /// the persist path isn't draining (see #6).
+    pub fn deferred_queue_depth(&self) -> (usize, usize) {
+        let sh = self.shared.lock().unwrap();
+        (sh.pending_free[0].len(), sh.pending_free[1].len())
     }
 
     /// All allocated block numbers. Used for full replication sends.
@@ -1615,7 +1643,10 @@ impl Fs {
         // Persist the full bitmap (updates sb.bitmap_* for generation+1).
         // Write to the target slot's area (like commit_async).
         let target_slot = 1 - self.active_slot;
-        self.persist_bitmap_full(target_slot)?;
+        let (_, written_free) = self.persist_bitmap_full(target_slot)?;
+        // #6: the area just written is what the flip below commits;
+        // its exact free count keeps sb.free_blocks consistent.
+        self.sb.free_blocks = written_free;
         // Advance the generation on the inactive slot.
         self.sb.generation += 1;
         {
@@ -1752,21 +1783,60 @@ impl Fs {
     }
 
     /// Write the full bitmap to area 0 and reset delta state.
-    fn persist_bitmap_full(&self, target_slot: usize) -> Result<(), FsError> {
+    /// Write the full bitmap to the target slot's area, streaming page by
+    /// page (N11). Returns `(dropped, written_free)`:
+    /// - `dropped`: deferred-free entries that did not fit in the area's
+    ///   real padding; their bits were cleared in the *written* area (not
+    ///   in memory) so the persisted (bitmap, queue) pair stays consistent.
+    /// - `written_free`: popcount of free bitmap bits < block_count as
+    ///   written (ground truth for the area the next slot flip commits).
+    fn persist_bitmap_full(&self, target_slot: usize) -> Result<(u64, u64), FsError> {
         let blocks = self.sb.bitmap_blocks;
+        let block_count = self.sb.block_count;
         let mut sh = self.shared.lock().unwrap();
-        // R3: the deferred queue is persisted in bitmap area padding. If the
-        // E1: if the deferred-free queue exceeds the padding, DO NOT free
-        // blocks immediately. That would make blocks referenced by the
-        // newest durable generation allocatable, corrupting on crash.
-        // Instead, keep them queued in memory; they remain marked as
-        // allocated (safe, just temporarily wasted space). The next commit
-        // will retry persisting them.
-        // (The old code freed overflow here, which is the E1 bug.)
-        {
-            // No-op: the queue stays in memory if it doesn't fit.
-            // The streaming write below persists what fits.
-        }
+        // #6: the deferred-free queue is persisted in the bitmap area's
+        // padding, but ONLY when real padding exists and the whole queue
+        // fits. Two failure modes of the old code are fixed here:
+        // (a) When bitmap_bytes is a multiple of BLOCK_SIZE there is NO
+        //     padding; the old code wrote the queue at offset 0 of the
+        //     last page anyway, clobbering live bitmap words (every
+        //     image sized a multiple of 128 MiB corrupted its bitmap on
+        //     every commit with a non-empty queue).
+        // (b) When the queue exceeded the padding, the old code persisted
+        //     a truncated queue while the area kept all bits set; on
+        //     reopen the dropped entries were "allocated but unreachable"
+        //     and fsck failed.
+        // Fix: entries beyond capacity ("dropped") have their bits cleared
+        // in the WRITTEN area. This is crash-safe: every queued block is
+        // unreachable from the about-to-be-committed trees (live and
+        // snapshots), so clearing its bit in the new area is consistent;
+        // the previous slot (which may still reference it) is dead after
+        // the flip. In-memory bits stay set (E1 two-generation safety:
+        // clearing them in memory would make the block reallocatable
+        // while the previous generation still references it).
+        let bitmap_bytes = ((block_count + 63) / 64) as usize * 8;
+        let off_in_block = bitmap_bytes % BLOCK_SIZE;
+        let pad = if off_in_block == 0 {
+            0
+        } else {
+            BLOCK_SIZE - off_in_block
+        };
+        // 8 bytes for the count; the rest holds entries.
+        let capacity = pad.saturating_sub(8) / 8;
+        let (take, dropped) = {
+            let total = sh.pending_free[0].len() + sh.pending_free[1].len();
+            let take = total.min(capacity);
+            let mut dropped: Vec<u64> = sh.pending_free[1]
+                .iter()
+                .chain(sh.pending_free[0].iter())
+                .skip(take)
+                .copied()
+                .filter(|&b| b < block_count)
+                .collect();
+            dropped.sort_unstable();
+            (take, dropped)
+        };
+        let dropped_count = dropped.len() as u64;
         // S4: materialize the bitmap to the target slot's area.
         // R1 fix: write to the *target superblock slot's* bitmap area.
         // Slot s owns area s (bitmap_start + s*blocks). The currently-active
@@ -1778,47 +1848,60 @@ impl Fs {
         // (from cache or disk), encode, write, CRC. O(bitmap) time but O(1)
         // memory.
         let mut crcs = Vec::with_capacity(blocks as usize);
+        let mut written_free: u64 = 0;
+        let valid_words = ((block_count + 63) / 64) as usize;
+        let valid_bits_in_last = (block_count % 64) as u32;
         for page_idx in 0..blocks {
             let words = sh
                 .bitmap
                 .get_page_or_load(page_idx)
                 .map_err(|e| FsError::Store(crate::store::StoreError::Io(e)))?;
+            // Mutable copy: dropped bits are cleared here (written area
+            // only); the cached page is untouched.
+            let mut wbuf = *words;
+            if !dropped.is_empty() {
+                let page_base = page_idx * crate::bitmap::BITS_PER_PAGE;
+                let lo = dropped.partition_point(|&b| b < page_base);
+                let hi = dropped.partition_point(|&b| b < page_base + crate::bitmap::BITS_PER_PAGE);
+                for &b in &dropped[lo..hi] {
+                    let wi = ((b - page_base) / 64) as usize;
+                    wbuf[wi] &= !(1u64 << (b % 64));
+                }
+            }
             let mut blk = [0u8; BLOCK_SIZE];
-            for (i, w) in words.iter().enumerate() {
+            for (i, w) in wbuf.iter().enumerate() {
                 blk[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+                // Count free bits as written (words past the bitmap are
+                // padding, not free space). gi is the global word index.
+                let gi = page_idx as usize * wbuf.len() + i;
+                if gi < valid_words {
+                    let mut word = *w;
+                    if gi + 1 == valid_words && valid_bits_in_last != 0 {
+                        word &= (1u64 << valid_bits_in_last) - 1;
+                    }
+                    written_free += word.count_zeros() as u64;
+                }
             }
             // R3: on the last block, append the deferred-free queue to the
             // padding after the bitmap data. Offset must match
             // load_deferred_queue: bitmap_bytes = ceil(block_count/64)*8.
-            if page_idx + 1 == blocks {
+            // #6: only into REAL padding (capacity > 0 implies
+            // off_in_block > 0); never over live bitmap words.
+            if page_idx + 1 == blocks && capacity > 0 {
                 let q0 = &sh.pending_free[0];
                 let q1 = &sh.pending_free[1];
-                let total = q0.len() + q1.len();
-                let bitmap_bytes = ((self.sb.block_count + 63) / 64) as usize * 8;
-                let off_in_block = bitmap_bytes % BLOCK_SIZE;
-                // The queue goes at bitmap_bytes; if it spans blocks, we'd
-                // need to handle it, but for now assume it fits in the last
-                // block's padding (matches old behavior where buf was
-                // blocks*BLOCK_SIZE and queue was at offset n=bitmap_bytes).
-                if off_in_block + 8 <= BLOCK_SIZE {
-                    let avail = (BLOCK_SIZE - (off_in_block + 8)) / 8;
-                    let take = total.min(avail);
-                    let mut pos = off_in_block;
-                    blk[pos..pos + 8].copy_from_slice(&(take as u64).to_le_bytes());
+                let mut pos = off_in_block;
+                blk[pos..pos + 8].copy_from_slice(&(take as u64).to_le_bytes());
+                pos += 8;
+                for b in q1.iter().chain(q0.iter()).take(take) {
+                    blk[pos..pos + 8].copy_from_slice(&b.to_le_bytes());
                     pos += 8;
-                    for b in q1.iter().chain(q0.iter()).take(take) {
-                        if pos + 8 <= BLOCK_SIZE {
-                            blk[pos..pos + 8].copy_from_slice(&b.to_le_bytes());
-                            pos += 8;
-                        }
-                    }
                 }
+                debug_assert!(pos <= BLOCK_SIZE);
             }
             crcs.push(crate::checksum::checksum32(&blk));
             sh.dev.write_block(write_start + page_idx, &blk)?;
         }
-        // Update the bitmap's area to the target (slot flip).
-        sh.bitmap.set_area_start(write_start);
         // Update the bitmap's area to the target (slot flip).
         sh.bitmap.set_area_start(write_start);
         // P1: sb.bitmap_full_gen/delta_gen no longer updated here (they're
@@ -1829,6 +1912,10 @@ impl Fs {
         // but is no longer used for area selection.)
         *self.last_bitmap_write_bytes.lock().unwrap() = blocks * BLOCK_SIZE as u64;
         sh.bitmap.mark_all_clean();
+        // #6: stash the written area's stats for prepare_sync's
+        // free_blocks (each persist fully rewrites the area, so the latest
+        // persist's stats describe the area the next flip will commit).
+        *self.persisted_area_stats.lock().unwrap() = Some((dropped_count, written_free));
         drop(sh);
         *self.commits_since_checkpoint.lock().unwrap() = 0;
         // Update the CRC sidecar for the target slot's area (if CRCs present).
@@ -1839,13 +1926,12 @@ impl Fs {
                 let sh = self.shared.lock().unwrap();
                 // S4: use the CRCs computed during the streaming write
                 // (covers intended bytes, safe under write reordering).
-                // Note: the deferred queue is written after; its bytes are
-                // not CRC'd (matches the old behavior which CRC'd only the
-                // bitmap bytes passed in).
+                // The CRC covers the whole block as written, including the
+                // deferred-queue bytes in the last block's padding.
                 Self::write_bitmap_crcs(&sh.dev, blocks, sidecar_start, &crcs)?;
             }
         }
-        Ok(())
+        Ok((dropped_count, written_free))
     }
 
     /// Write only dirty words as a delta to area 1.
@@ -1886,7 +1972,10 @@ impl Fs {
             }
         }
         // mkfs path: write bitmap to the *active* slot's area (no flip).
-        self.persist_bitmap_full(self.active_slot)?;
+        // Queues were drained above, so nothing is dropped; written_free
+        // is the exact free count for the fresh image.
+        let (_, written_free) = self.persist_bitmap_full(self.active_slot)?;
+        self.sb.free_blocks = written_free;
         self.shared.lock().unwrap().dev.sync()?;
         self.sync_roots();
         let sh = self.shared.lock().unwrap();
@@ -2039,7 +2128,18 @@ impl Fs {
         new_sb.live_snaps = self.snaps.store_handle().live() as u64;
         new_sb.has_live_counts = true;
         // S4: persist the P3 free-block counter.
-        new_sb.free_blocks = self.shared.lock().unwrap().bitmap.free_count();
+        // #6: prefer the exact popcount of the bitmap area the upcoming
+        // slot flip commits (stashed by persist_bitmap_full). Unlike the
+        // in-memory counter it accounts for deferred-free bits cleared in
+        // the written area when the queue didn't fit in the padding, and
+        // for allocations/frees between persist and prepare. Falls back
+        // to the in-memory counter when no persist preceded this prepare
+        // (pre-existing behavior).
+        let free_blocks = match self.persisted_area_stats.lock().unwrap().take() {
+            Some((_, written_free)) => written_free,
+            None => self.shared.lock().unwrap().bitmap.free_count(),
+        };
+        new_sb.free_blocks = free_blocks;
         // E2: the txg being synced. Normally set by commit_async at the flush
         // point; if sync_txg is called directly (background sync disabled),
         // fall back to t.current, which mark_txg_dirty allocated for this
@@ -2065,13 +2165,24 @@ impl Fs {
         self.shared.lock().unwrap().dev.sync()?;
         self.check_fault(FaultPoint::AfterSync)?;
         // Write the staged superblock to the new slot.
+        // (Lock scopes are split so check_fault can take the shared lock;
+        // commit_mutex still serializes the whole phase.)
         {
             let sh = self.shared.lock().unwrap();
             superblock::write_slot(&sh.dev, prepared.slot, &prepared.new_sb)?;
+        }
+        self.check_fault(FaultPoint::AfterSlotWrite)?;
+        {
+            let sh = self.shared.lock().unwrap();
             // S3: persist the quota usage table in the slot's padding.
             superblock::write_quota_table(&sh.dev, prepared.slot, &self.quota_usage)?;
+        }
+        self.check_fault(FaultPoint::AfterQuotaTable)?;
+        {
+            let sh = self.shared.lock().unwrap();
             sh.dev.sync()?;
         }
+        self.check_fault(FaultPoint::AfterFinalSync)?;
         Ok(())
     }
 
