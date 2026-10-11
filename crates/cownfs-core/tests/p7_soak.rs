@@ -21,7 +21,7 @@ fn p7_soak() {
     let img = dir.join(format!("cownfs-p7-soak-{}.img", std::process::id()));
     let _ = std::fs::remove_file(&img);
 
-    let mut fs = Fs::format(&img, 16384).unwrap();
+    let mut fs = Fs::format(&img, 65536).unwrap();
     let root = ROOT_INO;
 
     // Deterministic PRNG (xorshift64).
