@@ -97,6 +97,7 @@ impl LeaseState {
 /// Open the image for lease I/O, preferring `O_DIRECT` (bypass the page
 /// cache so SAN peers observe writes promptly). Falls back to buffered
 /// I/O where `O_DIRECT` is unsupported (e.g. tmpfs).
+#[cfg(target_os = "linux")]
 fn open_lease_fd(path: &Path) -> io::Result<std::fs::File> {
     use std::fs::OpenOptions;
     // Use libc::O_DIRECT for the correct value on each platform
@@ -113,6 +114,16 @@ fn open_lease_fd(path: &Path) -> io::Result<std::fs::File> {
         }
         Err(e) => Err(e),
     }
+}
+
+/// macOS has no `O_DIRECT`; buffered I/O is the only option. Lease
+/// correctness does not depend on cache bypass (fsync still applies).
+#[cfg(not(target_os = "linux"))]
+fn open_lease_fd(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
 }
 
 /// 4 KiB-aligned buffer for `O_DIRECT`.
